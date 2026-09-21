@@ -10,12 +10,14 @@ bits. The time prefix keeps ids lexicographically sortable by creation time.
 
 from __future__ import annotations
 
+import contextvars
+import functools
 import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Any, Callable, Optional
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TRACE_ID_CHARS = 26
@@ -204,3 +206,87 @@ class Span:
                 for e in self.events
             ],
         }
+
+
+_obs_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_obs_user_id", default=""
+)
+_obs_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_obs_session_id", default=""
+)
+
+
+class ObservabilitySDK:
+    """SDK entry point for agent observability.
+
+    Instrumentation happens via the ``agent_observed`` decorator, which wraps an
+    async agent ``run()`` method into an ``agent.loop`` root span. Completed
+    spans are enqueued (a temporary in-memory list on MVP; replaced by the ring
+    buffer + export worker in P07-P08).
+    """
+
+    def __init__(self, exporters: list, enabled: bool = True):
+        self._exporters = exporters
+        self.enabled = enabled
+        self.last_spans: list[Span] = []
+
+    def _build_context(
+        self,
+        agent_id: str,
+        version: str = "",
+        user_id: str = "",
+        session_id: str = "",
+    ) -> SpanContext:
+        """Create a root SpanContext for an agent loop.
+
+        user_id/session_id fall back to values stored in the current
+        contextvars (``_obs_user_id`` / ``_obs_session_id``).
+        """
+        return SpanContext.new(
+            agent_id=agent_id,
+            agent_version=version,
+            user_id=user_id or _obs_user_id.get(),
+            session_id=session_id or _obs_session_id.get(),
+        )
+
+    async def _enqueue(self, span: Span) -> None:
+        """Temporary stub: append span to ``last_spans`` for tests.
+
+        P07-P08 replaces this with the ring buffer + export worker. The public
+        contract of ``_enqueue`` stays unchanged.
+        """
+        self.last_spans.append(span)
+
+    def agent_observed(self, agent_id: str, version: str = ""):
+        """Decorate an async agent ``run()`` method into an ``agent.loop`` root span.
+
+        On success the span gets ``status=ok``; on exception the span gets
+        ``status=error`` and ``error.type``, and the exception is re-raised.
+        The wrapped function receives the trace context as the ``_obs_ctx`` kwarg.
+        """
+
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            @functools.wraps(fn)
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                ctx = self._build_context(agent_id=agent_id, version=version)
+                span = Span(
+                    name=f"agent.loop:{agent_id}",
+                    span_type=SpanType.AGENT_LOOP,
+                    context=ctx,
+                )
+                span.start_time = _now()
+                try:
+                    result = await fn(*args, _obs_ctx=ctx, **kwargs)
+                    span.attributes["status"] = "ok"
+                    return result
+                except Exception as e:
+                    span.attributes["status"] = "error"
+                    span.attributes["error.type"] = type(e).__name__
+                    raise
+                finally:
+                    span.end_time = _now()
+                    await self._enqueue(span)
+
+            return wrapper
+
+        return decorator
