@@ -10,8 +10,10 @@ bits. The time prefix keeps ids lexicographically sortable by creation time.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
+import logging
 import os
 import secrets
 import time
@@ -20,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, AsyncIterator, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TRACE_ID_CHARS = 26
@@ -244,9 +248,9 @@ class ObservabilitySDK:
     buffer + export worker in P07-P08).
     """
 
-    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None):
+    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000):
         self._exporters = exporters
-        
+
         # Priority: explicit enabled parameter > config > environment variable
         if config is not None and "enabled" in config:
             self.enabled = config["enabled"]
@@ -257,8 +261,14 @@ class ObservabilitySDK:
             else:
                 env_enabled = os.environ.get("AGENT_OBS_ENABLED", "true").strip().lower()
                 self.enabled = env_enabled in ("true", "1", "yes", "on")
-        
+
         self.last_spans: list[Span] = []
+        self._ring_buffer: asyncio.Queue[Span] = asyncio.Queue(
+            maxsize=ring_buffer_maxsize
+        )
+        self._worker_task: asyncio.Task | None = None
+        if self.enabled and self._exporters:
+            self._worker_task = asyncio.create_task(self._export_worker())
 
     def _build_context(
         self,
@@ -280,12 +290,54 @@ class ObservabilitySDK:
         )
 
     async def _enqueue(self, span: Span) -> None:
-        """Temporary stub: append span to ``last_spans`` for tests.
+        """Enqueue a span into the ring buffer for async export.
 
-        P07-P08 replaces this with the ring buffer + export worker. The public
-        contract of ``_enqueue`` stays unchanged.
+        This is a fire-and-forget operation — never blocks the caller.
+        If the buffer is full, the span is dropped and counted.
         """
-        self.last_spans.append(span)
+        try:
+            self._ring_buffer.put_nowait(span)
+            self.last_spans.append(span)
+        except asyncio.QueueFull:
+            from agent_obs.metrics import dropped_spans_total
+
+            dropped_spans_total.labels(agent_id=span.context.agent_id).inc()
+            logger.warning(
+                "Ring buffer full, dropping span %s (trace=%s)",
+                span.context.span_id,
+                span.context.trace_id,
+            )
+
+    async def _export_worker(self) -> None:
+        """Background worker that drains the ring buffer and exports spans.
+
+        Batches spans with a 50ms drain window and max batch size of 512.
+        Fan-outs to all registered exporters via asyncio.gather.
+        """
+        while True:
+            batch: list[Span] = []
+            try:
+                first = await asyncio.wait_for(
+                    self._ring_buffer.get(), timeout=0.5
+                )
+                batch.append(first)
+            except asyncio.TimeoutError:
+                continue
+
+            deadline = _now() + 0.05  # 50ms drain window
+            while _now() < deadline and len(batch) < 512:
+                try:
+                    batch.append(self._ring_buffer.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            try:
+                await asyncio.gather(
+                    *[exp.export(batch) for exp in self._exporters],
+                    return_exceptions=True,
+                )
+            except Exception:
+                logger.exception("Export worker encountered an unexpected error")
 
     def agent_observed(self, agent_id: str, version: str = ""):
         """Decorate an async agent ``run()`` method into an ``agent.loop`` root span.
