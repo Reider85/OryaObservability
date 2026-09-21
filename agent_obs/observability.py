@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -209,6 +210,20 @@ class Span:
         }
 
 
+class NullSpan:
+    """Zero-overhead no-op span for disabled observability mode."""
+
+    __slots__ = ()
+
+    def set_attribute(self, key: str, value: object) -> None:
+        """No-op: does nothing."""
+        pass
+
+    def add_event(self, name: str, attrs: Optional[dict] = None) -> None:
+        """No-op: does nothing."""
+        pass
+
+
 _obs_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_obs_user_id", default=""
 )
@@ -229,9 +244,20 @@ class ObservabilitySDK:
     buffer + export worker in P07-P08).
     """
 
-    def __init__(self, exporters: list, enabled: bool = True):
+    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None):
         self._exporters = exporters
-        self.enabled = enabled
+        
+        # Priority: explicit enabled parameter > config > environment variable
+        if config is not None and "enabled" in config:
+            self.enabled = config["enabled"]
+        else:
+            # Use explicit enabled parameter if provided, otherwise check environment
+            if enabled is not None:
+                self.enabled = enabled
+            else:
+                env_enabled = os.environ.get("AGENT_OBS_ENABLED", "true").strip().lower()
+                self.enabled = env_enabled in ("true", "1", "yes", "on")
+        
         self.last_spans: list[Span] = []
 
     def _build_context(
@@ -270,6 +296,10 @@ class ObservabilitySDK:
         """
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            if not self.enabled:
+                # Zero-overhead mode: return function directly without wrapping
+                return fn
+            
             @functools.wraps(fn)
             async def wrapper(*args: Any, **kwargs: Any) -> Any:
                 ctx = self._build_context(agent_id=agent_id, version=version)
@@ -307,6 +337,11 @@ class ObservabilitySDK:
         with ``parent_span_id`` set to the active span.  On exit the span is
         enqueued regardless of exceptions.
         """
+        if not self.enabled:
+            # Zero-overhead mode: yield a no-op NullSpan
+            yield NullSpan()
+            return
+            
         parent_ctx = _active_span_context.get()
         child_ctx = SpanContext.new(
             agent_id=ctx.agent_id,
@@ -338,6 +373,11 @@ class ObservabilitySDK:
         with ``parent_span_id`` set to the active span.  On exit the span is
         enqueued regardless of exceptions.
         """
+        if not self.enabled:
+            # Zero-overhead mode: yield a no-op NullSpan
+            yield NullSpan()
+            return
+            
         parent_ctx = _active_span_context.get()
         child_ctx = SpanContext.new(
             agent_id=ctx.agent_id,
