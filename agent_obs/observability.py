@@ -11,6 +11,7 @@ bits. The time prefix keeps ids lexicographically sortable by creation time.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextvars
 import functools
 import logging
@@ -271,6 +272,7 @@ class ObservabilitySDK:
         self._worker_task: asyncio.Task | None = None
         if self.enabled and self._exporters:
             self._worker_task = asyncio.create_task(self._export_worker())
+            atexit.register(self._atexit_handler)
 
     def _build_context(
         self,
@@ -321,8 +323,12 @@ class ObservabilitySDK:
 
         Batches spans with a 50ms drain window and max batch size of 512.
         Fan-outs to all registered exporters via asyncio.gather.
+
+        When ``_shutdown`` is signalled the worker finishes the current batch
+        then continues draining any remaining spans until the queue is empty
+        before exiting.
         """
-        while not self._shutdown.is_set():
+        while True:
             batch: list[Span] = []
             try:
                 first = await asyncio.wait_for(
@@ -330,6 +336,8 @@ class ObservabilitySDK:
                 )
                 batch.append(first)
             except asyncio.TimeoutError:
+                if self._shutdown.is_set() and self._ring_buffer.empty():
+                    break
                 continue
 
             deadline = _now() + 0.05  # 50ms drain window
@@ -347,19 +355,51 @@ class ObservabilitySDK:
             except Exception:
                 logger.exception("Export worker encountered an unexpected error")
 
-    async def shutdown(self) -> None:
-        """Gracefully shut down the export worker.
+            if self._shutdown.is_set() and self._ring_buffer.empty():
+                break
 
-        Signals the worker to stop, drains remaining spans, and cancels the task.
+    async def shutdown(self) -> None:
+        """Gracefully shut down: drain buffer, flush exporters, cancel worker.
+
+        The entire procedure is bounded by a 5-second deadline.  If the deadline
+        is exceeded the worker is cancelled and a warning is logged with the
+        count of undelivered spans.
         """
         self._shutdown.set()
-        if self._worker_task is not None:
+
+        if self._worker_task is None:
+            return
+
+        try:
+            await asyncio.wait_for(self._worker_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            remaining = self._ring_buffer.qsize()
+            logger.warning(
+                "Shutdown timed out after 5s, cancelling worker (%d spans undelivered)",
+                remaining,
+            )
             self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-            self._worker_task = None
+        except asyncio.CancelledError:
+            pass
+
+        self._worker_task = None
+
+        # Flush all exporters (best-effort within remaining time, max 3s)
+        for exporter in self._exporters:
+            try:
+                await asyncio.wait_for(exporter.flush(), timeout=3.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.warning("Exporter %s flush failed or timed out", type(exporter).__name__)
+
+    async def __aenter__(self) -> "ObservabilitySDK":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.shutdown()
 
     def agent_observed(self, agent_id: str, version: str = ""):
         """Decorate an async agent ``run()`` method into an ``agent.loop`` root span.
@@ -371,8 +411,11 @@ class ObservabilitySDK:
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             if not self.enabled:
-                # Zero-overhead mode: return function directly without wrapping
-                return fn
+                # Zero-overhead mode: return a decorator that returns the function unchanged
+                @functools.wraps(fn)
+                def wrapper(*args: Any, **kwargs: Any) -> Any:
+                    return fn(*args, **kwargs)
+                return wrapper
             
             @functools.wraps(fn)
             async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -400,6 +443,34 @@ class ObservabilitySDK:
             return wrapper
 
         return decorator
+
+    def _atexit_handler(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or loop.is_closed():
+            # No running loop — we can create one for sync scripts
+            asyncio.run(self.shutdown())
+        else:
+            logger.warning(
+                "Event loop is running at exit; async shutdown not possible. "
+                "Use 'async with sdk:' or call sdk.shutdown() explicitly."
+            )
+
+    def _atexit_handler(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or loop.is_closed():
+            # No running loop — we can create one for sync scripts
+            asyncio.run(self.shutdown())
+        else:
+            logger.warning(
+                "Event loop is running at exit; async shutdown not possible. "
+                "Use 'async with sdk:' or call sdk.shutdown() explicitly."
+            )
 
     @asynccontextmanager
     async def llm_call(
