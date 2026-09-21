@@ -300,6 +300,9 @@ class ObservabilitySDK:
         try:
             self._ring_buffer.put_nowait(span)
             self.last_spans.append(span)
+            from agent_obs.metrics import spans_total
+
+            spans_total.labels(agent_id=span.context.agent_id).inc()
         except asyncio.QueueFull:
             from agent_obs.metrics import dropped_spans_total
 

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from agent_obs.metrics import dropped_spans_total
+from agent_obs.metrics import dropped_spans_total, spans_total
 from agent_obs.observability import (
     ObservabilitySDK,
     Span,
@@ -53,6 +53,16 @@ class TestRingBuffer:
         await sdk._enqueue(_make_span())
         # Queue should still have only 2 items
         assert sdk._ring_buffer.qsize() == 2
+
+    async def test_enqueue_increments_spans_total(self) -> None:
+        sdk = ObservabilitySDK(exporters=[], enabled=True, ring_buffer_maxsize=1000)
+        initial = spans_total.labels(agent_id="test-agent")._value.get()
+
+        for _ in range(3):
+            await sdk._enqueue(_make_span(agent_id="test-agent"))
+
+        after = spans_total.labels(agent_id="test-agent")._value.get()
+        assert after == initial + 3
 
     async def test_overflow_drops_span_and_increments_metric(self) -> None:
         sdk = ObservabilitySDK(exporters=[], enabled=True, ring_buffer_maxsize=2)
