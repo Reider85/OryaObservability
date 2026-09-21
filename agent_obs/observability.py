@@ -266,6 +266,8 @@ class ObservabilitySDK:
         self._ring_buffer: asyncio.Queue[Span] = asyncio.Queue(
             maxsize=ring_buffer_maxsize
         )
+        self._shutdown: asyncio.Event = asyncio.Event()
+        self._last_drop_warning: float = 0.0
         self._worker_task: asyncio.Task | None = None
         if self.enabled and self._exporters:
             self._worker_task = asyncio.create_task(self._export_worker())
@@ -302,11 +304,14 @@ class ObservabilitySDK:
             from agent_obs.metrics import dropped_spans_total
 
             dropped_spans_total.labels(agent_id=span.context.agent_id).inc()
-            logger.warning(
-                "Ring buffer full, dropping span %s (trace=%s)",
-                span.context.span_id,
-                span.context.trace_id,
-            )
+            now = _now()
+            if now - self._last_drop_warning >= 5.0:
+                self._last_drop_warning = now
+                logger.warning(
+                    "Ring buffer full, dropping span %s (trace=%s)",
+                    span.context.span_id,
+                    span.context.trace_id,
+                )
 
     async def _export_worker(self) -> None:
         """Background worker that drains the ring buffer and exports spans.
@@ -314,7 +319,7 @@ class ObservabilitySDK:
         Batches spans with a 50ms drain window and max batch size of 512.
         Fan-outs to all registered exporters via asyncio.gather.
         """
-        while True:
+        while not self._shutdown.is_set():
             batch: list[Span] = []
             try:
                 first = await asyncio.wait_for(
@@ -338,6 +343,20 @@ class ObservabilitySDK:
                 )
             except Exception:
                 logger.exception("Export worker encountered an unexpected error")
+
+    async def shutdown(self) -> None:
+        """Gracefully shut down the export worker.
+
+        Signals the worker to stop, drains remaining spans, and cancels the task.
+        """
+        self._shutdown.set()
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
 
     def agent_observed(self, agent_id: str, version: str = ""):
         """Decorate an async agent ``run()`` method into an ``agent.loop`` root span.

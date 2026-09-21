@@ -70,3 +70,23 @@ class TestRingBuffer:
     async def test_no_worker_started_without_exporters(self) -> None:
         sdk = ObservabilitySDK(exporters=[], enabled=True, ring_buffer_maxsize=1000)
         assert sdk._worker_task is None
+
+    async def test_drop_warning_throttled(self, caplog) -> None:
+        sdk = ObservabilitySDK(exporters=[], enabled=True, ring_buffer_maxsize=2)
+        for _ in range(2):
+            await sdk._enqueue(_make_span())
+
+        with caplog.at_level("WARNING", logger="agent_obs.observability"):
+            for _ in range(10):
+                await sdk._enqueue(_make_span())
+
+        drop_warnings = [r for r in caplog.records if "Ring buffer full" in r.message]
+        assert len(drop_warnings) == 1
+
+        sdk._last_drop_warning = _now() - 6.0
+
+        with caplog.at_level("WARNING", logger="agent_obs.observability"):
+            await sdk._enqueue(_make_span())
+
+        drop_warnings2 = [r for r in caplog.records if "Ring buffer full" in r.message]
+        assert len(drop_warnings2) == 2

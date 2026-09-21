@@ -70,7 +70,7 @@ class TestExportWorker:
             assert len(exporter.batches) >= 1
             assert span in exporter.batches[0]
         finally:
-            await sdk._worker_task
+            await sdk.shutdown()
 
     async def test_batch_max_512(self) -> None:
         exporter = MockExporter()
@@ -95,7 +95,7 @@ class TestExportWorker:
 
             assert len(all_exported) == 600
         finally:
-            await sdk._worker_task
+            await sdk.shutdown()
 
     async def test_fan_out_to_multiple_exporters(self) -> None:
         exp1 = MockExporter()
@@ -117,7 +117,7 @@ class TestExportWorker:
             assert span in exp1.batches[0]
             assert span in exp2.batches[0]
         finally:
-            await sdk._worker_task
+            await sdk.shutdown()
 
     async def test_failing_exporter_does_not_crash_worker(self) -> None:
         good = MockExporter()
@@ -139,4 +139,4 @@ class TestExportWorker:
             # Worker should still be alive
             assert not sdk._worker_task.done()
         finally:
-            await sdk._worker_task
+            await sdk.shutdown()
