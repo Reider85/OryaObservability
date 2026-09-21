@@ -1,0 +1,80 @@
+name: orya-observability
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
+      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    # No host port: postgres is internal to the compose network only.
+    # Host 5432 is often occupied by a local Postgres (see infra/README.md).
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    # No host port: redis is internal to the compose network only.
+    # Host 6379 is often occupied by a local Redis (see infra/README.md).
+
+  langfuse:
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://langfuse:langfuse@postgres:5432/langfuse}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      SALT: ${LANGFUSE_SALT}
+      NEXTAUTH_URL: ${LANGFUSE_HOST:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-my-observability-session-secret}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-agent-obs}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-00000000-0000-0000-0000-000000000000}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-00000000-0000-0000-0000-000000000000}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- \"http://$$(hostname):3000/api/public/health\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    restart: unless-stopped
+    depends_on:
+      langfuse:
+        condition: service_healthy
+    environment:
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+volumes:
+  postgres_data:

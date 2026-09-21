@@ -1,0 +1,41 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+extensions:
+  basicauth/langfuse:
+    client_auth:
+      username: ${env:LANGFUSE_PUBLIC_KEY}
+      password: ${env:LANGFUSE_SECRET_KEY}
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+exporters:
+  otlphttp/langfuse:
+    endpoint: http://langfuse:3000/api/public/otel
+    auth:
+      authenticator: basicauth/langfuse
+    retry_on_failure:
+      enabled: true
+      initial_interval: 200ms
+      max_interval: 30s
+      max_elapsed_time: 60s
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [basicauth/langfuse, health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/langfuse, debug]
