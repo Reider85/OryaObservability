@@ -13,6 +13,8 @@ from __future__ import annotations
 import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -90,4 +92,115 @@ class SpanContext:
             "agent_version": self.agent_version,
             "user_id": self.user_id,
             "session_id": self.session_id,
+        }
+
+
+def _now() -> float:
+    """Current time as POSIX timestamp (seconds)."""
+    return time.time()
+
+
+def _to_iso8601(ts: Optional[float]) -> Optional[str]:
+    """Convert a POSIX timestamp to ISO 8601 string (UTC)."""
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+class SpanType(Enum):
+    """Allowed span types on MVP (level 2 types are placeholders, must not be used)."""
+
+    AGENT_LOOP = "agent.loop"
+    LLM_CALL = "llm.call"
+    TOOL_CALL = "tool.call"
+    # Level 2 placeholders — not implemented in MVP
+    # TOOL_INPUT = "tool.input"
+    # TOOL_OUTPUT = "tool.output"
+    # LLM_INPUT = "llm.input"
+    # LLM_OUTPUT = "llm.output"
+    # EVAL_RESULT = "eval.result"
+    # AUDIT_EVENT = "audit.event"
+
+
+class InvalidSpanTypeError(ValueError):
+    """Raised when an invalid span_type string is provided."""
+
+    pass
+
+
+@dataclass
+class Event:
+    """A timestamped event within a span."""
+
+    name: str
+    timestamp: str  # ISO 8601
+    attributes: dict = field(default_factory=dict)
+
+
+@dataclass
+class Span:
+    """Core telemetry object representing a unit of work within a trace.
+
+    Matches the canonical contract from ARCHITECT.md §7.1.
+    """
+
+    name: str
+    span_type: SpanType
+    context: SpanContext
+    attributes: dict = field(default_factory=dict)
+    events: list = field(default_factory=list)
+    start_time: float = 0.0
+    end_time: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.span_type, str):
+            try:
+                self.span_type = SpanType(self.span_type)
+            except ValueError:
+                raise InvalidSpanTypeError(
+                    f"Invalid span_type: {self.span_type!r}. "
+                    f"Allowed: {[st.value for st in SpanType]}"
+                )
+
+    @property
+    def duration_ms(self) -> float:
+        """Duration of the span in milliseconds."""
+        if self.end_time is None:
+            return 0.0
+        return (self.end_time - self.start_time) * 1000.0
+
+    def set_attribute(self, key: str, value: object) -> None:
+        """Set a key-value attribute on the span."""
+        self.attributes[key] = value
+
+    def add_event(self, name: str, attrs: Optional[dict] = None) -> None:
+        """Append a timestamped event to the span."""
+        self.events.append(
+            Event(
+                name=name,
+                timestamp=_to_iso8601(_now()) or "",
+                attributes=attrs or {},
+            )
+        )
+
+    def to_dict(self) -> dict:
+        """Serialize to the §7.1 ARCHITECT.md schema."""
+        return {
+            "trace_id": self.context.trace_id,
+            "span_id": self.context.span_id,
+            "parent_span_id": self.context.parent_span_id,
+            "name": self.name,
+            "span_type": self.span_type.value,
+            "start_time": _to_iso8601(self.start_time),
+            "end_time": _to_iso8601(self.end_time),
+            "status": self.attributes.get("status", "unset"),
+            "attributes": dict(self.attributes),
+            "events": [
+                {
+                    "name": e.name,
+                    "timestamp": e.timestamp,
+                    "attributes": dict(e.attributes),
+                }
+                for e in self.events
+            ],
         }
