@@ -14,10 +14,11 @@ import contextvars
 import functools
 import secrets
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TRACE_ID_CHARS = 26
@@ -214,6 +215,9 @@ _obs_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _obs_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_obs_session_id", default=""
 )
+_active_span_context: contextvars.ContextVar[Optional[SpanContext]] = (
+    contextvars.ContextVar("_active_span_context", default=None)
+)
 
 
 class ObservabilitySDK:
@@ -275,6 +279,7 @@ class ObservabilitySDK:
                     context=ctx,
                 )
                 span.start_time = _now()
+                token = _active_span_context.set(ctx)
                 try:
                     result = await fn(*args, _obs_ctx=ctx, **kwargs)
                     span.attributes["status"] = "ok"
@@ -285,8 +290,73 @@ class ObservabilitySDK:
                     raise
                 finally:
                     span.end_time = _now()
+                    _active_span_context.reset(token)
                     await self._enqueue(span)
 
             return wrapper
 
         return decorator
+
+    @asynccontextmanager
+    async def llm_call(
+        self, ctx: SpanContext, *, model: str, provider: str
+    ) -> AsyncIterator[Span]:
+        """Create a child ``llm.call`` span for an LLM invocation.
+
+        The span inherits ``trace_id`` from *ctx* and gets its own ``span_id``
+        with ``parent_span_id`` set to the active span.  On exit the span is
+        enqueued regardless of exceptions.
+        """
+        parent_ctx = _active_span_context.get()
+        child_ctx = SpanContext.new(
+            agent_id=ctx.agent_id,
+            agent_version=ctx.agent_version,
+            parent=parent_ctx if parent_ctx is not None else ctx,
+            user_id=ctx.user_id,
+            session_id=ctx.session_id,
+        )
+        span = Span(
+            name=f"llm.call:{model}",
+            span_type=SpanType.LLM_CALL,
+            context=child_ctx,
+            attributes={"llm.model": model, "llm.provider": provider},
+        )
+        span.start_time = _now()
+        token = _active_span_context.set(child_ctx)
+        try:
+            yield span
+        finally:
+            span.end_time = _now()
+            _active_span_context.reset(token)
+            await self._enqueue(span)
+
+    @asynccontextmanager
+    async def tool_call(self, ctx: SpanContext, *, tool_name: str) -> AsyncIterator[Span]:
+        """Create a child ``tool.call`` span for an instrumented tool.
+
+        The span inherits ``trace_id`` from *ctx* and gets its own ``span_id``
+        with ``parent_span_id`` set to the active span.  On exit the span is
+        enqueued regardless of exceptions.
+        """
+        parent_ctx = _active_span_context.get()
+        child_ctx = SpanContext.new(
+            agent_id=ctx.agent_id,
+            agent_version=ctx.agent_version,
+            parent=parent_ctx if parent_ctx is not None else ctx,
+            user_id=ctx.user_id,
+            session_id=ctx.session_id,
+        )
+        span = Span(
+            name=f"tool.call:{tool_name}",
+            span_type=SpanType.TOOL_CALL,
+            context=child_ctx,
+            attributes={"tool.name": tool_name},
+        )
+        span.start_time = _now()
+        token = _active_span_context.set(child_ctx)
+        try:
+            yield span
+        finally:
+            span.end_time = _now()
+            _active_span_context.reset(token)
+            await self._enqueue(span)
