@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 
 spans_total = Counter(
     "agent_obs_spans_total",
@@ -20,4 +20,16 @@ exporter_errors_total = Counter(
     "agent_obs_exporter_errors_total",
     "Exporter errors by type",
     ["exporter", "status_code"],
+)
+
+cost_per_request_usd = Gauge(
+    "agent_obs_cost_per_request_usd",
+    "Cost of the last completed LLM call in USD",
+    ["agent_id", "model"],
+)
+
+cost_total_usd = Counter(
+    "agent_obs_cost_total_usd",
+    "Accumulated total cost of all LLM calls in USD",
+    ["agent_id", "model"],
 )

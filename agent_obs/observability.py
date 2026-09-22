@@ -252,7 +252,7 @@ class ObservabilitySDK:
     buffer + export worker in P07-P08).
     """
 
-    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000):
+    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None):
         self._exporters = exporters
 
         # Priority: explicit enabled parameter > config > environment variable
@@ -273,9 +273,20 @@ class ObservabilitySDK:
         self._shutdown: asyncio.Event = asyncio.Event()
         self._last_drop_warning: float = 0.0
         self._worker_task: asyncio.Task | None = None
-        if self.enabled and self._exporters:
-            self._worker_task = asyncio.create_task(self._export_worker())
-            atexit.register(self._atexit_handler)
+        self._metrics_http_server = None
+        if self.enabled:
+            if self._exporters:
+                self._worker_task = asyncio.create_task(self._export_worker())
+                atexit.register(self._atexit_handler)
+            if metrics_port is not None:
+                self._start_metrics_server(metrics_port)
+
+    def _start_metrics_server(self, port: int) -> None:
+        """Start a Prometheus HTTP server on the given port to serve /metrics."""
+        from prometheus_client import start_http_server
+
+        self._metrics_http_server = start_http_server(port)
+        logger.info("Prometheus metrics server started on port %d", port)
 
     def _build_context(
         self,
@@ -305,9 +316,22 @@ class ObservabilitySDK:
         try:
             self._ring_buffer.put_nowait(span)
             self.last_spans.append(span)
-            from agent_obs.metrics import spans_total
+            from agent_obs.metrics import (
+                cost_per_request_usd,
+                cost_total_usd,
+                spans_total,
+            )
 
             spans_total.labels(agent_id=span.context.agent_id).inc()
+
+            if span.span_type == SpanType.LLM_CALL and "cost.usd" in span.attributes:
+                agent_id = span.context.agent_id
+                model = span.attributes.get("llm.model", "unknown")
+                cost_usd = span.attributes["cost.usd"]
+                cost_per_request_usd.labels(agent_id=agent_id, model=model).set(
+                    cost_usd
+                )
+                cost_total_usd.labels(agent_id=agent_id, model=model).inc(cost_usd)
         except asyncio.QueueFull:
             from agent_obs.metrics import dropped_spans_total
 
