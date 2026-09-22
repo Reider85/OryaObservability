@@ -3,17 +3,20 @@
 import asyncio
 import base64
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 import respx
 
 from agent_obs.exporters.langfuse_exporter import (
+    ConfigError,
     LangfuseExporter,
     _batch_to_otlp,
     _retry_delay,
     _to_hex,
 )
+from agent_obs.exporters.stdout_exporter import StdoutExporter
 from agent_obs.metrics import exporter_errors_total
 from agent_obs.observability import Span, SpanContext, SpanType, _now
 
@@ -87,6 +90,27 @@ class TestOtlpConversion:
 
         keys = {a["key"] for a in resource_attrs}
         assert "service.name" in keys
+
+    def test_ids_are_padded_to_otlp_length(self) -> None:
+        span = _make_span()
+        otlp_span = _batch_to_otlp([span])["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        assert len(otlp_span["traceId"]) == 32
+        assert len(otlp_span["spanId"]) == 16
+        assert otlp_span["parentSpanId"] == ""
+
+    def test_gen_ai_usage_attributes_added(self) -> None:
+        span = _make_span(
+            attributes={
+                "status": "ok",
+                "tokens.input": 100,
+                "tokens.output": 50,
+            }
+        )
+        otlp_span = _batch_to_otlp([span])["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        keys = {a["key"] for a in otlp_span["attributes"]}
+        assert "gen_ai.usage.input_tokens" in keys
+        assert "gen_ai.usage.output_tokens" in keys
+        assert "tokens.input" in keys
 
 
 class TestLangfuseExporter:
@@ -266,10 +290,146 @@ class TestLangfuseExporter:
             public_key="pk-test",
             secret_key="sk-test",
         )
-        # flush is a stub — should not raise
         await exporter.flush()
         await exporter.flush()
         await exporter.close()
+
+    @respx.mock
+    async def test_flush_delivers_pending_after_exhausted_retries(self) -> None:
+        route = respx.post(
+            "http://localhost:3000/api/public/otel/v1/traces"
+        ).mock(
+            side_effect=lambda req: (
+                httpx.Response(500)
+                if len(route.calls) < 2
+                else httpx.Response(200)
+            )
+        )
+
+        exporter = LangfuseExporter(
+            endpoint="http://localhost:3000",
+            public_key="pk-test",
+            secret_key="sk-test",
+            max_retries=2,
+        )
+        try:
+            await exporter.export([_make_span()])
+            assert len(exporter._pending) == 1
+
+            await exporter.flush()
+            assert len(exporter._pending) == 0
+            assert len(route.calls) == 3
+        finally:
+            await exporter.close()
+
+    @respx.mock
+    async def test_flush_unavailable_backend_does_not_raise(self) -> None:
+        respx.post(
+            "http://localhost:3000/api/public/otel/v1/traces"
+        ).mock(return_value=httpx.Response(503))
+
+        exporter = LangfuseExporter(
+            endpoint="http://localhost:3000",
+            public_key="pk-test",
+            secret_key="sk-test",
+            max_retries=1,
+        )
+        try:
+            await exporter.export([_make_span()])
+            assert len(exporter._pending) == 1
+
+            # Flush must finish without raising even if backend is down.
+            await exporter.flush()
+            assert len(exporter._pending) == 0
+        finally:
+            await exporter.close()
+
+
+class TestConfigAndTls:
+    def test_endpoint_without_scheme_raises(self) -> None:
+        with pytest.raises(ConfigError):
+            LangfuseExporter(
+                endpoint="localhost:3000",
+                public_key="pk",
+                secret_key="sk",
+            )
+
+    async def test_tls_verify_enabled_by_default(self) -> None:
+        exporter = LangfuseExporter(
+            endpoint="https://langfuse.example.com",
+            public_key="pk-test",
+            secret_key="sk-test",
+        )
+        try:
+            # No verify=False anywhere: _tls_ca is None and no disable option
+            # exists on the exporter.
+            assert exporter._tls_ca is None
+        finally:
+            await exporter.close()
+
+    async def test_tls_ca_path_is_used_for_verification(self) -> None:
+        ca_path = Path(__file__).parent / "fixtures" / "ca.pem"
+        exporter = LangfuseExporter(
+            endpoint="https://langfuse.example.com",
+            public_key="pk-test",
+            secret_key="sk-test",
+            tls_ca=str(ca_path),
+        )
+        try:
+            assert exporter._tls_ca == str(ca_path)
+        finally:
+            await exporter.close()
+
+    async def test_from_env_reads_credentials(self) -> None:
+        exporter = LangfuseExporter.from_env(
+            {
+                "LANGFUSE_HOST": "http://localhost:3000",
+                "LANGFUSE_PUBLIC_KEY": "pk-env",
+                "LANGFUSE_SECRET_KEY": "sk-env",
+            }
+        )
+        try:
+            assert isinstance(exporter, LangfuseExporter)
+            assert exporter._endpoint == "http://localhost:3000"
+        finally:
+            await exporter.close()
+
+    async def test_from_env_reads_tls_ca(self) -> None:
+        ca_path = Path(__file__).parent / "fixtures" / "ca.pem"
+        exporter = LangfuseExporter.from_env(
+            {
+                "LANGFUSE_HOST": "https://langfuse.example.com",
+                "LANGFUSE_PUBLIC_KEY": "pk-env",
+                "LANGFUSE_SECRET_KEY": "sk-env",
+                "AGENT_OBS_TLS_CA": str(ca_path),
+            }
+        )
+        try:
+            assert isinstance(exporter, LangfuseExporter)
+            assert exporter._tls_ca == str(ca_path)
+        finally:
+            await exporter.close()
+
+    def test_from_env_missing_config_raises(self) -> None:
+        with pytest.raises(ConfigError):
+            LangfuseExporter.from_env(
+                {
+                    "LANGFUSE_HOST": "",
+                    "LANGFUSE_PUBLIC_KEY": "pk",
+                    "LANGFUSE_SECRET_KEY": "",
+                }
+            )
+
+    def test_from_env_degrades_to_stdout_exporter(self) -> None:
+        exporter = LangfuseExporter.from_env(
+            {
+                "AGENT_OBS_FAIL_ON_CONFIG": "0",
+                "LANGFUSE_HOST": "",
+                "LANGFUSE_PUBLIC_KEY": "",
+                "LANGFUSE_SECRET_KEY": "",
+            }
+        )
+        assert isinstance(exporter, StdoutExporter)
 
 
 class TestRetryDelay:

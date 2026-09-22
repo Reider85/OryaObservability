@@ -1,0 +1,24 @@
+# Recording rules for tail-sampler observability (P21).
+groups:
+  - name: tail_sampler
+    rules:
+      # Доля сохранённых трейсов: kept / (kept + dropped).
+      - record: job:tail_sampler_kept_ratio:ratio
+        expr: |
+          sum(otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"})
+          /
+          (
+            sum(otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"})
+            + sum(otelcol_processor_tail_sampling_count_traces_sampled{decision="dropped"})
+          )
+      # Причины срабатывания keep различимы по лейблу reason
+      # (error-keep | cost-over-budget-keep | security-incident-keep | normal-sample).
+      - record: job:tail_sampler_kept_by_reason:ratio
+        expr: |
+          sum by (reason) (
+            otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"}
+          )
+          /
+          sum(
+            otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"}
+          )

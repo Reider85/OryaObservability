@@ -274,6 +274,9 @@ class ObservabilitySDK:
         self._last_drop_warning: float = 0.0
         self._worker_task: asyncio.Task | None = None
         self._metrics_http_server = None
+        self._trace_agg: dict[str, dict] = {}
+        self._max_trace_agg = 100_000
+        self.cost_threshold = self._load_cost_threshold(config)
         if self.enabled:
             if self._exporters:
                 self._worker_task = asyncio.create_task(self._export_worker())
@@ -287,6 +290,27 @@ class ObservabilitySDK:
 
         self._metrics_http_server = start_http_server(port)
         logger.info("Prometheus metrics server started on port %d", port)
+
+    @staticmethod
+    def _load_cost_threshold(config: dict | None) -> float:
+        """Read the tail-sampler cost threshold (P20).
+
+        Priority: ``config["cost_threshold"]`` > ``TAIL_SAMPLER_COST_THRESHOLD``
+        env var > default ``0.05``.
+        """
+        if config is not None and "cost_threshold" in config:
+            try:
+                return float(config["cost_threshold"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid config cost_threshold %r, using default",
+                    config["cost_threshold"],
+                )
+        raw = os.environ.get("TAIL_SAMPLER_COST_THRESHOLD", "0.05")
+        try:
+            return float(raw)
+        except ValueError:
+            return 0.05
 
     def _build_context(
         self,
@@ -316,6 +340,7 @@ class ObservabilitySDK:
         try:
             self._ring_buffer.put_nowait(span)
             self.last_spans.append(span)
+            self._accumulate_trace_aggregates(span)
             from agent_obs.metrics import (
                 cost_per_request_usd,
                 cost_total_usd,
@@ -344,6 +369,47 @@ class ObservabilitySDK:
                     span.context.span_id,
                     span.context.trace_id,
                 )
+
+    def _accumulate_trace_aggregates(self, span: Span) -> None:
+        """Aggregate per-trace data onto the root span (P20/P24).
+
+        Children (``llm.call`` / ``tool.call``) are enqueued when their context
+        managers exit — before the ``agent.loop`` root, which is enqueued in
+        the decorator's ``finally``.  So when the root arrives we can stamp it
+        with ``steps.count``, ``cost.usd_sum``, ``cost.over_budget`` and the
+        error flag for the tail sampler and the Langfuse saved queries.
+        """
+        trace_id = span.context.trace_id
+        agg = self._trace_agg.get(trace_id)
+        if agg is None:
+            if len(self._trace_agg) >= self._max_trace_agg:
+                # Memory guard: stop aggregating, never grow unboundedly.
+                return
+            agg = {"cost_usd": 0.0, "steps": 0, "has_error": False}
+            self._trace_agg[trace_id] = agg
+
+        agg["steps"] += 1
+        if span.attributes.get("status") == "error":
+            agg["has_error"] = True
+        if span.span_type == SpanType.LLM_CALL:
+            cost = span.attributes.get("cost.usd")
+            if isinstance(cost, (int, float)):
+                agg["cost_usd"] += cost
+
+        if span.span_type != SpanType.AGENT_LOOP:
+            return
+
+        span.attributes["steps.count"] = agg["steps"]
+        span.attributes["cost.usd_sum"] = round(agg["cost_usd"], 8)
+        span.attributes["cost.over_budget"] = (
+            "true" if agg["cost_usd"] > self.cost_threshold else "false"
+        )
+        # MVP stub: the security layer arrives in Level 2 (E2.1), but the
+        # tail sampler already knows how to check the field.
+        span.attributes["security.incident"] = "false"
+        if agg["has_error"]:
+            span.attributes["status"] = "error"
+        self._trace_agg.pop(trace_id, None)
 
     async def _export_worker(self) -> None:
         """Background worker that drains the ring buffer and exports spans.
@@ -508,6 +574,8 @@ class ObservabilitySDK:
         provider: str,
         price_book: PriceBook | None = None,
         usage: Usage | None = None,
+        input_text: str | None = None,
+        output_text: str | None = None,
     ) -> AsyncIterator[Span]:
         """Create a child ``llm.call`` span for an LLM invocation.
 
@@ -519,6 +587,10 @@ class ObservabilitySDK:
         attributes are auto-filled on exit (SDK sugar, P15):
         ``tokens.input``, ``tokens.output``, ``tokens.cached``,
         ``cost.usd`` and ``cost.price_book_version``.
+
+        When *input_text* and/or *output_text* are provided, deterministic
+        content sampling (P22) decides whether the full text is stored or
+        replaced by ``sha256`` + character counts.
         """
         if not self.enabled:
             # Zero-overhead mode: yield a no-op NullSpan
@@ -547,7 +619,23 @@ class ObservabilitySDK:
             span.end_time = _now()
             _active_span_context.reset(token)
             self._attach_cost_attributes(span, model, usage, price_book)
+            self._attach_llm_content(span, input_text, output_text)
             await self._enqueue(span)
+
+    @staticmethod
+    def _attach_llm_content(
+        span: Span,
+        input_text: str | None,
+        output_text: str | None,
+    ) -> None:
+        """Content-sample an llm.call span (P22)."""
+        if input_text is None and output_text is None:
+            return
+        from agent_obs.content_sampling import attach_llm_content
+
+        attach_llm_content(
+            span, input_text=input_text, output_text=output_text
+        )
 
     @staticmethod
     def _attach_cost_attributes(
@@ -583,12 +671,16 @@ class ObservabilitySDK:
         span.attributes["cost.price_book_version"] = result.price_book_version
 
     @asynccontextmanager
-    async def tool_call(self, ctx: SpanContext, *, tool_name: str) -> AsyncIterator[Span]:
+    async def tool_call(self, ctx: SpanContext, *, tool_name: str, input_text: str | None = None) -> AsyncIterator[Span]:
         """Create a child ``tool.call`` span for an instrumented tool.
 
         The span inherits ``trace_id`` from *ctx* and gets its own ``span_id``
         with ``parent_span_id`` set to the active span.  On exit the span is
         enqueued regardless of exceptions.
+
+        When *input_text* is provided, only a summary (≤200 chars), its hash
+        and length are stored — the full tool input never reaches the backend
+        (P22, risk R1.5).
         """
         if not self.enabled:
             # Zero-overhead mode: yield a no-op NullSpan
@@ -616,4 +708,8 @@ class ObservabilitySDK:
         finally:
             span.end_time = _now()
             _active_span_context.reset(token)
+            if input_text is not None:
+                from agent_obs.content_sampling import attach_tool_content
+
+                attach_tool_content(span, input_text=input_text)
             await self._enqueue(span)

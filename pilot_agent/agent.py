@@ -69,6 +69,7 @@ class PilotAgent:
             _obs_ctx,
             model=config.model,
             provider=config.provider,
+            input_text=user_query,
         ) as span:
             span.attributes["llm.temperature"] = config.temperature
             response = await self.client.chat.completions.create(
@@ -88,4 +89,10 @@ class PilotAgent:
                 "cost.usd": round(result.cost_usd, 8),
                 "cost.price_book_version": result.price_book_version,
             })
-            return response.choices[0].message.content or ""
+            content = response.choices[0].message.content or ""
+            # Output text participates in deterministic content sampling;
+            # full text is stored only for ~AGENT_OBS_CONTENT_RATE% of traces.
+            from agent_obs.content_sampling import attach_llm_content
+
+            attach_llm_content(span, output_text=content)
+            return content

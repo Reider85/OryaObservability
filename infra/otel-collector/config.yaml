@@ -7,6 +7,38 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
+  # P20 (E1.3): tail-sampling policy — «интересные» трейсы сохраняются всегда,
+  # обычные — только probabilistic-доля (ТРИЗ Принцип 16).
+  # Атрибуты root-span'а (cost.over_budget / security.incident / status)
+  # заполняются SDK-агрегацией в _enqueue (см. ObservabilitySDK).
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 10000
+    expected_new_traces_per_sec: 100
+    policies:
+      # 1) Ошибки → keep 100%
+      - name: error-keep
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      # 2) Превышение бюджета (cost.usd_sum > TAIL_SAMPLER_COST_THRESHOLD) → keep 100%
+      - name: cost-over-budget-keep
+        type: string_attribute
+        string_attribute:
+          key: cost.over_budget
+          values: ["true"]
+      # 3) Security-инцидент (заглушка на MVP, SDK выставляет "false") → keep 100%
+      - name: security-incident-keep
+        type: string_attribute
+        string_attribute:
+          key: security.incident
+          values: ["true"]
+      # 4) Обычные трейсы → probabilistic TAIL_SAMPLER_NORMAL_RATE% (по умолчанию 10)
+      - name: normal-sample
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${env:TAIL_SAMPLER_NORMAL_RATE}
+
   batch:
     timeout: 5s
     send_batch_size: 512
@@ -34,8 +66,12 @@ exporters:
 
 service:
   extensions: [basicauth/langfuse, health_check]
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+      level: normal
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
+      processors: [tail_sampling, batch]
       exporters: [otlphttp/langfuse, debug]

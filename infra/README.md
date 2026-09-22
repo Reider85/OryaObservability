@@ -10,7 +10,8 @@ Local self-hosted observability stack for the `agent-obs` MVP
 | `langfuse` | `langfuse/langfuse:2` | `3000` | Trace UI + OTLP ingest |
 | `postgres` | `postgres:16` | internal | Langfuse metadata database (compose network only) |
 | `redis` | `redis:7` | internal | Langfuse queues (compose network only) |
-| `otel-collector` | `otel/opentelemetry-collector-contrib:0.128.0` | `4317` gRPC, `4318` HTTP | OTLP → batch → Langfuse |
+| `otel-collector` | `otel/opentelemetry-collector-contrib:0.128.0` | `4317` gRPC, `4318` HTTP, `8888` self-telemetry | OTLP → tail-sampling → batch → Langfuse |
+| `prometheus` | `prom/prometheus:latest` | `9090` | Scrapes Collector self-telemetry; recording rules for `tail_sampler_kept_ratio` (P21) |
 
 > Postgres/Redis are deliberately **not** exposed on the host: their ports
 > (5432/6379) are commonly occupied by a local Postgres/Redis. The SDK only
@@ -20,7 +21,8 @@ Local self-hosted observability stack for the `agent-obs` MVP
 **Data flow**
 
 ```
-SDK --OTLP--> otel-collector(:4317/:4318) --batch--> langfuse(/api/public/otel/v1/traces)
+SDK --OTLP--> otel-collector(:4317/:4318) --tail_sampling--> --batch--> langfuse(/api/public/otel/v1/traces)
+                                          `-- metrics --> prometheus(:8888]
 ```
 
 ---
@@ -93,27 +95,58 @@ The Collector batches for 5 s (≤ 512 spans per batch) and pushes to
 
 ## 5. Tail sampler configuration
 
-Sampling policy environment variables are consumed by the Collector config
-(expandable, see `otel-collector/config.yaml`):
+The Collector runs a **tail-sampling** processor between OTLP receiver and the
+batch processor (see `otel-collector/config.yaml`). Policies (P20):
+
+| Order | Policy | Verdict |
+|---|---|---|
+| 1 | `status_code == ERROR` (any span of the trace) | keep 100% |
+| 2 | `cost.over_budget == "true"` (root attribute) | keep 100% |
+| 3 | `security.incident == "true"` (MVP stub, SDK always writes `"false"`) | keep 100% |
+| 4 | fallback (`normal-sample`) | probabilistic keep |
+
+The root-span attributes (`cost.over_budget`, `security.incident`, `status`)
+are stamped by the SDK's per-trace aggregation in `_enqueue` (P20/P24), so the
+sampler only ever looks at root attributes.
+
+Sampling policy environment variables (in `.env`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TAIL_SAMPLER_COST_THRESHOLD` | `0.05` | Traces with `cost.usd` above the threshold are kept 100% |
-| `TAIL_SAMPLER_NORMAL_RATE` | `0.1` | Keep ratio for "normal" traces |
+| `TAIL_SAMPLER_COST_THRESHOLD` | `0.05` | Traces whose summed `cost.usd` exceeds the threshold are flagged `cost.over_budget=true` and kept 100% |
+| `TAIL_SAMPLER_NORMAL_RATE` | `10` | Keep ratio for "normal" traces, **percent 0–100** |
 
-Tail-sampling processor is wired in a later wave (MVP prompt P20).
+## 6. Sampler observability (P21)
 
-## 6. Useful commands
+The Collector exposes its own Prometheus telemetry on `:8888`; Prometheus
+scrapes it and derives two recording rules (see `prometheus-rules.yml`):
+
+- `job:tail_sampler_kept_ratio:ratio` — kept/(kept+dropped) share
+- `job:tail_sampler_kept_by_reason:ratio` — per-policy breakdown
+
+The native counter is `otelcol_processor_tail_sampling_count_traces_sampled`
+with labels `decision` (`sampled`/`dropped`) and `reason` (policy name).
+
+```bash
+curl http://localhost:9090/api/v1/query --data-urlencode \
+  'query=job:tail_sampler_kept_ratio:ratio'
+```
+
+## 7. Useful commands
 
 ```bash
 docker compose logs -f langfuse          # Langfuse logs
 docker compose logs -f otel-collector    # Collector logs (debug exporter output)
+docker compose logs -f prometheus        # Prometheus logs
 docker compose down                      # stop (keeps postgres volume)
 docker compose down -v                   # stop and wipe data
 ```
 
-## 7. The SDK side (later waves)
+## 8. The SDK side (later waves)
 
 `agent_obs` uses `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
 from `.env` (see P17–P19 in `analytics/MVP-PROMPT.md`). Keep these in sync with
-the same `.env` file used here.
+the same `.env` file used here. `AGENT_OBS_CONTENT_RATE` (default 10) controls
+deterministic content sampling (P22); `AGENT_OBS_TLS_CA` points to a CA bundle
+for self-signed TLS (P19); `AGENT_OBS_FAIL_ON_CONFIG=0` degrades to a stdout
+exporter when Langfuse config is missing.
