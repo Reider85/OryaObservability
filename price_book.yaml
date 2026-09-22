@@ -2,19 +2,29 @@ version: "2026-09-01"
 currency: USD
 models:
   gpt-4o:
+    valid_from: "2026-01-01"
+    valid_to: "2026-12-31"
     input_per_1k: 0.0025
     output_per_1k: 0.010
     cached_input_per_1k: 0.00125
   gpt-4o-mini:
+    valid_from: "2026-01-01"
+    valid_to: "2026-12-31"
     input_per_1k: 0.00015
     output_per_1k: 0.0006
     cached_input_per_1k: 0.000075
   claude-3.5-sonnet:
+    valid_from: "2026-01-01"
+    valid_to: "2026-12-31"
     input_per_1k: 0.003
     output_per_1k: 0.015
   claude-3-haiku:
+    valid_from: "2026-01-01"
+    valid_to: "2026-12-31"
     input_per_1k: 0.00025
     output_per_1k: 0.00125
   gemini-1.5-pro:
+    valid_from: "2026-01-01"
+    valid_to: "2026-12-31"
     input_per_1k: 0.00125
     output_per_1k: 0.005
