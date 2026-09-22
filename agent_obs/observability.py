@@ -24,6 +24,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, AsyncIterator, Callable, Optional
 
+from agent_obs.cost.compute_cost import Usage, compute_cost
+from agent_obs.cost.price_book import PriceBook, PriceNotFoundError
+
 logger = logging.getLogger(__name__)
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -474,19 +477,30 @@ class ObservabilitySDK:
 
     @asynccontextmanager
     async def llm_call(
-        self, ctx: SpanContext, *, model: str, provider: str
+        self,
+        ctx: SpanContext,
+        *,
+        model: str,
+        provider: str,
+        price_book: PriceBook | None = None,
+        usage: Usage | None = None,
     ) -> AsyncIterator[Span]:
         """Create a child ``llm.call`` span for an LLM invocation.
 
         The span inherits ``trace_id`` from *ctx* and gets its own ``span_id``
         with ``parent_span_id`` set to the active span.  On exit the span is
         enqueued regardless of exceptions.
+
+        When both *usage* and *price_book* are provided, token and cost
+        attributes are auto-filled on exit (SDK sugar, P15):
+        ``tokens.input``, ``tokens.output``, ``tokens.cached``,
+        ``cost.usd`` and ``cost.price_book_version``.
         """
         if not self.enabled:
             # Zero-overhead mode: yield a no-op NullSpan
             yield NullSpan()
             return
-            
+
         parent_ctx = _active_span_context.get()
         child_ctx = SpanContext.new(
             agent_id=ctx.agent_id,
@@ -508,7 +522,41 @@ class ObservabilitySDK:
         finally:
             span.end_time = _now()
             _active_span_context.reset(token)
+            self._attach_cost_attributes(span, model, usage, price_book)
             await self._enqueue(span)
+
+    @staticmethod
+    def _attach_cost_attributes(
+        span: Span,
+        model: str,
+        usage: Usage | None,
+        price_book: PriceBook | None,
+    ) -> None:
+        """Attach token and cost attributes to a span (P15).
+
+        If *usage* is provided, token counts are always recorded.  Cost
+        attributes additionally require *price_book*: a missing model raises
+        ``PriceNotFoundError`` which is swallowed with a warning so that
+        observability never blocks the agent.
+        """
+        if usage is None:
+            return
+        span.attributes["tokens.input"] = usage.input
+        span.attributes["tokens.output"] = usage.output
+        span.attributes["tokens.cached"] = usage.cached
+        if price_book is None:
+            return
+        try:
+            result = compute_cost(usage, model, price_book)
+        except PriceNotFoundError:
+            logger.warning(
+                "No price for model %r in price book %s; cost attributes skipped",
+                model,
+                price_book.version,
+            )
+            return
+        span.attributes["cost.usd"] = round(result.cost_usd, 8)
+        span.attributes["cost.price_book_version"] = result.price_book_version
 
     @asynccontextmanager
     async def tool_call(self, ctx: SpanContext, *, tool_name: str) -> AsyncIterator[Span]:
