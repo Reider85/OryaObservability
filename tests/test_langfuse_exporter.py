@@ -98,6 +98,38 @@ class TestOtlpConversion:
         assert len(otlp_span["spanId"]) == 16
         assert otlp_span["parentSpanId"] == ""
 
+    def test_gen_ai_semconv_attributes_added(self) -> None:
+        span = _make_span(
+            attributes={
+                "llm.model": "gpt-4o",
+                "cost.usd": 0.005,
+                "tokens.input": 100,
+            }
+        )
+        otlp_span = _batch_to_otlp([span])["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        keys = {a["key"] for a in otlp_span["attributes"]}
+        assert "gen_ai.operation.name" in keys
+        assert "gen_ai.request.model" in keys
+        assert "gen_ai.usage.cost" in keys
+        assert "gen_ai.usage.input_tokens" in keys
+
+    def test_span_events_mirrored_to_attribute(self) -> None:
+        span = _make_span()
+        span.add_event("llm.call.started")
+        span.add_event("llm.call.completed")
+        otlp_span = _batch_to_otlp([span])["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+
+        attrs = {a["key"]: a["value"] for a in otlp_span["attributes"]}
+        assert "agent_obs.events" in attrs
+        names = [v["stringValue"] for v in attrs["agent_obs.events"]["arrayValue"]["values"]]
+        assert names == ["llm.call.started", "llm.call.completed"]
+
+    def test_no_events_no_mirror_attribute(self) -> None:
+        span = _make_span()
+        otlp_span = _batch_to_otlp([span])["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        keys = {a["key"] for a in otlp_span["attributes"]}
+        assert "agent_obs.events" not in keys
+
     def test_gen_ai_usage_attributes_added(self) -> None:
         span = _make_span(
             attributes={

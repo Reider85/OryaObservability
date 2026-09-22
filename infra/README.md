@@ -7,22 +7,30 @@ Local self-hosted observability stack for the `agent-obs` MVP
 
 | Service | Image | Port | Purpose |
 |---|---|---|---|
-| `langfuse` | `langfuse/langfuse:2` | `3000` | Trace UI + OTLP ingest |
-| `postgres` | `postgres:16` | internal | Langfuse metadata database (compose network only) |
-| `redis` | `redis:7` | internal | Langfuse queues (compose network only) |
+| `langfuse` | `langfuse/langfuse:3` | `3000` | Trace UI + OTLP ingest |
+| `langfuse-worker` | `langfuse/langfuse-worker:3` | internal | Ingestion/queue workers (ClickhouseWriter, otel-ingestion) |
+| `postgres` | `postgres:17` | internal | Langfuse metadata database (compose network only) |
+| `redis` | `redis:7` | internal | Langfuse queues (compose network only, `requirepass`) |
+| `clickhouse` | `clickhouse/clickhouse-server` | `8123`, `9000` | Langfuse event/observation storage (compose network only) |
+| `minio` | `quay.io/minio/minio:latest` | `9000` | S3-compatible storage for Langfuse (S3 buckets; compose network only) |
 | `otel-collector` | `otel/opentelemetry-collector-contrib:0.128.0` | `4317` gRPC, `4318` HTTP, `8888` self-telemetry | OTLP → tail-sampling → batch → Langfuse |
-| `prometheus` | `prom/prometheus:latest` | `9090` | Scrapes Collector self-telemetry; recording rules for `tail_sampler_kept_ratio` (P21) |
+| `prometheus` | `prom/prometheus:latest` | `9091` (host) → `9090` | Scrapes Collector self-telemetry; recording rules for `tail_sampler_kept_ratio` (P21) |
 
-> Postgres/Redis are deliberately **not** exposed on the host: their ports
-> (5432/6379) are commonly occupied by a local Postgres/Redis. The SDK only
-> talks to Langfuse (`:3000`) and the Collector (`:4317`/`:4318`). To debug the
-> database directly, run `docker compose exec postgres psql -U langfuse`.
+> Langfuse v3 **requires** `CLICKHOUSE_URL`/`CLICKHOUSE_MIGRATION_URL` and an
+> `ENCRYPTION_KEY` + `NEXTAUTH_SECRET` + `LANGFUSE_SALT` in `.env`. MinIO hosts
+> the S3 bucket Langfuse uses for media/event uploads (fully offline mode via
+> the compose network; Traefik/Let's Encrypt are **not** used).
+>
+> Postgres/Redis/ClickHouse/MinIO are deliberately **not** exposed on the host:
+> their ports are commonly occupied by a local service. The SDK only talks to
+> Langfuse (`:3000`) and the Collector (`:4317`/`:4318`). To debug the database
+> directly, run `docker compose exec postgres psql -U langfuse`.
 
 **Data flow**
 
 ```
 SDK --OTLP--> otel-collector(:4317/:4318) --tail_sampling--> --batch--> langfuse(/api/public/otel/v1/traces)
-                                          `-- metrics --> prometheus(:8888]
+                                          `-- metrics --> prometheus(:8888)
 ```
 
 ---
@@ -36,13 +44,15 @@ docker compose ps          # all services should be Up/healthy
 docker compose logs -f     # watch startup
 ```
 
-First boot creates the Langfuse database schema (Postgres migrations). Give it 30–60 seconds.
+First boot runs the Langfuse schema migrations (Postgres) and ClickHouse
+migrations. Give it 30–60 seconds; `langfuse-worker` may log transient
+`background_migrations` errors until the web migrations finish — that is benign.
 
 Smoke check:
 
 ```bash
 # Langfuse UI
-curl http://localhost:3000/api/public/health        # {"status":"ok", ...}
+curl http://localhost:3000/api/public/health        # {"status":"OK","version":"3.x", ...}
 open http://localhost:3000                          # UI
 
 # OTel Collector health
@@ -57,8 +67,14 @@ reporting "Everything is ready" on `:13133`.
 1. Open the Langfuse UI at <http://localhost:3000>.
 2. Sign in with the admin credentials from `.env`
    (`LANGFUSE_INIT_USER_EMAIL` / `LANGFUSE_INIT_USER_PASSWORD`).
-3. A project `agent-obs` is created automatically on first boot
-   (`LANGFUSE_INIT_PROJECT_NAME`). If not, create one via **Create Project**.
+3. A project `agent-obs` (`LANGFUSE_INIT_PROJECT_ID=prj-agent-obs`,
+   `LANGFUSE_INIT_ORG_ID=org-agent-obs`) is created automatically on first boot
+   with the placeholder API keys from `.env`. Verify the initial project via:
+
+   ```bash
+   curl http://localhost:3000/api/public/projects \
+     -u "pk-lf-your-public-key-here:sk-lf-your-secret-key-here"
+   ```
 4. Go to **Project Settings → API Keys** and copy:
    - **Public Key** (`pk-lf-...`)
    - **Secret Key** (`sk-lf-...`)
@@ -70,6 +86,8 @@ cd infra
 cp .env.example .env
 # edit .env, set:
 #   LANGFUSE_SALT=<random string>
+#   NEXTAUTH_SECRET=<random string>
+#   ENCRYPTION_KEY=<64 hex chars>
 #   LANGFUSE_INIT_USER_PASSWORD=<admin password>
 #   LANGFUSE_PUBLIC_KEY=pk-lf-<from UI>
 #   LANGFUSE_SECRET_KEY=sk-lf-<from UI>
@@ -128,19 +146,23 @@ The native counter is `otelcol_processor_tail_sampling_count_traces_sampled`
 with labels `decision` (`sampled`/`dropped`) and `reason` (policy name).
 
 ```bash
-curl http://localhost:9090/api/v1/query --data-urlencode \
+curl http://localhost:9091/api/v1/query --data-urlencode \
   'query=job:tail_sampler_kept_ratio:ratio'
 ```
 
 ## 7. Useful commands
 
 ```bash
-docker compose logs -f langfuse          # Langfuse logs
+docker compose logs -f langfuse          # Langfuse web logs
+docker compose logs -f langfuse-worker   # Langfuse worker/ingestion logs
 docker compose logs -f otel-collector    # Collector logs (debug exporter output)
 docker compose logs -f prometheus        # Prometheus logs
-docker compose down                      # stop (keeps postgres volume)
+docker compose down                      # stop (keeps volumes)
 docker compose down -v                   # stop and wipe data
 ```
+
+> `docker compose down -v` wipes the volumes. The `up -d` re-run boots a fresh
+> Langfuse v3 stack that re-runs Postgres + ClickHouse migrations (allow 30–60 s).
 
 ## 8. The SDK side (later waves)
 

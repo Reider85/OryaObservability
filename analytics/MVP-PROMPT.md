@@ -152,8 +152,9 @@ pyyaml, httpx. Langfuse self-hosted (docker-compose). OTel Collector (для tai
 
 ЧТО СДЕЛАТЬ
 1. infra/docker-compose.yml с сервисами:
-   - langfuse (self-hosted, образ langfuse/langfuse:2, порт 3000)
-   - postgres:16 (база метаданных Langfuse, volume, healthcheck)
+   - langfuse (self-hosted, образ langfuse/langfuse:3, порт 3000,
+     + langfuse-worker:3, clickhouse, minio для v3)
+   - postgres:17 (база метаданных Langfuse, volume, healthcheck)
    - redis:7 (очереди Langfuse)
    - otel-collector (образ otel/opentelemetry-collector-contrib:0.xx)
    Все переменные окружения (LANGFUSE_SALT, keys, DATABASE_URL) — через .env.example.

@@ -29,7 +29,11 @@ from typing import Any
 import httpx
 
 from agent_obs.exporters.base import BaseExporter
-from agent_obs.exporters.otlp_mapping import enrich_otlp_attributes
+from agent_obs.exporters.otlp_mapping import (
+    EVENTS_ATTRIBUTE,
+    enrich_otlp_attributes,
+    enrich_semconv_attributes,
+)
 from agent_obs.metrics import exporter_errors_total
 from agent_obs.observability import Span, SpanType
 
@@ -88,14 +92,18 @@ def _attr_to_otlp_value(value: Any) -> dict[str, Any]:
 def _span_to_otlp(span: Span) -> dict[str, Any]:
     """Convert a single Span to an OTLP Span dict.
 
-    Attributes are enriched with OTLP semantic-convention usage fields
-    (``gen_ai.usage.*``) so Langfuse can render tokens natively (P23).
+    Attributes are enriched with OTel semantic-convention usage fields
+    (``gen_ai.usage.*``) and type/alias fields (``gen_ai.operation.name``,
+    ``gen_ai.request.model``, ``gen_ai.usage.cost``, ``gen_ai.tool.name``) so
+    Langfuse v3 classifies LLM calls as ``GENERATION`` observations and
+    renders tokens/cost/model natively (P23).
     """
     attributes = [
         {"key": k, "value": _attr_to_otlp_value(v)}
         for k, v in span.attributes.items()
     ]
     attributes = enrich_otlp_attributes(attributes)
+    attributes = enrich_semconv_attributes(attributes, span)
 
     events = []
     for evt in span.events:
@@ -107,6 +115,21 @@ def _span_to_otlp(span: Span) -> dict[str, Any]:
             "timeUnixNano": _timestamp_to_nanos(time.time()),
             "name": evt.name,
             "attributes": evt_attributes,
+        })
+
+    # v3's legacy OTLP path drops span events, so mirror the names into an
+    # attribute for the UI metadata panel (P23).
+    if span.events:
+        attributes = list(attributes)
+        attributes.append({
+            "key": EVENTS_ATTRIBUTE,
+            "value": {
+                "arrayValue": {
+                    "values": [
+                        {"stringValue": evt.name} for evt in span.events
+                    ]
+                }
+            },
         })
 
     status_code = _STATUS_CODE_MAP.get(

@@ -12,7 +12,7 @@ Runbook для дежурного инженера (P25). Цель: найти �
 - Учётка: `LANGFUSE_INIT_USER_EMAIL` / `LANGFUSE_INIT_USER_PASSWORD` из `infra/.env`.
 - **Ключи API проектов не хранятся в репозитории.** Ссылка на секрет-менеджер:
   `infra/.env` (gitignored) для локали; в проде — managed vault (Уровень 2).
-- Prometheus: `http://localhost:9090` (метрики Collector/sampler).
+- Prometheus: `http://localhost:9091` (метрики Collector/sampler).
 
 ## 2. Поиск трейса по trace_id
 
@@ -59,7 +59,7 @@ Runbook для дежурного инженера (P25). Цель: найти �
   ```bash
   docker compose logs -f otel-collector   # debug exporter: экспорт в Langfuse
   docker compose logs -f langfuse         # ingest-ошибки на стороне Langfuse
-  curl http://localhost:9090/api/v1/query --data-urlencode \
+  curl http://localhost:9091/api/v1/query --data-urlencode \
     'query=agent_obs_exporter_errors_total'
   ```
 

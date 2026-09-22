@@ -1,8 +1,45 @@
 name: orya-observability
 
+# Shared environment for langfuse-web and langfuse-worker (Langfuse v3).
+# v3 stores traces in ClickHouse and needs an S3-compatible bucket (MinIO)
+# for event/media payloads; the v2 single-container image is gone.
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: ${LANGFUSE_HOST:-http://localhost:3000}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-my-observability-session-secret}
+  DATABASE_URL: ${DATABASE_URL:-postgresql://langfuse:langfuse@postgres:5432/langfuse}
+  SALT: ${LANGFUSE_SALT}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+  TELEMETRY_ENABLED: "false"
+
+  CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+  CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+  CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+
+  REDIS_HOST: ${REDIS_HOST:-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
+
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
 services:
   postgres:
-    image: postgres:16
+    image: postgres:17
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-langfuse}
@@ -22,8 +59,13 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    environment:
+      REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
+    volumes:
+      - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -31,33 +73,94 @@ services:
     # No host port: redis is internal to the compose network only.
     # Host 6379 is often occupied by a local Redis (see infra/README.md).
 
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    # No host port: clickhouse is internal to the compose network only.
+
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    # Pre-create the 'langfuse' bucket (MinIO stores each bucket as a directory).
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    # No host port: minio is internal to the compose network only.
+
   langfuse:
-    image: langfuse/langfuse:2
+    image: langfuse/langfuse:3
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://langfuse:langfuse@postgres:5432/langfuse}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      SALT: ${LANGFUSE_SALT}
-      NEXTAUTH_URL: ${LANGFUSE_HOST:-http://localhost:3000}
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-my-observability-session-secret}
-      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
-      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+      <<: *langfuse-env
+      # First-boot provisioning (v3 only runs it when ORG_ID is set).
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Orya Observability}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-prj-agent-obs}
       LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-agent-obs}
-      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-00000000-0000-0000-0000-000000000000}
-      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-00000000-0000-0000-0000-000000000000}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-your-public-key-here}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-your-secret-key-here}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
     ports:
       - "3000:3000"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- \"http://$$(hostname):3000/api/public/health\""]
+      # v3's Next.js server binds to the container IP ($HOSTNAME), not loopback,
+      # so probe the health endpoint via $HOSTNAME. Returns 503 until
+      # Postgres/ClickHouse are migrated, 200 once ready.
+      test: ["CMD", "node", "-e", "fetch('http://'+process.env.HOSTNAME+':3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
-      retries: 6
-      start_period: 30s
+      retries: 30
+      start_period: 60s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.128.0
@@ -88,7 +191,11 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus-rules.yml:/etc/prometheus/rules.yml:ro
     ports:
-      - "9090:9090"
+      - "9091:9090"
 
 volumes:
   postgres_data:
+  redis_data:
+  clickhouse_data:
+  clickhouse_logs:
+  minio_data:

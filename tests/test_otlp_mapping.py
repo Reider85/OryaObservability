@@ -4,6 +4,7 @@ from agent_obs.exporters.otlp_mapping import (
     LANGFUSE_LABELS,
     USAGE_CONVENTION_MAP,
     enrich_otlp_attributes,
+    enrich_semconv_attributes,
     span_to_langfuse_labels,
 )
 from agent_obs.observability import Span, SpanContext, SpanType, _now
@@ -191,6 +192,75 @@ class TestEnrichOtlpAttributes:
         assert "llm.model" in keys
         assert "status" in keys
         assert "gen_ai.usage.input_tokens" in keys
+
+
+class TestEnrichSemconvAttributes:
+    @staticmethod
+    def _kv(key: str, value) -> dict:
+        return {"key": key, "value": {"stringValue": str(value)}}
+
+    def _enrich(
+        self,
+        span_type: SpanType,
+        attributes: dict,
+        existing: list[dict] | None = None,
+    ) -> list[dict]:
+        span = _make_span(span_type=span_type, attributes=attributes)
+        return enrich_semconv_attributes(existing or [], span)
+
+    def test_llm_call_becomes_generation_operation(self) -> None:
+        attrs = self._enrich(SpanType.LLM_CALL, {"llm.provider": "openai"})
+        op = next(
+            a for a in attrs if a["key"] == "gen_ai.operation.name"
+        )
+        assert op["value"] == {"stringValue": "chat"}
+
+    def test_llm_model_aliased_to_gen_ai_request_model(self) -> None:
+        attrs = self._enrich(SpanType.LLM_CALL, {"llm.model": "gpt-4o"})
+        model = next(a for a in attrs if a["key"] == "gen_ai.request.model")
+        assert model["value"] == {"stringValue": "gpt-4o"}
+
+    def test_cost_aliased_to_gen_ai_usage_cost(self) -> None:
+        attrs = self._enrich(SpanType.LLM_CALL, {"cost.usd": 0.0123})
+        cost = next(a for a in attrs if a["key"] == "gen_ai.usage.cost")
+        assert cost["value"] == {"doubleValue": 0.0123}
+
+    def test_tool_call_maps_to_gen_ai_tool_name(self) -> None:
+        attrs = self._enrich(SpanType.TOOL_CALL, {"tool.name": "search"})
+        tool = next(a for a in attrs if a["key"] == "gen_ai.tool.name")
+        assert tool["value"] == {"stringValue": "search"}
+
+    def test_agent_loop_maps_to_openinference_kind(self) -> None:
+        attrs = self._enrich(SpanType.AGENT_LOOP, {})
+        kind = next(a for a in attrs if a["key"] == "openinference.span.kind")
+        assert kind["value"] == {"stringValue": "AGENT"}
+
+    def test_existing_semconv_attributes_not_duplicated(self) -> None:
+        existing = [
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+        ]
+        attrs = self._enrich(
+            SpanType.LLM_CALL, {"llm.model": "gpt-4o"}, existing
+        )
+        gen_ai_op = [a for a in attrs if a["key"] == "gen_ai.operation.name"]
+        assert len(gen_ai_op) == 1
+        gen_ai_model = [a for a in attrs if a["key"] == "gen_ai.request.model"]
+        assert len(gen_ai_model) == 1
+
+    def test_original_attributes_preserved(self) -> None:
+        attrs = self._enrich(
+            SpanType.TOOL_CALL, {"tool.name": "search"}, [self._kv("x", "y")]
+        )
+        keys = {a["key"] for a in attrs}
+        assert "x" in keys
+        assert "gen_ai.tool.name" in keys
+
+    def test_missing_alias_source_skips_convention(self) -> None:
+        attrs = self._enrich(SpanType.LLM_CALL, {"llm.provider": "openai"})
+        keys = {a["key"] for a in attrs}
+        assert "gen_ai.request.model" not in keys
+        assert "gen_ai.usage.cost" not in keys
 
 
 class TestMappingConstants:

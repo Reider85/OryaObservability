@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_obs.observability import Span
+from agent_obs.observability import Span, SpanType
 
 # Internal attribute name -> Langfuse UI label shown to the operator.
 LANGFUSE_LABELS: dict[str, str] = {
@@ -30,6 +30,44 @@ USAGE_CONVENTION_MAP: dict[str, str] = {
     "tokens.output": "gen_ai.usage.output_tokens",
     "tokens.cached": "gen_ai.usage.cached_input_tokens",
 }
+
+# Per-span-type OTel GenAI attributes that let Langfuse classify the
+# observation and render it natively (tree/type, usage, cost).
+# Keys are the source span attribute; ``None`` means a constant value.
+SEMCONV_TYPE_MAP: dict[SpanType, dict[str, str | None]] = {
+    SpanType.AGENT_LOOP: {"openinference.span.kind": None},
+    SpanType.LLM_CALL: {"gen_ai.operation.name": None},
+    SpanType.TOOL_CALL: {"gen_ai.tool.name": "tool.name"},
+}
+
+# Constant values for convention attributes whose source is ``None``.
+SEMCONV_CONSTANTS: dict[str, str] = {
+    "openinference.span.kind": "AGENT",
+}
+
+# Extra value-aliasing so Langfuse picks up model/cost from our attributes.
+ALIAS_CONVENTION_MAP: dict[str, str] = {
+    "llm.model": "gen_ai.request.model",
+    "cost.usd": "gen_ai.usage.cost",
+}
+
+_LLM_GEN_AI_OPERATION = "chat"
+
+# Attribute carrying the span event names for the UI metadata panel.
+# Langfuse v3's legacy OTLP path does not persist OTLP span events natively,
+# so events are mirrored under this attribute (P23).
+EVENTS_ATTRIBUTE = "agent_obs.events"
+
+
+def _otlp_value(value: Any) -> dict[str, Any]:
+    """Convert a Python value to an OTLP KeyValue value."""
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": value}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    return {"stringValue": str(value)}
 
 
 def span_to_langfuse_labels(span: Span) -> dict[str, str]:
@@ -74,4 +112,47 @@ def enrich_otlp_attributes(attributes: list[dict[str, Any]]) -> list[dict[str, A
             continue
         enriched.append({"key": convention, "value": existing[internal]})
         added.add(convention)
+    return enriched
+
+
+def enrich_semconv_attributes(
+    attributes: list[dict[str, Any]], span: Span
+) -> list[dict[str, Any]]:
+    """Add OTel GenAI semantic-convention attributes for Langfuse v3.
+
+    Langfuse v3 classifies observations from ``gen_ai.operation.name`` /
+    ``gen_ai.tool.name`` / ``openinference.span.kind`` and only renders native
+    usage/cost/model columns for generation observations.  This enrichment
+    aliases our span attributes so LLM calls become native ``GENERATION``
+    observations, tool calls ``TOOL``, and the agent loop ``AGENT`` (P23).
+
+    Called after :func:`enrich_otlp_attributes`; keys already present are
+    never duplicated.
+    """
+    existing = {a["key"] for a in attributes}
+    enriched = list(attributes)
+
+    def _add(key: str, value: Any) -> None:
+        if key not in existing:
+            enriched.append({"key": key, "value": _otlp_value(value)})
+            existing.add(key)
+
+    span_attrs = span.attributes or {}
+    for convention, source in SEMCONV_TYPE_MAP.get(span.span_type, {}).items():
+        if source is not None:
+            value = span_attrs.get(source)
+            if value is None:
+                continue
+        elif convention in SEMCONV_CONSTANTS:
+            value = SEMCONV_CONSTANTS[convention]
+        else:
+            value = _LLM_GEN_AI_OPERATION
+        _add(convention, value)
+
+    if span.span_type == SpanType.LLM_CALL:
+        for source, convention in ALIAS_CONVENTION_MAP.items():
+            value = span_attrs.get(source)
+            if value is not None:
+                _add(convention, value)
+
     return enriched
