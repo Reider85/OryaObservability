@@ -1,0 +1,93 @@
+# promtool test rules for P21 recording rules.
+#
+# Run (inside the repo root):
+#   docker run --rm -v "%cd%/infra:/infra" -v "%cd%/tests:/tests" \
+#     prom/prometheus promtool test rules /tests/prometheus_rules_test.yml
+
+rule_files:
+  - /infra/prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- Overall kept ratio on a fixed set of traces --------------------------
+  - interval: 1m
+    name: kept ratio is 100 / (100 + 400) = 0.2
+    input_series:
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"}'
+        values: "100"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="dropped"}'
+        values: "400"
+    promql_expr_test:
+      - expr: job:tail_sampler_kept_ratio:ratio
+        eval_time: 1m
+        exp_samples:
+          - labels: '{}'
+            value: 0.2
+
+  # --- All kept -------------------------------------------------------------
+  - interval: 1m
+    name: all traces kept → ratio 1
+    input_series:
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"}'
+        values: "50"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="dropped"}'
+        values: "0"
+    promql_expr_test:
+      - expr: job:tail_sampler_kept_ratio:ratio
+        eval_time: 1m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # --- Keep reasons are distinguishable -------------------------------------
+  - interval: 1m
+    name: per-reason breakdown (error/cost/security/normal)
+    input_series:
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled",reason="error-keep"}'
+        values: "30"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled",reason="cost-over-budget-keep"}'
+        values: "20"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled",reason="security-incident-keep"}'
+        values: "10"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled",reason="normal-sample"}'
+        values: "40"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="dropped"}'
+        values: "400"
+    promql_expr_test:
+      - expr: job:tail_sampler_kept_ratio:ratio
+        eval_time: 1m
+        exp_samples:
+          - labels: '{}'
+            value: 0.2
+      - expr: job:tail_sampler_kept_by_reason:ratio
+        eval_time: 1m
+        exp_samples:
+          - labels: '{reason="error-keep"}'
+            value: 0.3
+          - labels: '{reason="cost-over-budget-keep"}'
+            value: 0.2
+          - labels: '{reason="security-incident-keep"}'
+            value: 0.1
+          - labels: '{reason="normal-sample"}'
+            value: 0.4
+
+  # --- Normal-sample-only case (10% keep rate) ------------------------------
+  - interval: 1m
+    name: only normal-sample kept traces (10% rate)
+    input_series:
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled",reason="normal-sample"}'
+        values: "10"
+      - series: 'otelcol_processor_tail_sampling_count_traces_sampled{decision="dropped"}'
+        values: "90"
+    promql_expr_test:
+      - expr: job:tail_sampler_kept_ratio:ratio
+        eval_time: 1m
+        exp_samples:
+          - labels: '{}'
+            value: 0.1
+      - expr: job:tail_sampler_kept_by_reason:ratio
+        eval_time: 1m
+        exp_samples:
+          - labels: '{reason="normal-sample"}'
+            value: 1
