@@ -93,6 +93,22 @@ services:
     # No host port: redis is internal to the compose network only.
     # Host 6379 is often occupied by a local Redis (see infra/README.md).
 
+  eval-redis:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-server --requirepass ${EVAL_REDIS_AUTH:-eval-redis-secret} --maxmemory-policy noeviction --database 1
+    environment:
+      REDIS_AUTH: ${EVAL_REDIS_AUTH:-eval-redis-secret}
+    volumes:
+      - eval_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    # Dedicated Redis instance for async eval jobs (separate from Langfuse)
+
   clickhouse:
     image: clickhouse/clickhouse-server
     restart: unless-stopped
@@ -227,6 +243,38 @@ services:
       retries: 6
       start_period: 10s
 
+  eval-worker:
+    image: eval-worker:latest
+    restart: unless-stopped
+    depends_on:
+      eval-redis:
+        condition: service_healthy
+    environment:
+      EVAL_REDIS_URL: redis://eval-redis:6379/1
+      EVAL_QUEUE_NAME: eval-queue
+      EVAL_WORKER_CONCURRENCY: 4
+      LLM_JUDGE_MODEL: gpt-4o-mini
+      LLM_JUDGE_API_KEY: ${OPENAI_API_KEY}
+      EMBEDDING_MODEL: text-embedding-3-small
+      PYTHONPATH: /app
+    volumes:
+      - ../:/app:ro
+    command: >
+      sh -c "cd /app && 
+             python -m rq worker eval-queue \
+             --url redis://eval-redis:6379/1 \
+             --worker-class 'rq.worker.SimpleWorker' \
+             --name eval-worker-1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8777/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    scale: 2
+    expose:
+      - "8777"
+
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
@@ -242,6 +290,7 @@ volumes:
   postgres_data:
   postgres_warm_data:
   redis_data:
+  eval_redis_data:
   clickhouse_data:
   clickhouse_logs:
   minio_data:
