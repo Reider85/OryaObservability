@@ -7,6 +7,7 @@ Local self-hosted observability stack for the `agent-obs` MVP
 
 | Service | Image | Port | Purpose |
 |---|---|---|---|
+| `vault` | `hashicorp/vault:1.18` | `8200` | HashiCorp Vault for PII recovery storage (PC02) |
 | `langfuse` | `langfuse/langfuse:3` | `3000` | Trace UI + OTLP ingest |
 | `langfuse-worker` | `langfuse/langfuse-worker:3` | internal | Ingestion/queue workers (ClickhouseWriter, otel-ingestion) |
 | `postgres` | `postgres:17` | internal | Langfuse metadata database (compose network only) |

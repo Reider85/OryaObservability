@@ -208,6 +208,25 @@ services:
       - "4318:4318"
       - "8888:8888"
 
+  vault:
+    image: hashicorp/vault:1.18
+    restart: unless-stopped
+    cap_add: ["IPC_LOCK"]
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_LOCAL_CONFIG: '{"storage":{"file":{"path":"/vault/data"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+    volumes:
+      - vault_data:/vault/data
+      - ./vault/policies:/vault/policies:ro
+      - ./vault/vault_init.sh:/vault/vault_init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "vault status -format=json || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
@@ -226,3 +245,4 @@ volumes:
   clickhouse_data:
   clickhouse_logs:
   minio_data:
+  vault_data:

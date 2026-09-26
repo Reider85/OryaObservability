@@ -1,0 +1,1 @@
+path "sys/audit-hash/*" { capabilities = ["update"] }
