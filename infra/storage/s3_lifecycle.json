@@ -1,0 +1,26 @@
+{
+  "Rules": [
+    {
+      "ID": "cold-traces-lifecycle",
+      "Status": "Enabled",
+      "Prefix": "cold-traces/",
+      "Expiration": {
+        "Days": 365
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 30
+      }
+    },
+    {
+      "ID": "audit-events-lifecycle", 
+      "Status": "Enabled",
+      "Prefix": "audit-events/",
+      "Expiration": {
+        "Days": 90
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 30
+      }
+    }
+  ]
+}
