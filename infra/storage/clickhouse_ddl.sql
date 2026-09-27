@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS eval_results_hot (
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (trace_id, eval_id, eval_name, eval_timestamp)
-TTL start_time + INTERVAL 14 DAY
+TTL eval_timestamp + INTERVAL 14 DAY
 SETTINGS index_granularity = 8192;
 
 -- audit_events_hot table: security audit events for hot tier (365 days retention)

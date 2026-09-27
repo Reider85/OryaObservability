@@ -38,4 +38,4 @@ RUN pip install -e /app/
 EXPOSE 8777
 
 # Health check endpoint (simple HTTP server for health checks)
-CMD ["sh", "-c", "python -m http.server 8777 --bind 0.0.0.0 & rq worker eval-queue --url redis://eval-redis:6379/1 --worker-class 'rq.worker.SimpleWorker' --name eval-worker-1"]
+CMD ["sh", "-c", "python -m http.server 8777 --bind 0.0.0.0 & rq worker eval-queue --url redis://eval-redis:6379/1 --worker-class rq.worker.SimpleWorker --name eval-worker-1 agent_obs.eval.llm_judge_worker.llm_judge_worker"]

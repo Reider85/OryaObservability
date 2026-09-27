@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, Histogram
 
 spans_total = Counter(
     "agent_obs_spans_total",
@@ -54,4 +54,31 @@ eval_llm_judge_pending_total = Counter(
 eval_llm_judge_sampling_skipped_total = Counter(
     "agent_obs_eval_llm_judge_sampling_skipped_total",
     "LLM judge evaluations skipped due to sampling rate",
+)
+
+eval_annotation_total = Counter(
+    "agent_obs_eval_annotation_total",
+    "Late annotation writes to ClickHouse",
+    ["status"],
+)
+
+eval_annotation_redis_fallback_total = Counter(
+    "agent_obs_eval_annotation_redis_fallback_total",
+    "Late annotations stored in Redis due to ClickHouse unavailability",
+)
+
+eval_jobs_completed_total = Counter(
+    "agent_obs_eval_jobs_completed_total",
+    "LLM judge jobs completed successfully",
+)
+
+eval_jobs_failed_total = Counter(
+    "agent_obs_eval_jobs_failed_total",
+    "LLM judge jobs that failed",
+)
+
+eval_job_latency_seconds = Histogram(
+    "agent_obs_eval_job_latency_seconds",
+    "LLM judge job processing latency",
+    buckets=[1, 2, 5, 10, 15, 30, 60],
 )

@@ -19,6 +19,7 @@ dependencies = [
     "jsonschema>=4.20",
     "rq>=1.14",
     "redis>=5.0",
+    "clickhouse-driver>=0.2.7",
 ]
 
 [project.optional-dependencies]
