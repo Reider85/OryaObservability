@@ -12,6 +12,7 @@ from agent_obs.guardrail.engine import (
     GuardrailEngine,
     GuardrailVerdict,
 )
+from agent_obs.guardrail.vault_client import MFARequiredError, MFAConfig
 from agent_obs.guardrail.field_masker import FieldMasker
 from agent_obs.guardrail.injection_classifier import InjectionClassifier, InjectionScore
 from agent_obs.guardrail.pii_detector import PIIDetector
@@ -28,6 +29,8 @@ __all__ = [
     "FieldMasker",
     "InjectionClassifier",
     "InjectionScore",
+    "MFAConfig",
+    "MFARequiredError",
     "PIIDetector",
     "PIIMatch",
     "PresidioPIIEngine",

@@ -1,0 +1,14 @@
+# Configuration for authorized engineers with MFA access to vault recovery
+# This file should be kept in git, but the actual TOTP secrets should be
+# managed through environment variables for security.
+
+# List of engineer logins authorized for MFA-based vault recovery
+authorized_logins:
+  - alice@company.com
+  - bob@company.com
+
+# Configuration notes:
+# - Each login must match exactly with the login used in the CLI
+# - TOTP secrets should be stored in VAULT_MFA_SECRETS environment variable
+#   Format: "alice@company.com:TOTP_SECRET,bob@company.com:TOTP_SECRET"
+# - Rate limiting is applied per login with 3 failed attempts → 5 min cooldown

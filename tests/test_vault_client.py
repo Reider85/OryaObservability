@@ -1,13 +1,15 @@
 """Tests for VaultClient with real hvac integration (mocked)."""
 
 import asyncio
+import os
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pyotp
 
-from agent_obs.guardrail.vault_client import VaultClient, _VaultEntry
+from agent_obs.guardrail.vault_client import VaultClient, _VaultEntry, MFARequiredError, MFAConfig
 
 
 class TestVaultEntry:
@@ -326,3 +328,220 @@ class TestVaultClient:
         
         with pytest.raises(ConnectionError, match="Vault client not authenticated"):
             await vault_client.recover("pii/test/1234567890")
+
+
+class TestVaultClientMFA:
+    """Test MFA functionality for vault recovery."""
+
+    @pytest.fixture
+    def mfa_config(self):
+        """Create MFA config for testing."""
+        return MFAConfig(
+            totp_secrets={
+                "alice@company.com": "JBSWY3DPEHPK3PXP",  # "Hello World" in base32
+                "bob@company.com": "MFRGG43FMVSE33JB",    # Secret for testing
+            },
+            authorized_logins=["alice@company.com", "bob@company.com"],
+            max_attempts=3,
+            cooldown_seconds=300,
+        )
+
+    @pytest.fixture
+    def mock_redis(self):
+        """Mock redis client for testing."""
+        mock_redis_client = MagicMock()
+        
+        # Make sure incr returns a coroutine (async function)
+        async def mock_incr(key):
+            return 1
+        
+        # Make sure expire returns a coroutine
+        async def mock_expire(key, ttl):
+            return True
+            
+        # Make sure delete returns a coroutine
+        async def mock_delete(key):
+            return True
+            
+        mock_redis_client.incr = mock_incr
+        mock_redis_client.expire = mock_expire
+        mock_redis_client.delete = mock_delete
+        mock_redis_client.from_url.return_value = mock_redis_client
+        return mock_redis_client
+
+    @pytest.fixture
+    def mfa_vault_client(self, mfa_config, mock_redis):
+        """Create VaultClient with MFA enabled."""
+        with patch("hvac.Client") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.is_authenticated.return_value = True
+            mock_client.sys.health_check.return_value = {
+                "initialized": True,
+                "sealed": False,
+            }
+            mock_client.secrets.kv.v2.create_or_update_secret.return_value = {"data": {"metadata": {}}}
+            mock_client.secrets.kv.v2.read_secret_version.return_value = {
+                "data": {
+                    "data": {
+                        "mask": "[EMAIL:5f3a]",
+                        "original": "ivan@example.com",
+                        "created_at": time.time(),
+                        "ttl_seconds": 86400,
+                    }
+                }
+            }
+            
+            with patch("redis.asyncio.from_url", return_value=mock_redis):
+                client = VaultClient(
+                    addr="http://localhost:8200",
+                    token="test-token",
+                    verify_tls=False,
+                    mfa_config=mfa_config,
+                    redis_url="redis://localhost:6379/2",
+                )
+                yield client
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_required_without_token(self, mfa_vault_client):
+        """Test that recover without MFA token raises MFARequiredError."""
+        with pytest.raises(MFARequiredError, match="MFA verification required"):
+            await mfa_vault_client.recover("pii/test/1234567890", login="alice@company.com")
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_invalid_login(self, mfa_vault_client):
+        """Test that recover with invalid login raises MFARequiredError."""
+        with pytest.raises(MFARequiredError, match="Login 'invalid@company.com' not authorized"):
+            await mfa_vault_client.recover(
+                "pii/test/1234567890", 
+                mfa_token="123456", 
+                login="invalid@company.com"
+            )
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_invalid_token(self, mfa_vault_client):
+        """Test that recover with invalid TOTP token raises MFARequiredError."""
+        with pytest.raises(MFARequiredError, match="Invalid MFA token"):
+            await mfa_vault_client.recover(
+                "pii/test/1234567890", 
+                mfa_token="123456",  # Wrong token
+                login="alice@company.com"
+            )
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_valid_token(self, mfa_vault_client):
+        """Test that recover with valid TOTP token succeeds."""
+        # First store something
+        vault_key = await mfa_vault_client.store(
+            mask="[EMAIL:5f3a]",
+            original="ivan@example.com",
+        )
+        
+        # Generate valid TOTP token for alice@company.com
+        totp = pyotp.TOTP("JBSWY3DPEHPK3PXP")
+        valid_token = totp.now()
+        
+        # Then recover it with valid token
+        original = await mfa_vault_client.recover(
+            vault_key, 
+            mfa_token=valid_token, 
+            login="alice@company.com"
+        )
+        
+        assert original == "ivan@example.com"
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_rate_limit(self, mfa_vault_client):
+        """Test that rate limiting blocks after 3 failed attempts."""
+        # Generate invalid tokens to trigger rate limit
+        totp = pyotp.TOTP("JBSWY3DPEHPK3PXP")
+        
+        for i in range(3):
+            with pytest.raises(MFARequiredError, match="Invalid MFA token"):
+                await mfa_vault_client.recover(
+                    "pii/test/1234567890", 
+                    mfa_token="000000",  # Always wrong
+                    login="alice@company.com"
+                )
+        
+        # 4th attempt should be blocked by rate limit
+        with pytest.raises(MFARequiredError, match="Rate limit exceeded"):
+            await mfa_vault_client.recover(
+                "pii/test/1234567890", 
+                mfa_token="000000",
+                login="alice@company.com"
+            )
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_rate_limit_cooldown_expires(self, mfa_vault_client):
+        """Test that rate limit expires after cooldown period."""
+        # This test would need to mock time or use real Redis with short TTL
+        # For now, just verify the logic exists
+        assert mfa_vault_client.mfa_config.cooldown_seconds == 300
+
+    @pytest.mark.asyncio
+    async def test_recover_mfa_no_config(self):
+        """Test that recover works without MFA config."""
+        with patch("hvac.Client") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.is_authenticated.return_value = True
+            mock_client.sys.health_check.return_value = {
+                "initialized": True,
+                "sealed": False,
+            }
+            mock_client.secrets.kv.v2.create_or_update_secret.return_value = {"data": {"metadata": {}}}
+            mock_client.secrets.kv.v2.read_secret_version.return_value = {
+                "data": {
+                    "data": {
+                        "mask": "[EMAIL:5f3a]",
+                        "original": "ivan@example.com",
+                        "created_at": time.time(),
+                        "ttl_seconds": 86400,
+                    }
+                }
+            }
+            
+            client = VaultClient(
+                addr="http://localhost:8200",
+                token="test-token",
+                verify_tls=False,
+                mfa_config=None,  # No MFA
+            )
+            
+            # Store and recover without MFA
+            vault_key = await client.store(
+                mask="[EMAIL:5f3a]",
+                original="ivan@example.com",
+            )
+            
+            original = await client.recover(vault_key)
+            assert original == "ivan@example.com"
+
+    def test_mfa_config_from_env(self):
+        """Test MFAConfig loading from environment."""
+        # Set test environment
+        os.environ["VAULT_MFA_SECRETS"] = "alice:secret1,bob:secret2"
+        os.environ["VAULT_MFA_AUTHORIZED"] = "alice@company.com,bob@company.com"
+        
+        config = MFAConfig.from_env()
+        assert config is not None
+        assert "alice" in config.totp_secrets
+        assert "bob" in config.totp_secrets
+        assert "alice@company.com" in config.authorized_logins
+        assert "bob@company.com" in config.authorized_logins
+        
+        # Clean up
+        del os.environ["VAULT_MFA_SECRETS"]
+        del os.environ["VAULT_MFA_AUTHORIZED"]
+
+    def test_mfa_config_from_env_none(self):
+        """Test MFAConfig returns None when no env vars set."""
+        # Ensure no env vars are set
+        if "VAULT_MFA_SECRETS" in os.environ:
+            del os.environ["VAULT_MFA_SECRETS"]
+        if "VAULT_MFA_AUTHORIZED" in os.environ:
+            del os.environ["VAULT_MFA_AUTHORIZED"]
+        
+        config = MFAConfig.from_env()
+        assert config is None

@@ -21,6 +21,7 @@ dependencies = [
     "redis>=5.0",
     "clickhouse-driver>=0.2.7",
     "hvac>=2.0.0",
+    "pyotp>=2.9",
 ]
 
 [project.optional-dependencies]

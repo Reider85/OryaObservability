@@ -2,21 +2,68 @@
 
 PC18 provides a full implementation with real Vault HTTP API calls, TTL-based
 expiration via Vault leases, and batch operations. Replaces the PC07 in-memory stub.
+PC19 adds TOTP MFA verification and rate-limiting for recovery operations.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
 import hvac
+import pyotp
 from hvac.exceptions import VaultError
 
 logger = logging.getLogger(__name__)
+
+
+class MFARequiredError(Exception):
+    """Raised when MFA verification fails or is required for vault recovery."""
+    pass
+
+
+@dataclass
+class MFAConfig:
+    """Configuration for TOTP MFA verification."""
+    
+    totp_secrets: dict[str, str]  # login -> totp_secret
+    authorized_logins: list[str]  # list of authorized engineer emails
+    max_attempts: int = 3
+    cooldown_seconds: int = 300  # 5 minutes
+    
+    @classmethod
+    def from_env(cls) -> Optional["MFAConfig"]:
+        """Load MFA config from environment variables."""
+        # In production, these would be loaded from secure config files
+        # For CRITICAL level, we keep them in env for security
+        totp_secrets = {}
+        authorized_logins = []
+        
+        # Parse from environment: VAULT_MFA_SECRETS="alice:secret1,bob:secret2"
+        if secrets_str := os.environ.get("VAULT_MFA_SECRETS"):
+            for item in secrets_str.split(","):
+                if ":" in item:
+                    login, secret = item.split(":", 1)
+                    totp_secrets[login] = secret
+        
+        # Parse from environment: VAULT_MFA_AUTHORIZED="alice@company.com,bob@company.com"
+        if authorized_str := os.environ.get("VAULT_MFA_AUTHORIZED"):
+            authorized_logins = [login.strip() for login in authorized_str.split(",")]
+        
+        if not totp_secrets or not authorized_logins:
+            return None
+            
+        return cls(
+            totp_secrets=totp_secrets,
+            authorized_logins=authorized_logins,
+            max_attempts=int(os.environ.get("VAULT_MFA_MAX_ATTEMPTS", "3")),
+            cooldown_seconds=int(os.environ.get("VAULT_MFA_COOLDOWN_SECONDS", "300")),
+        )
 
 
 @dataclass
@@ -57,11 +104,15 @@ class VaultClient:
         token: str = "",
         namespace: str = "",
         verify_tls: bool = True,
+        mfa_config: Optional[MFAConfig] = None,
+        redis_url: Optional[str] = None,
     ) -> None:
         self.addr = addr
         self.token = token
         self.namespace = namespace
         self.verify_tls = verify_tls
+        self.mfa_config = mfa_config or MFAConfig.from_env()
+        self.redis_url = redis_url or os.environ.get("VAULT_MFA_REDIS_URL")
         self._client: Optional[hvac.Client] = None
         self._health_cache: dict = {"available": False, "checked_at": 0}
         self._health_cache_ttl = 30  # Cache health check for 30 seconds
@@ -179,7 +230,7 @@ class VaultClient:
         logger.debug("vault.store_batch stored %d/%d items", len(results), len(items))
         return results
 
-    async def recover(self, vault_key: str, mfa_token: str = "") -> str:
+    async def recover(self, vault_key: str, mfa_token: str = "", login: str = "") -> str:
         """Recover the original PII value for a given vault_key.
 
         Parameters
@@ -187,7 +238,9 @@ class VaultClient:
         vault_key:
             The vault_key returned by :meth:`store`.
         mfa_token:
-            TOTP token for MFA verification (currently unused, reserved for PC19).
+            TOTP token for MFA verification. Required if MFA is configured.
+        login:
+            Engineer's login/email for rate-limiting and MFA verification.
 
         Returns
         -------
@@ -200,7 +253,20 @@ class VaultClient:
             If the vault_key does not exist or has expired.
         ConnectionError
             If Vault is unreachable.
+        MFARequiredError
+            If MFA is required and token is missing or invalid.
         """
+        # MFA verification before accessing Vault
+        if self.mfa_config and (login or mfa_token):
+            if not login:
+                raise ValueError("login is required when MFA is enabled")
+            
+            await self.verify_mfa(login, mfa_token)
+        
+        # If MFA is configured but no login/token provided, require them
+        elif self.mfa_config:
+            raise MFARequiredError("MFA verification required for vault recovery")
+        
         try:
             client = self._get_client()
             if not client.is_authenticated():
@@ -231,6 +297,108 @@ class VaultClient:
                 raise KeyError(f"vault_key not found: {vault_key}")
             logger.error("vault.recover failed for key=%s: %s", vault_key, str(e))
             raise ConnectionError(f"Vault error: {str(e)}")
+
+    async def verify_mfa(self, login: str, mfa_token: str) -> bool:
+        """Verify TOTP token for the given login.
+        
+        Parameters
+        ----------
+        login:
+            Engineer's login/email
+        mfa_token:
+            TOTP token to verify
+            
+        Returns
+        -------
+        bool
+            True if verification successful
+            
+        Raises
+        ------
+        MFARequiredError
+            If token is invalid or rate limit exceeded
+        """
+        if not self.mfa_config:
+            return True
+            
+        # Check if login is authorized
+        if login not in self.mfa_config.authorized_logins:
+            raise MFARequiredError(f"Login '{login}' not authorized for MFA")
+        
+        # Check rate limit first
+        if await self._check_rate_limit(login):
+            raise MFARequiredError(f"Rate limit exceeded for login '{login}'")
+        
+        # Get TOTP secret for this login
+        if login not in self.mfa_config.totp_secrets:
+            raise MFARequiredError(f"No TOTP secret found for login '{login}'")
+        
+        totp_secret = self.mfa_config.totp_secrets[login]
+        totp = pyotp.TOTP(totp_secret)
+        
+        # Verify with window=1 (±30 seconds tolerance)
+        if not totp.verify(mfa_token, valid_window=1):
+            # Rate limit on failed attempt
+            await self._record_failed_attempt(login)
+            raise MFARequiredError("Invalid MFA token")
+        
+        # Reset rate limit on successful verification
+        await self._reset_rate_limit(login)
+        return True
+
+    async def _check_rate_limit(self, login: str) -> bool:
+        """Check if rate limit would be exceeded for this login."""
+        if not self.redis_url:
+            return False
+            
+        try:
+            import redis.asyncio as redis
+            r = redis.from_url(self.redis_url)
+            key = f"rate_limit:vault:{login}"
+            
+            # Get current count
+            count = await r.incr(key)
+            if count == 1:
+                # Set expiration on first increment
+                await r.expire(key, self.mfa_config.cooldown_seconds)
+            
+            return count > self.mfa_config.max_attempts
+            
+        except Exception as e:
+            logger.warning("Rate limit check failed for %s: %s", login, str(e))
+            # If Redis fails, we allow the attempt but log the failure
+            return False
+
+    async def _record_failed_attempt(self, login: str) -> None:
+        """Record a failed MFA attempt."""
+        if not self.redis_url:
+            return
+            
+        try:
+            import redis.asyncio as redis
+            r = redis.from_url(self.redis_url)
+            key = f"rate_limit:vault:{login}"
+            
+            await r.incr(key)
+            await r.expire(key, self.mfa_config.cooldown_seconds)
+            
+        except Exception as e:
+            logger.warning("Failed to record failed attempt for %s: %s", login, str(e))
+
+    async def _reset_rate_limit(self, login: str) -> None:
+        """Reset rate limit for a successful login."""
+        if not self.redis_url:
+            return
+            
+        try:
+            import redis.asyncio as redis
+            r = redis.from_url(self.redis_url)
+            key = f"rate_limit:vault:{login}"
+            
+            await r.delete(key)
+            
+        except Exception as e:
+            logger.warning("Failed to reset rate limit for %s: %s", login, str(e))
 
     def is_available(self) -> bool:
         """Return True if Vault backend is reachable.
@@ -270,3 +438,79 @@ class VaultClient:
         if self._client:
             self._client.close()
             self._client = None
+
+
+# ---------------------------------------------------------------------------
+# CLI functionality for PC19
+# ---------------------------------------------------------------------------
+
+def generate_totp_secret(login: str) -> str:
+    """Generate TOTP secret for an engineer and print QR code."""
+    totp_secret = pyotp.random_base32()
+    
+    print(f"\n=== TOTP Secret Generation for {login} ===")
+    print(f"Login: {login}")
+    print(f"TOTP Secret: {totp_secret}")
+    
+    # Generate QR code for Google Authenticator
+    totp = pyotp.TOTP(totp_secret)
+    provisioning_url = totp.provisioning_uri(name=login, issuer_name="Agent-Obs")
+    
+    print(f"\nQR Code URL (for manual setup):")
+    print(provisioning_url)
+    
+    print(f"\nSetup Instructions:")
+    print("1. Open Google Authenticator app on your phone")
+    print("2. Tap '+' and select 'Scan a barcode' (or 'Enter a setup key')")
+    print("3. Scan the QR code or manually enter the secret above")
+    print("4. Test with the current time-based code")
+    print("5. Save the secret securely (this is the only time it will be shown)")
+    
+    return totp_secret
+
+
+def main() -> None:
+    """CLI entry point for vault client operations."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="HashiCorp Vault client with MFA support for agent-obs"
+    )
+    parser.add_argument(
+        "command",
+        choices=["issue-mfa", "health"],
+        help="Command to execute"
+    )
+    parser.add_argument(
+        "--login",
+        help="Engineer's login/email for MFA operations",
+        required=False
+    )
+    
+    args = parser.parse_args()
+    
+    if args.command == "issue-mfa":
+        if not args.login:
+            print("Error: --login is required for issue-mfa command")
+            exit(1)
+        
+        # Generate and display TOTP secret
+        secret = generate_totp_secret(args.login)
+        
+        # In production, this would be stored securely
+        print(f"\nEnvironment Variable Setup:")
+        print(f"Add to your .env: VAULT_MFA_SECRETS='{args.login}:{secret}'")
+        print(f"Add to your .env: VAULT_MFA_AUTHORIZED='{args.login}'")
+        
+    elif args.command == "health":
+        # Simple health check for vault
+        client = VaultClient()
+        if client.is_available():
+            print("Vault is healthy and available")
+        else:
+            print("Vault is not available")
+            exit(1)
+
+
+if __name__ == "__main__":
+    main()
