@@ -1,0 +1,29 @@
+rules:
+  - name: no_pii_in_output
+    field: llm.output_text
+    rule_type: regex
+    params:
+      patterns:
+        email: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        phone: '(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}'
+        inn: '\b\d{10}\b|\b\d{12}\b'
+        passport: '\b\d{4}\s\d{6}\b'
+        payment: '\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b'
+
+  - name: json_output_valid
+    field: tool.output_text
+    rule_type: json_schema
+    params:
+      required: false  # правило применяется только если tool возвращает JSON
+
+  - name: no_blacklisted_words
+    field: llm.output_text
+    rule_type: blacklist
+    params:
+      words: []  # заполняется из конфига или env
+
+  - name: max_response_chars
+    field: llm.output_text
+    rule_type: max_length
+    params:
+      max_chars: 10000
