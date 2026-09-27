@@ -1,0 +1,13 @@
+golden_answers:
+  - intent: "capital_of_france"
+    golden_answer: "The capital of France is Paris."
+  - intent: "python_data_types"
+    golden_answer: "Python has several built-in data types including int, float, str, list, dict, tuple, set, and bool."
+  - intent: "capital_of_italy"
+    golden_answer: "The capital of Italy is Rome."
+  - intent: "capital_of_japan"
+    golden_answer: "The capital of Japan is Tokyo."
+  - intent: "python_hello_world"
+    golden_answer: "To print 'Hello World' in Python, use: print('Hello World')"
+  - intent: "default"
+    golden_answer: "This is a default golden answer for testing purposes."

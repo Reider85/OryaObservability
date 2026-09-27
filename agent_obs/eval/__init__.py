@@ -5,6 +5,7 @@ answer quality and attach results to traces via late annotation.
 """
 
 from agent_obs.eval.base import BaseEvaluator, EvalResult
+from agent_obs.eval.embedding import EmbeddingEvaluator, GoldenStore
 from agent_obs.eval.llm_judge import LLMJudgeEvaluator
 from agent_obs.eval.rule_based import Rule, RuleBasedEvaluator
 
@@ -14,4 +15,6 @@ __all__ = [
     "Rule",
     "RuleBasedEvaluator",
     "LLMJudgeEvaluator",
+    "EmbeddingEvaluator",
+    "GoldenStore",
 ]
