@@ -17,6 +17,8 @@ dependencies = [
     "transformers>=4.40",
     "torch>=2.0",
     "jsonschema>=4.20",
+    "rq>=1.14",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]

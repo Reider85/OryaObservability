@@ -44,3 +44,14 @@ guardrail_check_in_enqueue_total = Counter(
     "agent_obs_guardrail_check_in_enqueue_total",
     "Guardrail text checks performed inside _enqueue (last-resort masking barrier)",
 )
+
+eval_llm_judge_pending_total = Counter(
+    "agent_obs_eval_llm_judge_pending_total",
+    "LLM judge evaluation jobs enqueued for async processing",
+    ["eval_name"],
+)
+
+eval_llm_judge_sampling_skipped_total = Counter(
+    "agent_obs_eval_llm_judge_sampling_skipped_total",
+    "LLM judge evaluations skipped due to sampling rate",
+)
