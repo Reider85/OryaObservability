@@ -1,4 +1,4 @@
-"""PII detector with regex patterns for Russian and international PII types."""
+"""PII detector with regex patterns and ML-based detection for Russian and international PII types."""
 
 from __future__ import annotations
 
@@ -8,11 +8,15 @@ import os
 import re
 from dataclasses import dataclass
 
+from .pii_types import PIIMatch
+from .presidio_engine import PresidioPIIEngine
+
 logger = logging.getLogger(__name__)
 
 # Environment configuration
 DEFAULT_DETECTORS = "email,phone,inn,passport,payment"
 PII_DETECTORS_ENV = "AGENT_OBS_PII_DETECTORS"
+PII_ML_ENABLED_ENV = "AGENT_OBS_PII_ML_ENABLED"
 
 
 @dataclass
@@ -36,14 +40,15 @@ class PIIMatch:
 
 
 class PIIDetector:
-    """Regex-based PII detector for Russian and international entities."""
+    """Regex and ML-based PII detector for Russian and international entities."""
     
-    def __init__(self, enabled_detectors: set[str] | None = None) -> None:
+    def __init__(self, enabled_detectors: set[str] | None = None, presidio_engine=None) -> None:
         """Initialize detector with specified entity types.
         
         Args:
             enabled_detectors: Set of detector names to enable. If None, reads from 
                              environment variable AGENT_OBS_PII_DETECTORS.
+            presidio_engine: Optional PresidioPIIEngine instance. If None, will be lazily loaded.
         """
         if enabled_detectors is None:
             env_value = os.getenv(PII_DETECTORS_ENV, DEFAULT_DETECTORS)
@@ -52,6 +57,10 @@ class PIIDetector:
             self.enabled_detectors = set(detectors_list)
         else:
             self.enabled_detectors = enabled_detectors
+        
+        # ML stage configuration
+        self.ml_enabled = os.getenv(PII_ML_ENABLED_ENV, "false").lower() == "true"
+        self.presidio_engine = presidio_engine
         
         # Compile regex patterns
         self._detectors = {
@@ -63,7 +72,7 @@ class PIIDetector:
         }
     
     def detect(self, text: str) -> list[PIIMatch]:
-        """Detect PII entities in text.
+        """Detect PII entities in text using regex and optionally ML.
         
         Args:
             text: Input text to analyze
@@ -73,6 +82,7 @@ class PIIDetector:
         """
         matches = []
         
+        # Stage 1: Regex detection
         for detector_name in self.enabled_detectors:
             if detector_name in self._detectors:
                 try:
@@ -83,6 +93,12 @@ class PIIDetector:
         
         # Filter out likely false positives
         filtered_matches = self._filter_email_false_positives(text, matches)
+        
+        # Stage 2: ML detection (if enabled)
+        if self.ml_enabled:
+            ml_matches = self._run_ml_detection(text, filtered_matches)
+            # Merge results with priority to regex (avoid duplicates)
+            filtered_matches = self._merge_detection_results(filtered_matches, ml_matches)
         
         # Sort by position and return
         return sorted(filtered_matches, key=lambda m: m.span_start)
@@ -394,3 +410,82 @@ class PIIDetector:
             total += digit_int
         
         return total % 10 == 0
+    
+    def _run_ml_detection(self, text: str, regex_matches: list[PIIMatch]) -> list[PIIMatch]:
+        """Run ML-based PII detection using Presidio.
+        
+        Args:
+            text: Input text to analyze
+            regex_matches: Existing regex matches to avoid duplicates
+            
+        Returns:
+            List of ML-detected PIIMatch objects
+        """
+        try:
+            # Lazy initialization of presidio engine
+            if self.presidio_engine is None:
+                self.presidio_engine = PresidioPIIEngine.get_instance()
+            
+            # Get ML matches
+            ml_matches = self.presidio_engine.detect(text)
+            
+            # Filter out matches that overlap with regex matches
+            ml_matches = self._filter_overlapping_matches(ml_matches, regex_matches)
+            
+            return ml_matches
+            
+        except Exception as e:
+            logger.warning(f"ML PII detection failed: {e}")
+            return []
+    
+    def _filter_overlapping_matches(self, ml_matches: list[PIIMatch], regex_matches: list[PIIMatch]) -> list[PIIMatch]:
+        """Filter ML matches that overlap with existing regex matches.
+        
+        Args:
+            ml_matches: ML-detected matches
+            regex_matches: Regex-detected matches
+            
+        Returns:
+            ML matches that don't overlap with regex matches
+        """
+        # Create set of spans covered by regex matches
+        regex_spans = set()
+        for match in regex_matches:
+            regex_spans.add((match.span_start, match.span_end))
+        
+        # Filter ML matches that don't overlap with regex spans
+        filtered_ml_matches = []
+        for ml_match in ml_matches:
+            ml_span = (ml_match.span_start, ml_match.span_end)
+            if ml_span not in regex_spans:
+                filtered_ml_matches.append(ml_match)
+        
+        return filtered_ml_matches
+    
+    def _merge_detection_results(self, regex_matches: list[PIIMatch], ml_matches: list[PIIMatch]) -> list[PIIMatch]:
+        """Merge regex and ML detection results, prioritizing regex.
+        
+        Args:
+            regex_matches: Regex-detected matches
+            ml_matches: ML-detected matches
+            
+        Returns:
+            Combined list of matches with regex taking priority
+        """
+        # Start with regex matches
+        combined_matches = regex_matches.copy()
+        
+        # Add ML matches that don't overlap with regex
+        for ml_match in ml_matches:
+            overlap = False
+            for regex_match in regex_matches:
+                # Check if spans overlap
+                if (ml_match.span_start < regex_match.span_end and 
+                    ml_match.span_end > regex_match.span_start):
+                    overlap = True
+                    break
+            
+            if not overlap:
+                combined_matches.append(ml_match)
+        
+        return combined_matches

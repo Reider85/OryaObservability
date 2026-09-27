@@ -12,6 +12,8 @@ dependencies = [
     "openai>=1.0",
     "prometheus-client>=0.20",
     "pyyaml>=6.0",
+    "presidio-analyzer>=2.0",
+    "spacy>=3.7",
 ]
 
 [project.optional-dependencies]
