@@ -1,0 +1,20 @@
+# Field-aware PII masking policies for agent observability
+#
+# Each field type has a masking policy defined here:
+# - no_mask: No PII masking applied (even if detected)
+# - full_mask: All PII entities are masked with [TYPE:hex4] tokens
+# - partial_mask: Only specific PII fields are masked (SQL/JSON parsing in PC15)
+# - hash_only: Entire text replaced with sha256 hash + char count for privacy
+#
+# Field names must match those used in GuardrailEngine.check_input():
+# - system_prompt, user_message, tool_output, llm_output_text, tool_input_summary
+
+policies:
+  system_prompt: no_mask        # No user PII by architecture - skip detection entirely
+  user_message: full_mask       # All PII entities masked (default behavior)
+  tool_output: partial_mask     # Only PII fields from DB/REST responses masked (PC15 enhancement)
+  llm_output_text: full_mask    # LLM might reconstruct PII from context - mask everything
+  tool_input_summary: hash_only # Only sha256 + char count for tool inputs
+
+# Default policy for unknown field names
+default_policy: full_mask

@@ -12,6 +12,7 @@ from agent_obs.guardrail.engine import (
     GuardrailEngine,
     GuardrailVerdict,
 )
+from agent_obs.guardrail.field_masker import FieldMasker
 from agent_obs.guardrail.injection_classifier import InjectionClassifier, InjectionScore
 from agent_obs.guardrail.pii_detector import PIIDetector
 from agent_obs.guardrail.presidio_engine import PresidioPIIEngine, get_presidio_engine
@@ -24,6 +25,7 @@ __all__ = [
     "GuardrailConfig",
     "GuardrailEngine",
     "GuardrailVerdict",
+    "FieldMasker",
     "InjectionClassifier",
     "InjectionScore",
     "PIIDetector",

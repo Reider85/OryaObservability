@@ -22,6 +22,7 @@ from typing import Optional
 
 from prometheus_client import Counter, Histogram
 
+from agent_obs.guardrail.field_masker import FieldMasker
 from agent_obs.guardrail.injection_classifier import InjectionClassifier, InjectionScore
 from agent_obs.guardrail.pii_detector import PIIDetector
 from agent_obs.guardrail.pii_types import PIIMatch
@@ -164,11 +165,13 @@ class GuardrailEngine:
         injection_classifier: InjectionClassifier,
         vault_client: VaultClient,
         config: GuardrailConfig | None = None,
+        field_masker: FieldMasker | None = None,
     ) -> None:
         self.pii_detector = pii_detector
         self.injection_classifier = injection_classifier
         self.vault_client = vault_client
         self.config = config or GuardrailConfig()
+        self.field_masker = field_masker
         self._audit_log: list[AuditEvent] = []  # in-memory for tests; PC20 → ClickHouse
 
     # ------------------------------------------------------------------
@@ -207,15 +210,29 @@ class GuardrailEngine:
         audit_event_id = f"ae-{uuid.uuid4().hex[:12]}"
         trace_id = getattr(context, "trace_id", "unknown")
 
-        # --- Step 1: PII detection ---
-        pii_matches: list[PIIMatch] = self.pii_detector.detect(text)
+        # --- Step 1: PII detection and masking ---
+        pii_matches: list[PIIMatch] = []
         masked_text = text
         redacted_fields: list[str] = []
 
-        if pii_matches:
-            masked_text, redacted_fields = self._apply_pii_masking(
-                text, pii_matches, field
-            )
+        # Use field_masker if available, otherwise use legacy _apply_pii_masking
+        if self.field_masker is not None:
+            # Field-aware masking with policy enforcement
+            masked_text, redacted_fields = self.field_masker.apply(field, text, pii_matches)
+            
+            # For policies that require PII detection, run detection after masking
+            policy = self.field_masker.get_policy(field)
+            if policy in ("full_mask", "partial_mask"):
+                pii_matches = self.pii_detector.detect(text)
+                # Re-apply masking with detected entities
+                masked_text, redacted_fields = self.field_masker.apply(field, text, pii_matches)
+        else:
+            # Legacy full masking behavior
+            pii_matches = self.pii_detector.detect(text)
+            if pii_matches:
+                masked_text, redacted_fields = self._apply_pii_masking(
+                    text, pii_matches, field
+                )
 
         # --- Step 2: Vault store (fail-closed: masking already applied) ---
         vault_available = True
