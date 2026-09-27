@@ -95,6 +95,26 @@ class GuardrailVerdict:
     audit_event_id: str
 
 
+class GuardrailBlockException(Exception):
+    """Raised when a guardrail check returns ``verdict="block"``.
+
+    The SDK raises this from the pre-call hooks in ``llm_call`` / ``tool_call``
+    *before* the guarded request is sent, so a blocked prompt or tool input
+    never leaves the process.  The originating verdict is carried for auditing
+    and debugging; the message deliberately never contains the checked text,
+    which may contain unmasked PII.
+    """
+
+    def __init__(self, verdict: GuardrailVerdict, *, stage: str = "input") -> None:
+        self.verdict = verdict
+        self.stage = stage
+        super().__init__(
+            "Guardrail blocked the request "
+            f"(stage={stage}, score={verdict.score:.2f}, "
+            f"audit_event_id={verdict.audit_event_id})"
+        )
+
+
 @dataclass
 class GuardrailConfig:
     """Engine-level configuration knobs."""

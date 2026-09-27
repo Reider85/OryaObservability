@@ -33,3 +33,14 @@ cost_total_usd = Counter(
     "Accumulated total cost of all LLM calls in USD",
     ["agent_id", "model"],
 )
+
+guardrail_block_total = Counter(
+    "agent_obs_guardrail_block_total",
+    "Guardrail blocks raised before a guarded call, by stage",
+    ["stage"],
+)
+
+guardrail_check_in_enqueue_total = Counter(
+    "agent_obs_guardrail_check_in_enqueue_total",
+    "Guardrail text checks performed inside _enqueue (last-resort masking barrier)",
+)

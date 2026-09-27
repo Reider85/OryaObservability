@@ -22,15 +22,49 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, NamedTuple, Optional
 
 from agent_obs.cost.compute_cost import Usage, compute_cost
 from agent_obs.cost.price_book import PriceBook, PriceNotFoundError
+
+if TYPE_CHECKING:
+    from agent_obs.guardrail.engine import GuardrailEngine, GuardrailVerdict
 
 logger = logging.getLogger(__name__)
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TRACE_ID_CHARS = 26
+
+# Text span attributes subject to guardrail masking in ``_enqueue`` (PC08), as
+# ``(attribute, field_name, stage)``.  ``field_name`` is the semantic name used
+# to build ``pii.redacted_fields`` paths ("user_message.email.5f3a"), ``stage``
+# labels ``guardrail_block_total``.
+_GUARDRAIL_TEXT_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("llm.input_text", "user_message", "input"),
+    ("llm.output_text", "llm_output_text", "output"),
+    ("tool.input_summary", "tool_input_summary", "tool"),
+    ("tool.output_text", "tool_output", "output"),
+)
+
+# Attribute written instead of the text when the guardrail itself errors:
+# masking is fail-closed, so a failed check must never let plaintext through.
+_REDACTED_ON_GUARDRAIL_FAILURE = "[REDACTED:guardrail_unavailable]"
+
+# Environment flag that turns the guardrail on/off when an engine is supplied.
+_GUARDRAIL_ENABLED_ENV = "AGENT_OBS_GUARDRAIL_ENABLED"
+
+
+class _GuardrailCheck(NamedTuple):
+    """A guardrail check cached on a span by a pre-call hook.
+
+    ``text`` is the exact string that was checked, so a cached verdict is only
+    reused when the attribute still holds that same string.  ``tool_call``
+    truncates its input to a 200-char summary, which makes the attribute differ
+    from the checked text and correctly forces a fresh check.
+    """
+
+    text: str
+    verdict: "GuardrailVerdict"
 
 
 def _encode_crockford(value: int, length: int) -> str:
@@ -163,6 +197,11 @@ class Span:
     events: list = field(default_factory=list)
     start_time: float = 0.0
     end_time: Optional[float] = None
+    # Verdicts already produced by the pre-call guardrail hooks, keyed by text
+    # attribute name.  Deliberately kept out of ``attributes``/``events`` so it
+    # never reaches an exporter — it only lets ``_enqueue`` reuse a check on the
+    # same text instead of running detection twice (PC08).
+    guardrail_verdicts: dict = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.span_type, str):
@@ -250,9 +289,17 @@ class ObservabilitySDK:
     async agent ``run()`` method into an ``agent.loop`` root span. Completed
     spans are enqueued (a temporary in-memory list on MVP; replaced by the ring
     buffer + export worker in P07-P08).
+
+    Passing a ``guardrail`` engine turns on the CRITICAL security layer (PC08):
+    every text attribute of a span is PII-masked before the span reaches the
+    ring buffer, and ``llm_call`` / ``tool_call`` refuse to run when the check
+    returns ``block``.  The guardrail stays off when no engine is supplied, so
+    dev environments with synthetic data are unaffected; a supplied engine can
+    still be switched off with ``AGENT_OBS_GUARDRAIL_ENABLED=false`` or
+    ``config["guardrail_enabled"] = False``.
     """
 
-    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None):
+    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None, guardrail: "GuardrailEngine | None" = None):
         self._exporters = exporters
 
         # Priority: explicit enabled parameter > config > environment variable
@@ -277,6 +324,13 @@ class ObservabilitySDK:
         self._trace_agg: dict[str, dict] = {}
         self._max_trace_agg = 100_000
         self.cost_threshold = self._load_cost_threshold(config)
+        self._guardrail: "GuardrailEngine | None" = None
+        if guardrail is not None and self._load_guardrail_enabled(config):
+            self._guardrail = guardrail
+            logger.info(
+                "Guardrail active: PII masking before enqueue, "
+                "pre-call injection checks on llm_call/tool_call"
+            )
         if self.enabled:
             if self._exporters:
                 self._worker_task = asyncio.create_task(self._export_worker())
@@ -312,6 +366,19 @@ class ObservabilitySDK:
         except ValueError:
             return 0.05
 
+    @staticmethod
+    def _load_guardrail_enabled(config: dict | None) -> bool:
+        """Read the guardrail on/off switch (PC08).
+
+        Only consulted when a guardrail engine is actually supplied — without an
+        engine there is nothing to enable.  Priority: ``config["guardrail_enabled"]``
+        > ``AGENT_OBS_GUARDRAIL_ENABLED`` env var > default ``true``.
+        """
+        if config is not None and "guardrail_enabled" in config:
+            return bool(config["guardrail_enabled"])
+        raw = os.environ.get(_GUARDRAIL_ENABLED_ENV, "true")
+        return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
     def _build_context(
         self,
         agent_id: str,
@@ -332,11 +399,13 @@ class ObservabilitySDK:
         )
 
     async def _enqueue(self, span: Span) -> None:
-        """Enqueue a span into the ring buffer for async export.
+        """Mask the span, then enqueue it into the ring buffer for async export.
 
-        This is a fire-and-forget operation — never blocks the caller.
-        If the buffer is full, the span is dropped and counted.
+        Masking happens first so no plaintext PII can reach a container log or a
+        backend (anti-pattern §8.3).  Enqueuing is fire-and-forget — never blocks
+        the caller.  If the buffer is full, the span is dropped and counted.
         """
+        await self._apply_guardrail(span)
         try:
             self._ring_buffer.put_nowait(span)
             self.last_spans.append(span)
@@ -369,6 +438,117 @@ class ObservabilitySDK:
                     span.context.span_id,
                     span.context.trace_id,
                 )
+
+    async def _apply_guardrail(self, span: Span) -> None:
+        """Mask every text attribute of a span before it is exported (PC08).
+
+        This is the *last* barrier, not the primary one: the hooks in
+        :meth:`llm_call` / :meth:`tool_call` already refuse to issue a guarded
+        request when the check returns ``block``.  This pass exists for text that
+        reached a span without passing through those hooks — a tool output set
+        directly by the caller, or a span built by hand.
+
+        Verdicts already computed by a pre-call hook for the same attribute are
+        reused rather than re-detected, so the hot path runs one check per text.
+        Masking is fail-closed: if the guardrail raises, the text is replaced by
+        a redaction placeholder instead of being exported verbatim.
+        """
+        guardrail = self._guardrail
+        if guardrail is None:
+            return
+
+        from agent_obs.metrics import guardrail_check_in_enqueue_total
+
+        redacted_fields: list[str] = []
+        for attribute, field_name, stage in _GUARDRAIL_TEXT_FIELDS:
+            text = span.attributes.get(attribute)
+            if not isinstance(text, str) or not text:
+                continue
+
+            cached = span.guardrail_verdicts.get(attribute)
+            reused = cached is not None and cached.text == text
+            if reused:
+                verdict = cached.verdict
+            else:
+                try:
+                    verdict = await guardrail.check_input(
+                        text, context=span.context, field=field_name
+                    )
+                except Exception:
+                    logger.warning(
+                        "Guardrail check failed on attribute %s of span %s; "
+                        "text redacted",
+                        attribute,
+                        span.context.span_id,
+                        exc_info=True,
+                    )
+                    span.attributes[attribute] = _REDACTED_ON_GUARDRAIL_FAILURE
+                    continue
+
+            span.attributes[attribute] = verdict.masked_text
+            redacted_fields.extend(verdict.redacted_fields)
+            span.add_event(
+                "guardrail.check",
+                {
+                    "audit_event_id": verdict.audit_event_id,
+                    "field": field_name,
+                    "verdict": verdict.verdict,
+                    "score": verdict.score,
+                },
+            )
+            if verdict.verdict == "block":
+                # The span is still recorded for post-incident debugging.  A
+                # reused verdict was already counted by the hook that raised.
+                span.attributes["guardrail.block"] = True
+                if not reused:
+                    from agent_obs.metrics import guardrail_block_total
+
+                    guardrail_block_total.labels(stage=stage).inc()
+            guardrail_check_in_enqueue_total.inc()
+
+        if redacted_fields:
+            span.attributes["pii.redacted_fields"] = redacted_fields
+
+    async def _guard_call(
+        self,
+        span: Span,
+        text: str | None,
+        *,
+        attribute: str,
+        field_name: str,
+        stage: str,
+    ) -> None:
+        """Check a call input before the guarded request is issued (PC08).
+
+        Runs inside ``llm_call`` / ``tool_call`` before the body is entered, so
+        a ``block`` verdict prevents the LLM or tool request from ever leaving
+        the process.  The verdict is cached on the span so that :meth:`_enqueue`
+        can apply its masking without detecting the same text twice.
+        """
+        if self._guardrail is None or not text:
+            return
+
+        verdict = await self._guardrail.check_input(
+            text, context=span.context, field=field_name
+        )
+        span.guardrail_verdicts[attribute] = _GuardrailCheck(text, verdict)
+        if verdict.verdict != "block":
+            return
+
+        from agent_obs.guardrail.engine import GuardrailBlockException
+        from agent_obs.metrics import guardrail_block_total
+
+        span.attributes["status"] = "blocked"
+        span.attributes["guardrail.block"] = True
+        guardrail_block_total.labels(stage=stage).inc()
+        logger.warning(
+            "Guardrail blocked %s call for trace %s (score=%.2f, audit=%s)",
+            field_name,
+            span.context.trace_id,
+            verdict.score,
+            verdict.audit_event_id,
+        )
+        raise GuardrailBlockException(verdict, stage=stage)
 
     def _accumulate_trace_aggregates(self, span: Span) -> None:
         """Aggregate per-trace data onto the root span (P20/P24).
@@ -591,6 +771,11 @@ class ObservabilitySDK:
         When *input_text* and/or *output_text* are provided, deterministic
         content sampling (P22) decides whether the full text is stored or
         replaced by ``sha256`` + character counts.
+
+        When the guardrail is active, *input_text* is checked before the LLM is
+        called: a ``block`` verdict raises ``GuardrailBlockException`` so no
+        request is sent, and the span is still recorded with ``status=blocked``
+        (PC08).
         """
         if not self.enabled:
             # Zero-overhead mode: yield a no-op NullSpan
@@ -614,6 +799,13 @@ class ObservabilitySDK:
         span.start_time = _now()
         token = _active_span_context.set(child_ctx)
         try:
+            await self._guard_call(
+                span,
+                input_text,
+                attribute="llm.input_text",
+                field_name="user_message",
+                stage="input",
+            )
             yield span
         finally:
             span.end_time = _now()
@@ -681,6 +873,11 @@ class ObservabilitySDK:
         When *input_text* is provided, only a summary (≤200 chars), its hash
         and length are stored — the full tool input never reaches the backend
         (P22, risk R1.5).
+
+        When the guardrail is active, *input_text* is checked before the tool
+        runs: a ``block`` verdict raises ``GuardrailBlockException`` so the tool
+        is never invoked, and the span is still recorded with ``status=blocked``
+        (PC08).
         """
         if not self.enabled:
             # Zero-overhead mode: yield a no-op NullSpan
@@ -704,6 +901,13 @@ class ObservabilitySDK:
         span.start_time = _now()
         token = _active_span_context.set(child_ctx)
         try:
+            await self._guard_call(
+                span,
+                input_text,
+                attribute="tool.input_summary",
+                field_name="tool_input_summary",
+                stage="tool",
+            )
             yield span
         finally:
             span.end_time = _now()

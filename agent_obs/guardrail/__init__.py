@@ -7,6 +7,7 @@ as well as prompt-injection classification via DeBERTa-v3.
 
 from agent_obs.guardrail.engine import (
     AuditEvent,
+    GuardrailBlockException,
     GuardrailConfig,
     GuardrailEngine,
     GuardrailVerdict,
@@ -19,6 +20,7 @@ from agent_obs.guardrail.vault_client import VaultClient
 
 __all__ = [
     "AuditEvent",
+    "GuardrailBlockException",
     "GuardrailConfig",
     "GuardrailEngine",
     "GuardrailVerdict",
