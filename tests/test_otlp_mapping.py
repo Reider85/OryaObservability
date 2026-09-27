@@ -3,6 +3,7 @@
 from agent_obs.exporters.otlp_mapping import (
     LANGFUSE_LABELS,
     USAGE_CONVENTION_MAP,
+    enrich_eval_attributes,
     enrich_otlp_attributes,
     enrich_semconv_attributes,
     span_to_langfuse_labels,
@@ -284,3 +285,91 @@ class TestMappingConstants:
         assert "tokens.input" in USAGE_CONVENTION_MAP
         assert "tokens.output" in USAGE_CONVENTION_MAP
         assert "tokens.cached" in USAGE_CONVENTION_MAP
+
+
+class TestEvalAttributes:
+    def test_eval_pending_attribute_mapping(self) -> None:
+        """Test that eval.pending attribute is mapped to Langfuse label."""
+        span = _make_span(attributes={"eval.pending": True})
+        labels = span_to_langfuse_labels(span)
+        assert "eval.pending" in labels
+        assert labels["eval.pending"] == "True"
+
+    def test_eval_rule_based_attribute_mapping(self) -> None:
+        """Test that eval.rule_based attribute is mapped to Langfuse label."""
+        rule_result = {
+            "rules_passed": 3,
+            "rules_failed": 1,
+            "flags": ["pii_leak", "invalid_json"]
+        }
+        span = _make_span(attributes={"eval.rule_based": rule_result})
+        labels = span_to_langfuse_labels(span)
+        assert "eval.results" in labels
+        assert labels["eval.results"] == str(rule_result)
+
+    def test_eval_llm_judge_status_mapping(self) -> None:
+        """Test that eval.llm_judge.status attribute is mapped to Langfuse label."""
+        span = _make_span(attributes={"eval.llm_judge.status": "completed"})
+        labels = span_to_langfuse_labels(span)
+        assert "eval.llm_judge.status" in labels
+        assert labels["eval.llm_judge.status"] == "completed"
+
+    def test_enrich_eval_attributes_pending(self) -> None:
+        """Test enrich_eval_attributes adds eval.status for pending traces."""
+        span = _make_span(attributes={"eval.pending": True})
+        attributes = [{"key": "test", "value": "value"}]
+        
+        enriched = enrich_eval_attributes(attributes, span)
+        
+        # Check that eval.status was added
+        eval_status = next((a for a in enriched if a["key"] == "eval.status"), None)
+        assert eval_status is not None
+        assert eval_status["value"]["stringValue"] == "pending"
+
+    def test_enrich_eval_attributes_rule_based(self) -> None:
+        """Test enrich_eval_attributes adds rule-based eval results."""
+        rule_result = {
+            "rules_passed": 2,
+            "rules_failed": 0,
+            "flags": ["pii_leak"]
+        }
+        span = _make_span(attributes={"eval.rule_based": rule_result})
+        attributes = [{"key": "test", "value": "value"}]
+        
+        enriched = enrich_eval_attributes(attributes, span)
+        
+        # Check that rule-based metrics were added
+        passed = next((a for a in enriched if a["key"] == "eval.rule_based_passed"), None)
+        assert passed is not None
+        assert passed["value"]["intValue"] == 2
+        
+        failed = next((a for a in enriched if a["key"] == "eval.rule_based_failed"), None)
+        assert failed is not None
+        assert failed["value"]["intValue"] == 0
+        
+        flags = next((a for a in enriched if a["key"] == "eval.rule_based_flags"), None)
+        assert flags is not None
+        assert flags["value"]["stringValue"] == "pii_leak"
+
+    def test_enrich_eval_attributes_llm_judge_status(self) -> None:
+        """Test enrich_eval_attributes adds LLM judge status."""
+        span = _make_span(attributes={"eval.llm_judge.status": "completed"})
+        attributes = [{"key": "test", "value": "value"}]
+        
+        enriched = enrich_eval_attributes(attributes, span)
+        
+        # Check that LLM judge status was added
+        status = next((a for a in enriched if a["key"] == "eval.llm_judge_status"), None)
+        assert status is not None
+        assert status["value"]["stringValue"] == "completed"
+
+    def test_enrich_eval_attributes_no_eval_attrs(self) -> None:
+        """Test enrich_eval_attributes doesn't add anything when no eval attrs present."""
+        span = _make_span(attributes={"other": "value"})
+        attributes = [{"key": "test", "value": "value"}]
+        
+        enriched = enrich_eval_attributes(attributes, span)
+        
+        # Should only have original attributes
+        assert len(enriched) == 1
+        assert enriched[0]["key"] == "test"

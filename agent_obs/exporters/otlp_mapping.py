@@ -22,6 +22,9 @@ LANGFUSE_LABELS: dict[str, str] = {
     "cost.usd": "cost.usd",
     "session_id": "session_id",
     "user_id": "user_id",
+    "eval.pending": "eval.pending",
+    "eval.rule_based": "eval.results",
+    "eval.llm_judge.status": "eval.llm_judge.status",
 }
 
 # Internal attribute name -> OTel gen_ai semantic-convention attribute name.
@@ -154,5 +157,43 @@ def enrich_semconv_attributes(
             value = span_attrs.get(source)
             if value is not None:
                 _add(convention, value)
+
+    return enriched
+
+
+def enrich_eval_attributes(
+    attributes: list[dict[str, Any]], span: Span
+) -> list[dict[str, Any]]:
+    """Add eval-related attributes for Langfuse UI display.
+
+    Adds eval.pending status, rule-based results, and LLM judge status
+    to the OTLP attributes so Langfuse can show them in the trace viewer.
+    """
+    existing = {a["key"] for a in attributes}
+    enriched = list(attributes)
+
+    def _add(key: str, value: Any) -> None:
+        if key not in existing:
+            enriched.append({"key": key, "value": _otlp_value(value)})
+            existing.add(key)
+
+    # Add eval.pending status with timestamp
+    if span.attributes and span.attributes.get("eval.pending") is True:
+        _add("eval.status", "pending")
+        _add("eval.pending_timestamp", span.start_time)
+
+    # Add rule-based eval results as metadata
+    if span.attributes and "eval.rule_based" in span.attributes:
+        rule_result = span.attributes["eval.rule_based"]
+        if isinstance(rule_result, dict):
+            _add("eval.rule_based_passed", rule_result.get("rules_passed", 0))
+            _add("eval.rule_based_failed", rule_result.get("rules_failed", 0))
+            if rule_result.get("flags"):
+                _add("eval.rule_based_flags", ", ".join(rule_result.get("flags", [])))
+
+    # Add LLM judge status
+    if span.attributes and "eval.llm_judge.status" in span.attributes:
+        judge_status = span.attributes["eval.llm_judge.status"]
+        _add("eval.llm_judge_status", judge_status)
 
     return enriched

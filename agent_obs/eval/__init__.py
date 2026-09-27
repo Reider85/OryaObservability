@@ -4,6 +4,7 @@ Provides rule-based, LLM-judge, and embedding evaluators that assess
 answer quality and attach results to traces via late annotation.
 """
 
+from agent_obs.eval.api import app as eval_api_app
 from agent_obs.eval.base import BaseEvaluator, EvalResult
 from agent_obs.eval.embedding import EmbeddingEvaluator, GoldenStore
 from agent_obs.eval.llm_judge import LLMJudgeEvaluator
@@ -21,4 +22,5 @@ __all__ = [
     "annotate",
     "annotate_with_fallback",
     "get_eval_results",
+    "eval_api_app",
 ]
