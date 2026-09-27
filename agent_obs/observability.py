@@ -494,6 +494,7 @@ class ObservabilitySDK:
                     "field": field_name,
                     "verdict": verdict.verdict,
                     "score": verdict.score,
+                    "ts": _now(),
                 },
             )
             if verdict.verdict == "block":
@@ -508,6 +509,9 @@ class ObservabilitySDK:
 
         if redacted_fields:
             span.attributes["pii.redacted_fields"] = redacted_fields
+            span.attributes["pii.total_entities"] = len(redacted_fields)
+            entity_types = {f.split(".")[1] for f in redacted_fields}
+            span.attributes["pii.entity_types"] = sorted(entity_types)
 
     async def _guard_call(
         self,

@@ -217,6 +217,7 @@ class TestEnqueueMasking:
         assert events[0].attributes["verdict"] == "clean"
         assert events[0].attributes["field"] == "user_message"
         assert events[0].attributes["audit_event_id"].startswith("ae-")
+        assert "ts" in events[0].attributes
 
     async def test_check_metric_increments(self):
         engine, _ = _build_engine()
@@ -228,6 +229,31 @@ class TestEnqueueMasking:
         await sdk._enqueue(span)
 
         assert _enqueue_count() == before + 1
+
+    async def test_total_entities_and_entity_types_recorded(self):
+        engine, _ = _build_engine()
+        sdk = _build_sdk(engine)
+
+        span = _make_span()
+        span.attributes["llm.input_text"] = "reach me at ivan@example.com"
+        span.attributes["llm.output_text"] = "sure, ivan@example.com"
+        await sdk._enqueue(span)
+
+        assert "pii.total_entities" in span.attributes
+        assert "pii.entity_types" in span.attributes
+        assert span.attributes["pii.total_entities"] == 2
+        assert span.attributes["pii.entity_types"] == ["email"]
+
+    async def test_total_entities_absent_when_clean(self):
+        engine, _ = _build_engine()
+        sdk = _build_sdk(engine)
+
+        span = _make_span()
+        span.attributes["llm.input_text"] = "no personal data here"
+        await sdk._enqueue(span)
+
+        assert "pii.total_entities" not in span.attributes
+        assert "pii.entity_types" not in span.attributes
 
     async def test_span_without_text_attributes_is_not_checked(self):
         engine, classifier = _build_engine()
