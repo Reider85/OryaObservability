@@ -5,16 +5,28 @@ information in text content, supporting Russian and international PII types,
 as well as prompt-injection classification via DeBERTa-v3.
 """
 
+from agent_obs.guardrail.engine import (
+    AuditEvent,
+    GuardrailConfig,
+    GuardrailEngine,
+    GuardrailVerdict,
+)
 from agent_obs.guardrail.injection_classifier import InjectionClassifier, InjectionScore
 from agent_obs.guardrail.pii_detector import PIIDetector
 from agent_obs.guardrail.presidio_engine import PresidioPIIEngine, get_presidio_engine
 from agent_obs.guardrail.pii_types import PIIMatch
+from agent_obs.guardrail.vault_client import VaultClient
 
 __all__ = [
+    "AuditEvent",
+    "GuardrailConfig",
+    "GuardrailEngine",
+    "GuardrailVerdict",
     "InjectionClassifier",
     "InjectionScore",
     "PIIDetector",
     "PIIMatch",
     "PresidioPIIEngine",
+    "VaultClient",
     "get_presidio_engine",
 ]
