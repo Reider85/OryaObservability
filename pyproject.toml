@@ -20,6 +20,7 @@ dependencies = [
     "rq>=1.14",
     "redis>=5.0",
     "clickhouse-driver>=0.2.7",
+    "hvac>=2.0.0",
 ]
 
 [project.optional-dependencies]
