@@ -40,13 +40,16 @@ from agent_obs.storage.maintenance import (
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
     JOB_MIGRATE_SPANS,
+    JOB_MIGRATE_TRACES,
     archive_expired_audit_events,
     build_cold_store,
+    build_cold_trace_store,
     build_hot_store,
     build_warm_store,
     cleanup_vault_expired,
     migrate_eval_results_to_warm,
     migrate_spans_to_warm,
+    migrate_traces_to_cold,
     run_cron_job,
     run_cron_job_async,
 )
@@ -67,6 +70,7 @@ FULL_DOM = set(FIELD_RANGES[2])
 DAILY_AUDIT_SPEC = "17 3 * * *"
 DAILY_EVAL_SPEC = "47 3 * * *"
 DAILY_MIGRATION_SPEC = "0 4 * * *"
+WEEKLY_COLD_SPEC = "17 4 * * 0"  # Sunday 04:17 UTC, staggered off daily migration
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +276,31 @@ def _migration_job() -> Awaitable[Any]:
     return _runner()
 
 
+def _cold_migration_job() -> Awaitable[Any]:
+    """Migrate traces older than 90d to cold tier; pool closed even on failure."""
+    warm = build_warm_store()
+    cold = build_cold_trace_store()
+
+    async def _runner() -> Any:
+        try:
+            return await run_cron_job_async(
+                JOB_MIGRATE_TRACES,
+                migrate_traces_to_cold,
+                warm_store=warm,
+                cold_store=cold,
+                retention_days=_env_int(
+                    "AGENT_OBS_CRON_COLD_RETENTION_DAYS", DEFAULT_SPAN_RETENTION_DAYS
+                ),
+                max_partition_rows=_env_int("AGENT_OBS_CRON_MAX_PARTITION_ROWS", 200_000),
+                dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+            )
+        finally:
+            await warm.close()
+            await cold.close()
+
+    return _runner()
+
+
 def build_jobs() -> list[CronJob]:
     """Return the configured job table.
 
@@ -303,6 +332,12 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_MIGRATION_SPEC", DAILY_MIGRATION_SPEC),
             _migration_job,
             86400,
+        ),
+        CronJob(
+            JOB_MIGRATE_TRACES,
+            os.environ.get("AGENT_OBS_CRON_COLD_SPEC", WEEKLY_COLD_SPEC),
+            _cold_migration_job,
+            604800,  # 7 days * 24 hours * 3600 seconds
         ),
     ]
 

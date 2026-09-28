@@ -118,3 +118,29 @@ cron_last_success_timestamp_seconds = Gauge(
     "Unix timestamp of the last successful cron maintenance run",
     ["job_name"],
 )
+
+# --- PC23 Warm→Cold migration metrics ---
+migration_warm_to_cold_files_total = Counter(
+    "agent_obs_migration_warm_to_cold_files_total",
+    "Parquet files written to cold storage",
+    ["job_name"],
+)
+
+migration_warm_to_cold_rows_total = Counter(
+    "agent_obs_migration_warm_to_cold_rows_total",
+    "Trace rows aggregated into cold storage",
+    ["job_name"],
+)
+
+migration_warm_to_cold_bytes_total = Counter(
+    "agent_obs_migration_warm_to_cold_bytes_total",
+    "Bytes written to cold storage",
+    ["job_name"],
+)
+
+migration_warm_to_cold_duration_seconds = Histogram(
+    "agent_obs_migration_warm_to_cold_duration_seconds",
+    "Cold migration job wall-clock duration",
+    ["job_name"],
+    buckets=[1, 5, 15, 30, 60, 300, 900, 3600],
+)

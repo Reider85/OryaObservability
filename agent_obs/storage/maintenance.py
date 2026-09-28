@@ -26,6 +26,8 @@ Retention windows come from the ClickHouse DDL (``infra/storage/clickhouse_ddl.s
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -47,6 +49,7 @@ JOB_CLEANUP_VAULT = "cleanup_vault"
 JOB_CLEANUP_AUDIT_EVENTS = "cleanup_audit_events"
 JOB_CLEANUP_EVAL_RESULTS = "cleanup_eval_results"
 JOB_MIGRATE_SPANS = "migrate_spans_to_warm"
+JOB_MIGRATE_TRACES = "migrate_traces_to_cold"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 365
 DEFAULT_EVAL_RETENTION_DAYS = 14
@@ -54,6 +57,24 @@ DEFAULT_SPAN_RETENTION_DAYS = 14
 DEFAULT_BATCH_SIZE = 10_000
 DEFAULT_MAX_EVENTS = 1000
 VAULT_PREFIX = "pii/"
+
+
+def _user_hash(user_id: str) -> str:
+    """Generate a pseudonymous hash for a user identifier.
+    
+    Uses SHA-256 for consistency with input_sha256/output_sha256. The hash is
+    not reversible; the same user_id always produces the same hash. No salt by
+    default to preserve cross-deploy aggregation, but can be HMAC'd with
+    AGENT_OBS_USER_HASH_SALT if set.
+    """
+    if not user_id:
+        return ""
+    salt = os.environ.get("AGENT_OBS_USER_HASH_SALT", "")
+    if salt:
+        key = f"{salt}{user_id}".encode()
+    else:
+        key = user_id.encode()
+    return hashlib.sha256(key).hexdigest()
 
 
 @dataclass
@@ -115,6 +136,23 @@ class TraceWarmResult:
     def affected(self) -> int:
         """Rows the job changed — drives ``cron_rows_deleted_total``."""
         return self.traces_migrated
+
+
+@dataclass
+class TraceColdResult:
+    """Outcome of one ``migrate_traces_to_cold`` run (PC23)."""
+
+    partitions: int = 0
+    files: int = 0
+    rows: int = 0
+    bytes_written: int = 0
+    traces_deleted: int = 0
+    errors: int = 0
+
+    @property
+    def affected(self) -> int:
+        """Rows the job changed — drives ``cron_rows_deleted_total``."""
+        return self.traces_deleted
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +615,8 @@ def _aggregate_spans_by_trace(spans: list[dict]) -> dict[str, dict]:
     - ``error_count`` = spans whose ``status`` is not ``"ok"``
     - ``input_chars`` / ``input_sha256`` / ``output_chars`` / ``output_sha256``
       extracted from span attributes (SDK pre-computes these)
+    - ``user_hash`` = pseudonymous identifier from the root span's ``user_id``
+      attribute (for cold-tier distinct-user counts)
     - ``eval_avg`` left empty (eval scores are migrated separately)
     - ``start_time`` / ``end_time`` = earliest / latest span in the trace
     """
@@ -600,6 +640,7 @@ def _aggregate_spans_by_trace(spans: list[dict]) -> dict[str, dict]:
                 "input_sha256": attrs.get("llm.input_sha256", ""),
                 "output_chars": attrs.get("llm.output_chars", 0),
                 "output_sha256": attrs.get("llm.output_sha256", ""),
+                "user_hash": _user_hash(attrs.get("user_id", "")),
             }
         t = traces[tid]
         t["cost_usd_total"] += span.get("cost_usd", 0.0)
@@ -676,6 +717,171 @@ async def migrate_spans_to_warm(
     return result
 
 
+async def migrate_traces_to_cold(
+    warm_store: Any,
+    cold_store: Any,
+    retention_days: int = DEFAULT_SPAN_RETENTION_DAYS,
+    max_partition_rows: int = 200_000,
+    dry_run: bool = False,
+) -> TraceColdResult:
+    """Move traces past ``retention_days`` to cold tier, then purge warm.
+
+    PC23: each (tenant_id, day) partition is aggregated into Parquet with
+    traces_count, cost_usd_sum, eval_avg (struct), users_count, error_rate.
+    Idempotent by partition key: the prefix is wiped before writing.
+
+    Ordering rule: **ship first, delete second.** If the S3 upload fails, the
+    warm rows are left untouched and retried on the next cycle.
+    """
+    import pyarrow as pa
+    from agent_obs.storage.cold import parq_key
+
+    result = TraceColdResult()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+    # List candidate partitions (tenant_id, day)
+    partitions = await warm_store.list_trace_partitions(cutoff)
+    if not partitions:
+        logger.info("migrate_traces_to_cold: no partitions older than %d days", retention_days)
+        return result
+
+    result.partitions = len(partitions)
+    logger.info("migrate_traces_to_cold: processing %d partitions", result.partitions)
+
+    for tenant_id, day in partitions:
+        logger.debug("migrate_traces_to_cold: processing tenant=%s day=%s", tenant_id, day)
+
+        # Keyset pagination: fetch the partition in chunks
+        last_trace_id = ""
+        partition_rows = 0
+        while True:
+            rows = await warm_store.get_traces_for_partition(
+                tenant_id, day, last_trace_id, max_partition_rows
+            )
+            if not rows:
+                break
+
+            # Aggregate this chunk by agent_id
+            chunk_aggregates = {}
+            for row in rows:
+                aid = row["agent_id"]
+                if aid not in chunk_aggregates:
+                    chunk_aggregates[aid] = {
+                        "tenant_id": tenant_id,
+                        "agent_id": aid,
+                        "day": day,
+                        "traces_count": 0,
+                        "cost_usd_sum": 0.0,
+                        "eval_avg": {},
+                        "users_count": 0,
+                        "user_hashes": set(),
+                        "error_count": 0,
+                        "span_count": 0,
+                    }
+                agg = chunk_aggregates[aid]
+                agg["traces_count"] += 1
+                agg["cost_usd_sum"] += row.get("cost_usd_total", 0.0)
+                if row.get("eval_avg"):
+                    for key, val in row["eval_avg"].items():
+                        agg["eval_avg"][key] = agg["eval_avg"].get(key, 0.0) + val
+                user_hash = row.get("user_hash", "")
+                if user_hash:
+                    agg["user_hashes"].add(user_hash)
+                agg["error_count"] += row.get("error_count", 0)
+                agg["span_count"] += row.get("span_count", 0)
+
+                last_trace_id = row["trace_id"]
+                partition_rows += 1
+
+            # Build Parquet table for this chunk
+            table_data = {
+                "tenant_id": [],
+                "agent_id": [],
+                "day": [],
+                "traces_count": [],
+                "cost_usd_sum": [],
+                "eval_avg_faithfulness": [],
+                "eval_avg_relevancy": [],
+                "eval_avg_completeness": [],
+                "users_count": [],
+                "error_rate": [],
+            }
+            for agg in chunk_aggregates.values():
+                table_data["tenant_id"].append(agg["tenant_id"])
+                table_data["agent_id"].append(agg["agent_id"])
+                table_data["day"].append(agg["day"])
+                table_data["traces_count"].append(agg["traces_count"])
+                table_data["cost_usd_sum"].append(agg["cost_usd_sum"])
+                
+                # eval_avg struct with mapping: answer_relevancy -> relevancy
+                eval_avg = agg["eval_avg"]
+                table_data["eval_avg_faithfulness"].append(eval_avg.get("faithfulness", 0.0))
+                table_data["eval_avg_relevancy"].append(eval_avg.get("answer_relevancy", eval_avg.get("relevancy", 0.0)))
+                table_data["eval_avg_completeness"].append(eval_avg.get("completeness", 0.0))
+                
+                table_data["users_count"].append(len(agg["user_hashes"]))
+                error_rate = agg["error_count"] / agg["span_count"] if agg["span_count"] > 0 else 0.0
+                table_data["error_rate"].append(error_rate)
+
+            table = pa.table(table_data)
+
+            # Write to S3
+            prefix = f"tenant_id={tenant_id}/year={day.year}/month={day.month}/day={day.day}"
+            if dry_run:
+                logger.info("migrate_traces_to_cold: dry-run, would write %s/part-0000.parquet", prefix)
+                result.files += 1
+                result.rows += len(rows)
+            else:
+                try:
+                    # Wipe prefix first for idempotency
+                    cold_store.delete_prefix(prefix)
+                    key = parq_key(prefix, str(day), int(time.time()))
+                    bytes_written = cold_store.write_parquet(key, table)
+                    result.files += 1
+                    result.bytes_written += bytes_written
+                    result.rows += len(rows)
+                    logger.debug("migrate_traces_to_cold: wrote %s bytes to %s", bytes_written, key)
+                except Exception as e:
+                    logger.error("migrate_traces_to_cold: upload of %s failed, keeping warm rows: %s", prefix, str(e))
+                    result.errors += 1
+                    break
+
+            # Exit loop if this chunk was smaller than the limit (no more rows)
+            if len(rows) < max_partition_rows:
+                break
+
+        # Delete all traces from this partition if successful
+        if not dry_run and result.errors == 0:
+            try:
+                # Fetch all trace_ids in this partition to delete
+                all_rows = []
+                last_trace_id = ""
+                while True:
+                    rows = await warm_store.get_traces_for_partition(
+                        tenant_id, day, last_trace_id, max_partition_rows
+                    )
+                    if not rows:
+                        break
+                    all_rows.extend(rows)
+                    last_trace_id = rows[-1]["trace_id"]
+                
+                if all_rows:
+                    trace_ids = [row["trace_id"] for row in all_rows]
+                    deleted = await warm_store.delete_traces(trace_ids)
+                    result.traces_deleted += deleted
+                    logger.info("migrate_traces_to_cold: deleted %d traces from %s", deleted, prefix)
+            except Exception as e:
+                logger.error("migrate_traces_to_cold: delete of %s failed: %s", prefix, str(e))
+                result.errors += 1
+
+    logger.info(
+        "migrate_traces_to_cold: partitions=%d files=%d rows=%d bytes=%d deleted=%d errors=%d",
+        result.partitions, result.files, result.rows, result.bytes_written,
+        result.traces_deleted, result.errors,
+    )
+    return result
+
+
 def build_hot_store() -> Any:
     """Construct a ``HotStore`` from the standard ClickHouse env variables."""
     from agent_obs.storage.hot import HotStore
@@ -688,6 +894,18 @@ def build_cold_store() -> Any:
     from agent_obs.storage.cold import ColdStore
 
     return ColdStore()
+
+
+def build_cold_trace_store() -> Any:
+    """Construct a ``ColdStore`` for cold-tier trace aggregates.
+
+    Uses the S3_COLD_BUCKET environment variable (default cold-traces) instead
+    of the default audit-events bucket.
+    """
+    from agent_obs.storage.cold import ColdStore
+
+    bucket = os.environ.get("S3_COLD_BUCKET", "cold-traces")
+    return ColdStore(bucket=bucket)
 
 
 def build_warm_store() -> Any:
@@ -708,19 +926,23 @@ __all__ = [
     "JOB_CLEANUP_EVAL_RESULTS",
     "JOB_CLEANUP_VAULT",
     "JOB_MIGRATE_SPANS",
+    "JOB_MIGRATE_TRACES",
     "VAULT_PREFIX",
     "AuditArchiveResult",
     "EvalWarmResult",
     "TraceWarmResult",
+    "TraceColdResult",
     "VaultCleanupResult",
     "archive_expired_audit_events",
     "build_cold_store",
+    "build_cold_trace_store",
     "build_hot_store",
     "build_warm_store",
     "cleanup_vault_expired",
     "list_kv_keys_recursive",
     "migrate_eval_results_to_warm",
     "migrate_spans_to_warm",
+    "migrate_traces_to_cold",
     "run_cron_job",
     "run_cron_job_async",
 ]

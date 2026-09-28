@@ -51,6 +51,7 @@ TRACES_WARM_COLUMNS = (
     "input_sha256",
     "output_chars",
     "output_sha256",
+    "user_hash",
 )
 
 # Columns that are part of the primary key (not updated on conflict).
@@ -248,6 +249,112 @@ class WarmStore:
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT count(*) AS n FROM traces_warm")
         return int(row["n"]) if row else 0
+
+    async def list_trace_partitions(
+        self, cutoff: datetime, limit: int = 10_000
+    ) -> list[tuple[str, datetime.date]]:
+        """List distinct (tenant_id, day) partitions older than cutoff.
+
+        Each partition is a candidate for cold migration. The day is derived
+        from start_time in UTC (no time zones in the table).
+
+        Returns
+        -------
+        list[tuple[str, datetime.date]]
+            Pairs of (tenant_id, day) where day is a date object.
+        """
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT tenant_id, (start_time AT TIME ZONE 'UTC')::date AS day
+                FROM traces_warm
+                WHERE start_time < $1
+                ORDER BY 1, 2
+                LIMIT $2
+                """,
+                cutoff,
+                limit,
+            )
+        return [(row["tenant_id"], row["day"]) for row in rows]
+
+    async def get_traces_for_partition(
+        self, tenant_id: str, day: datetime.date, after_trace_id: str = "", limit: int = 10_000
+    ) -> list[dict]:
+        """Get traces for a specific (tenant_id, day) partition, with keyset pagination.
+
+        Returns rows of TRACES_WARM_COLUMNS, with JSONB fields decoded to dicts
+        and DECIMAL cost_usd_total converted to float.
+
+        Parameters
+        ----------
+        tenant_id:
+            Tenant to fetch.
+        day:
+            Day partition (derived from start_time in UTC).
+        after_trace_id:
+            Keyset cursor: fetch traces with trace_id > this value.
+        limit:
+            Maximum number of rows to return.
+
+        Returns
+        -------
+        list[dict]
+            List of trace rows, each with TRACES_WARM_COLUMNS keys.
+        """
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT {columns}
+                FROM traces_warm
+                WHERE tenant_id = $1
+                  AND (start_time AT TIME ZONE 'UTC')::date = $2
+                  AND trace_id > $3
+                ORDER BY trace_id
+                LIMIT $4
+                """.format(
+                    columns=", ".join(TRACES_WARM_COLUMNS)
+                ),
+                tenant_id,
+                day,
+                after_trace_id,
+                limit,
+            )
+
+        # Decode JSONB to dict and DECIMAL to float for consistency with the
+        # insert_traces path and the Parquet schema expectations.
+        result = []
+        for row in rows:
+            trace = dict(row)
+            eval_avg = trace.get("eval_avg")
+            if isinstance(eval_avg, str):
+                import json
+                trace["eval_avg"] = json.loads(eval_avg)
+            cost_usd_total = trace.get("cost_usd_total")
+            if cost_usd_total is not None:
+                trace["cost_usd_total"] = float(cost_usd_total)
+            result.append(trace)
+        return result
+
+    async def delete_traces(self, trace_ids: list[str]) -> int:
+        """Delete traces by ID from traces_warm.
+
+        Returns
+        -------
+        int
+            Number of rows actually deleted.
+        """
+        if not trace_ids:
+            return 0
+
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            deleted = await conn.fetchval(
+                "DELETE FROM traces_warm WHERE trace_id = ANY($1) RETURNING count(*)",
+                trace_ids,
+            )
+        return int(deleted) if deleted else 0
 
     async def close(self) -> None:
         """Close the connection pool."""

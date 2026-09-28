@@ -129,9 +129,10 @@ The tiered storage automatically migrates data between tiers:
    - Content is compressed (only metadata, no full text)
 
 2. **Warm → Cold (Weekly)**:
-   - Script: `scripts/cron/migrate_warm_to_cold.py`
-   - Traces older than 90 days are moved from PostgreSQL to MinIO
-   - Data is stored as Parquet files for efficient querying
+    - Script: `scripts/cron/migrate_warm_to_cold.py`
+    - Traces older than 90 days are moved from PostgreSQL to MinIO
+    - Data is stored as Parquet files for efficient querying
+    - Aggregates by (tenant, agent, day) with traces_count, cost_usd_sum, eval_avg, users_count, error_rate
 
 3. **Audit Events → Cold (Daily)**:
    - Audit events older than 90 days are moved to MinIO

@@ -35,6 +35,7 @@ from agent_obs.storage.maintenance import (
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
     JOB_MIGRATE_SPANS,
+    JOB_MIGRATE_TRACES,
     AuditArchiveResult,
     EvalWarmResult,
     TraceWarmResult,
@@ -1184,13 +1185,14 @@ class TestNextRunAt:
 class TestSchedulerJobTable:
     """The scheduled job table used by the container entrypoint."""
 
-    def test_all_four_jobs_registered(self):
+    def test_all_five_jobs_registered(self):
         names = [job.name for job in scheduler.build_jobs()]
         assert names == [
             JOB_CLEANUP_VAULT,
             JOB_CLEANUP_AUDIT_EVENTS,
             JOB_CLEANUP_EVAL_RESULTS,
             JOB_MIGRATE_SPANS,
+            JOB_MIGRATE_TRACES,
         ]
 
     def test_cadences_drive_the_alert_thresholds(self):
@@ -1347,7 +1349,7 @@ class TestInfraCronConfig:
     def test_cron_alert_rules_exist(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
         alerts = {rule["alert"] for rule in group["rules"]}
-        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale"}
+        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale"}
 
     def test_staleness_thresholds_are_two_cycles(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")

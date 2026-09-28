@@ -164,6 +164,43 @@ class ColdStore:
                 keys.append(obj["Key"])
         return keys
 
+    def delete_prefix(self, prefix: str, bucket: str | None = None) -> int:
+        """Delete all objects under ``prefix``.
+
+        Returns
+        -------
+        int
+            Number of objects deleted.
+        """
+        target = bucket or self._bucket
+        client = self._get_client()
+        
+        # List all objects under the prefix
+        paginator = client.get_paginator("list_objects_v2")
+        objects_to_delete = []
+        for page in paginator.paginate(Bucket=target, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                objects_to_delete.append({"Key": obj["Key"]})
+        
+        if not objects_to_delete:
+            return 0
+        
+        # Delete in batches (S3 limit is 1000 objects per request)
+        total_deleted = 0
+        batch_size = 1000
+        for i in range(0, len(objects_to_delete), batch_size):
+            batch = objects_to_delete[i:i + batch_size]
+            response = client.delete_objects(
+                Bucket=target,
+                Delete={"Objects": batch}
+            )
+            total_deleted += len(response.get("Deleted", []))
+            if response.get("Errors"):
+                logger.warning("cold delete_prefix: some objects failed to delete: %s", response["Errors"])
+        
+        logger.info("cold delete_prefix: deleted %d objects from prefix %s", total_deleted, prefix)
+        return total_deleted
+
     def close(self) -> None:
         """Drop the cached client. botocore pools are closed by the GC."""
         self._client = None

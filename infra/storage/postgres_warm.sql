@@ -28,9 +28,19 @@ CREATE TABLE IF NOT EXISTS traces_warm (
     input_sha256 VARCHAR(64) DEFAULT '',
     output_chars INTEGER DEFAULT 0,
     output_sha256 VARCHAR(64) DEFAULT '',
+    user_hash VARCHAR(64) DEFAULT '', -- Pseudonymous user identifier for cold-tier distinct-user counts
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
+
+-- Add user_hash to existing deployments (idempotent)
+DO $$
+BEGIN
+    ALTER TABLE traces_warm ADD COLUMN IF NOT EXISTS user_hash VARCHAR(64) DEFAULT '';
+EXCEPTION
+    WHEN duplicate_column THEN null; -- already exists
+END
+$$;
 
 -- Create indexes for better query performance
 CREATE INDEX IF NOT EXISTS idx_traces_warm_tenant_agent_start ON traces_warm(tenant_id, agent_id, start_time);

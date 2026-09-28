@@ -67,5 +67,19 @@ groups:
           description: >-
             Last successful run was {{ $value | humanizeDuration }} ago
             (threshold 48h). Audit events are past their 365-day retention
-            window, or eval results are past their 14-day hot window, and the
-            hot tier keeps growing past its ClickHouse TTL.
+            window, or eval results are past their 14-day hot window, or spans
+            are past their 14-day hot window, and the hot tier keeps growing past
+            its ClickHouse TTL.
+
+      - alert: CronWeeklyJobStale
+        expr: |
+          (time() - agent_obs_cron_last_success_timestamp_seconds{job_name="migrate_traces_to_cold"}) > 1209600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "migrate_traces_to_cold has not succeeded for more than 2 weekly cycles"
+          description: >-
+            Last successful run was {{ $value | humanizeDuration }} ago
+            (threshold 14d). Traces are past their 90-day warm window and not
+            being moved to cold storage, which will eventually fill the warm tier.
