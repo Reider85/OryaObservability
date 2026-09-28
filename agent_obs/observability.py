@@ -325,6 +325,14 @@ class ObservabilitySDK:
         self._max_trace_agg = 100_000
         self.cost_threshold = self._load_cost_threshold(config)
         self._guardrail: "GuardrailEngine | None" = None
+        # PC24: dedicated ring buffer for response embeddings → ClickHouse.
+        # Separate from the span ring buffer so embedding writes never block
+        # the main export path.
+        self._embedding_queue: asyncio.Queue[
+            tuple[str, str, list[float]]
+        ] = asyncio.Queue(maxsize=50_000)
+        self._embedding_worker_task: asyncio.Task | None = None
+        self._embedding_shutdown: asyncio.Event = asyncio.Event()
         if guardrail is not None and self._load_guardrail_enabled(config):
             self._guardrail = guardrail
             logger.info(
@@ -335,6 +343,20 @@ class ObservabilitySDK:
             if self._exporters:
                 self._worker_task = asyncio.create_task(self._export_worker())
                 atexit.register(self._atexit_handler)
+            # PC24: start the embedding storage worker alongside the main
+            # export worker.  It drains the embedding queue every 5 seconds
+            # and batch-inserts into ClickHouse.  Only started when a running
+            # event loop is available (same guard as the export worker).
+            try:
+                asyncio.get_running_loop()
+                self._embedding_worker_task = asyncio.create_task(
+                    self._embedding_worker()
+                )
+            except RuntimeError:
+                # No running loop — SDK constructed outside async context.
+                # The worker will not start; callers using the SDK outside
+                # async must use ``async with sdk:`` to start it.
+                pass
             if metrics_port is not None:
                 self._start_metrics_server(metrics_port)
 
@@ -406,6 +428,25 @@ class ObservabilitySDK:
         the caller.  If the buffer is full, the span is dropped and counted.
         """
         await self._apply_guardrail(span)
+
+        # PC24: extract response embedding before the span enters the ring
+        # buffer.  Embeddings go to ClickHouse through a separate queue so
+        # they never block the main Langfuse/OTLP export path.
+        embedding = span.attributes.pop("response_embedding", None)
+        if embedding is not None:
+            try:
+                self._embedding_queue.put_nowait(
+                    (span.context.trace_id, span.context.span_id, embedding)
+                )
+            except asyncio.QueueFull:
+                from agent_obs.metrics import embeddings_storage_failed_total
+
+                embeddings_storage_failed_total.inc()
+                logger.warning(
+                    "Embedding queue full, dropping embedding for span %s",
+                    span.context.span_id,
+                )
+
         try:
             self._ring_buffer.put_nowait(span)
             self.last_spans.append(span)
@@ -635,6 +676,120 @@ class ObservabilitySDK:
             if self._shutdown.is_set() and self._ring_buffer.empty():
                 break
 
+    # --- PC24: embedding storage worker ------------------------------------
+
+    async def _embedding_worker(self) -> None:
+        """Background worker that drains the embedding queue and batch-inserts
+        into ClickHouse ``spans_hot.response_embedding``.
+
+        Batches are flushed every 5 seconds or when the queue reaches 256
+        entries, whichever comes first.  This keeps the main export path
+        completely unblocked.
+        """
+        batch: list[tuple[str, str, list[float]]] = []
+        deadline: float = 0.0
+
+        while True:
+            try:
+                first = await asyncio.wait_for(
+                    self._embedding_queue.get(), timeout=0.5
+                )
+                batch.append(first)
+                deadline = _now() + 5.0  # 5-second flush window
+            except asyncio.TimeoutError:
+                if self._embedding_shutdown.is_set() and self._embedding_queue.empty():
+                    break
+                # If we have a batch and the deadline expired, flush it.
+                if batch and _now() >= deadline:
+                    await self._flush_embedding_batch(batch)
+                    batch = []
+                    deadline = 0.0
+                continue
+
+            # Drain up to 256 entries within the 5-second window.
+            while _now() < deadline and len(batch) < 256:
+                try:
+                    batch.append(self._embedding_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            await self._flush_embedding_batch(batch)
+            batch = []
+            deadline = 0.0
+
+            if self._embedding_shutdown.is_set() and self._embedding_queue.empty():
+                break
+
+    async def _flush_embedding_batch(
+        self, batch: list[tuple[str, str, list[float]]]
+    ) -> None:
+        """Write a batch of (trace_id, span_id, embedding) to ClickHouse.
+
+        Falls back to Redis with TTL 1 hour when ClickHouse is unavailable.
+        """
+        from agent_obs.metrics import (
+            embeddings_batch_size,
+            embeddings_stored_total,
+            embeddings_storage_failed_total,
+        )
+
+        if not batch:
+            return
+
+        embeddings_batch_size.observe(len(batch))
+
+        try:
+            from agent_obs.storage.hot import HotStore
+
+            hot_store = HotStore()
+            spans = [
+                {
+                    "trace_id": trace_id,
+                    "span_id": span_id,
+                    "response_embedding": embedding,
+                }
+                for trace_id, span_id, embedding in batch
+            ]
+            await asyncio.get_event_loop().run_in_executor(
+                None, hot_store.write_spans_batch, spans
+            )
+            embeddings_stored_total.inc(len(batch))
+        except Exception:
+            embeddings_storage_failed_total.inc(len(batch))
+            logger.warning(
+                "Failed to write %d embeddings to ClickHouse, "
+                "attempting Redis fallback",
+                len(batch),
+            )
+            await self._embedding_redis_fallback(batch)
+
+    async def _embedding_redis_fallback(
+        self, batch: list[tuple[str, str, list[float]]]
+    ) -> None:
+        """Store embeddings in Redis with TTL 1 hour when ClickHouse is down."""
+        try:
+            import json
+
+            import redis.asyncio as aioredis
+
+            redis_url = os.environ.get("AGENT_OBS_REDIS_URL", "redis://localhost:6379")
+            redis_client = aioredis.from_url(redis_url, decode_responses=True)
+            pipe = redis_client.pipeline()
+            for trace_id, span_id, embedding in batch:
+                key = f"embedding:{trace_id}:{span_id}"
+                pipe.set(key, json.dumps(embedding), ex=3600)  # TTL 1 hour
+            await pipe.execute()
+            await redis_client.aclose()
+            from agent_obs.metrics import eval_annotation_redis_fallback_total
+
+            eval_annotation_redis_fallback_total.inc(len(batch))
+        except Exception:
+            logger.warning(
+                "Redis fallback for %d embeddings also failed; data lost",
+                len(batch),
+                exc_info=True,
+            )
+
     async def shutdown(self) -> None:
         """Gracefully shut down: drain buffer, flush exporters, cancel worker.
 
@@ -643,6 +798,28 @@ class ObservabilitySDK:
         count of undelivered spans.
         """
         self._shutdown.set()
+
+        # PC24: drain the embedding worker first so pending embeddings are
+        # flushed to ClickHouse before we exit.
+        self._embedding_shutdown.set()
+        if self._embedding_worker_task is not None:
+            try:
+                await asyncio.wait_for(self._embedding_worker_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                remaining = self._embedding_queue.qsize()
+                logger.warning(
+                    "Embedding worker shutdown timed out after 5s, "
+                    "cancelling (%d embeddings undelivered)",
+                    remaining,
+                )
+                self._embedding_worker_task.cancel()
+                try:
+                    await self._embedding_worker_task
+                except asyncio.CancelledError:
+                    pass
+            except asyncio.CancelledError:
+                pass
+            self._embedding_worker_task = None
 
         if self._worker_task is None:
             return

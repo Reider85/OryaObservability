@@ -423,3 +423,59 @@ class TestEmbeddingEvaluator:
     def test_version_inheritance(self, evaluator):
         """Test that evaluator inherits version from base class."""
         assert evaluator.version == "1.0.0"
+
+    def test_evaluate_stores_embedding_in_eval_result(self, evaluator, mock_span, golden_store):
+        """PC24: evaluate() must include the answer embedding in EvalResult."""
+        evaluator.golden_store = golden_store
+        golden_store._golden_answers = [
+            GoldenEntry(
+                intent="capital_of_france",
+                golden_answer="The capital of France is Paris.",
+                embedding=[0.1, 0.2, 0.3],
+            )
+        ]
+        with patch.object(golden_store, "_get_embedding") as mock_get_embedding:
+            mock_get_embedding.return_value = [0.1, 0.2, 0.31]
+            eval_result = evaluator.evaluate(mock_span, [])
+
+        assert eval_result.response_embedding is not None
+        assert isinstance(eval_result.response_embedding, list)
+        assert len(eval_result.response_embedding) > 0
+        assert all(isinstance(v, float) for v in eval_result.response_embedding)
+
+    def test_evaluate_stores_embedding_on_span(self, evaluator, mock_span, golden_store):
+        """PC24: evaluate() must set response_embedding on the span attributes."""
+        evaluator.golden_store = golden_store
+        golden_store._golden_answers = [
+            GoldenEntry(
+                intent="capital_of_france",
+                golden_answer="The capital of France is Paris.",
+                embedding=[0.1, 0.2, 0.3],
+            )
+        ]
+        with patch.object(golden_store, "_get_embedding") as mock_get_embedding:
+            mock_get_embedding.return_value = [0.1, 0.2, 0.31]
+            evaluator.evaluate(mock_span, [])
+
+        assert "response_embedding" in mock_span.attributes
+        embedding = mock_span.attributes["response_embedding"]
+        assert isinstance(embedding, list)
+        assert len(embedding) > 0
+
+    def test_error_result_no_embedding(self, evaluator, mock_span, golden_store):
+        """PC24: error results must have response_embedding=None."""
+        evaluator.golden_store = golden_store
+        golden_store._golden_answers = []
+        with patch.object(golden_store, "_compute_embeddings") as mock_compute:
+            mock_compute.return_value = None
+            golden_store._golden_answers = []
+            eval_result = evaluator.evaluate(mock_span, [])
+
+        assert eval_result.response_embedding is None
+
+    def test_skipped_result_no_embedding(self, evaluator, mock_span, golden_store):
+        """PC24: skipped results must have response_embedding=None."""
+        evaluator.sample_rate = 0.0
+        evaluator.golden_store = golden_store
+        eval_result = evaluator.evaluate(mock_span, [])
+        assert eval_result.response_embedding is None

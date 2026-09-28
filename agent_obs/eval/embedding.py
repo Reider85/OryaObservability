@@ -287,12 +287,17 @@ class EmbeddingEvaluator(BaseEvaluator):
         
         # Compute similarity
         similarity = _cosine_similarity(golden_entry.embedding, answer_embedding)
-        
+
+        # Store embedding on span for downstream drift detection (PC24).
+        # The SDK picks this up in _enqueue and routes it to the embedding
+        # queue for batched ClickHouse writes.
+        span.attributes["response_embedding"] = answer_embedding
+
         # Create result
         flags = []
         if similarity < 0.7:
             flags.append("low_similarity")
-        
+
         return EvalResult(
             trace_id=span.context.trace_id,
             eval_id=f"embedding_{int(time.time() * 1000)}",
@@ -302,5 +307,6 @@ class EmbeddingEvaluator(BaseEvaluator):
             eval_latency_seconds=0.0,
             scores={"embedding_similarity": similarity},
             judge_model=self.model,
-            flags=flags
+            flags=flags,
+            response_embedding=answer_embedding,
         )

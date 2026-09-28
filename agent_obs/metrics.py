@@ -144,3 +144,21 @@ migration_warm_to_cold_duration_seconds = Histogram(
     ["job_name"],
     buckets=[1, 5, 15, 30, 60, 300, 900, 3600],
 )
+
+# --- PC24 Embedding storage metrics ------------------------------------------
+
+embeddings_stored_total = Counter(
+    "agent_obs_embeddings_stored_total",
+    "Response embeddings successfully written to ClickHouse",
+)
+
+embeddings_storage_failed_total = Counter(
+    "agent_obs_embeddings_storage_failed_total",
+    "Embedding writes to ClickHouse that failed",
+)
+
+embeddings_batch_size = Histogram(
+    "agent_obs_embeddings_batch_size",
+    "Number of embeddings in each ClickHouse batch write",
+    buckets=[1, 5, 10, 25, 50, 100, 250, 500],
+)

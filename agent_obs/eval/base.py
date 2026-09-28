@@ -30,6 +30,7 @@ class EvalResult:
     judge_prompt_sha256: str = ""
     reasoning: str = ""
     flags: list[str] = field(default_factory=list)
+    response_embedding: list[float] | None = None
 
 
 class BaseEvaluator(ABC):
