@@ -232,6 +232,98 @@ class HotStore:
             )
         return spans
 
+    def write_audit_event(self, event) -> None:
+        """Write a RecoveryAuditEvent to audit_events_hot table.
+
+        Parameters
+        ----------
+        event:
+            RecoveryAuditEvent instance with audit trail record
+
+        Raises
+        ------
+        Exception
+            If ClickHouse write fails
+        """
+        client = self._get_client()
+        row = event.to_clickhouse_row()
+        
+        client.execute(
+            """
+            INSERT INTO audit_events_hot
+            (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+            VALUES
+            """,
+            [row],
+        )
+        logger.debug(
+            "Audit event written: audit_id=%s action=%s reason=%s",
+            event.audit_id,
+            event.action,
+            event.reason,
+        )
+
+    def get_audit_events(self, action: str | None = None, trace_id: str | None = None, limit: int = 100) -> list[dict]:
+        """Retrieve audit events from audit_events_hot.
+        
+        Parameters
+        ----------
+        action:
+            Filter by action (e.g., "vault.recover")
+        trace_id:
+            Filter by trace_id
+        limit:
+            Maximum number of events to return
+            
+        Returns
+        -------
+        list[dict]
+            List of audit events as dicts
+        """
+        client = self._get_client()
+        
+        conditions = []
+        params = []
+        
+        if action:
+            conditions.append("action = %s")
+            params.append(action)
+        if trace_id:
+            conditions.append("trace_id = %s")
+            params.append(trace_id)
+        
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+        
+        query = f"""
+        SELECT audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent
+        FROM audit_events_hot
+        {where_clause}
+        ORDER BY timestamp DESC
+        LIMIT %s
+        """
+        
+        params.append(limit)
+        rows = client.execute(query, params)
+        
+        events = []
+        for row in rows:
+            events.append({
+                "audit_id": row[0],
+                "timestamp": row[1],  # DateTime64(3) → datetime object
+                "trace_id": row[2],
+                "actor": json.loads(row[3]) if isinstance(row[3], str) else row[3],
+                "action": row[4],
+                "decision": row[5],
+                "resource": json.loads(row[6]) if isinstance(row[6], str) else row[6],
+                "reason": row[7],
+                "ip_address": row[8],
+                "user_agent": row[9],
+            })
+        
+        return events
+
     def close(self) -> None:
         """Close the ClickHouse connection."""
         if self._client is not None:

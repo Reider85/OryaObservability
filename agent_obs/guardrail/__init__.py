@@ -5,6 +5,12 @@ information in text content, supporting Russian and international PII types,
 as well as prompt-injection classification via DeBERTa-v3.
 """
 
+from agent_obs.guardrail.audit import (
+    RecoveryAuditEvent,
+    AuditReasonRequiredError,
+    AuditWriteError,
+    classify_reason_category,
+)
 from agent_obs.guardrail.engine import (
     AuditEvent,
     GuardrailBlockException,
@@ -21,6 +27,12 @@ from agent_obs.guardrail.pii_types import PIIMatch
 from agent_obs.guardrail.vault_client import VaultClient
 
 __all__ = [
+    # PC20 Vault recovery audit
+    "RecoveryAuditEvent",
+    "AuditReasonRequiredError",
+    "AuditWriteError",
+    "classify_reason_category",
+    # Existing exports
     "AuditEvent",
     "GuardrailBlockException",
     "GuardrailConfig",

@@ -3,6 +3,7 @@
 PC18 provides a full implementation with real Vault HTTP API calls, TTL-based
 expiration via Vault leases, and batch operations. Replaces the PC07 in-memory stub.
 PC19 adds TOTP MFA verification and rate-limiting for recovery operations.
+PC20 adds audit trail for every recovery with ClickHouse write and reason field.
 """
 
 from __future__ import annotations
@@ -13,13 +14,43 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import hvac
 import pyotp
 from hvac.exceptions import VaultError
 
+from agent_obs.guardrail.audit import (
+    RecoveryAuditEvent,
+    AuditReasonRequiredError,
+    AuditWriteError,
+)
+
+if TYPE_CHECKING:
+    from agent_obs.storage.hot import HotStore
+
 logger = logging.getLogger(__name__)
+
+# Prometheus metrics for vault operations
+from prometheus_client import Counter, Histogram
+
+vault_recovery_total = Counter(
+    "agent_obs_vault_recovery_total",
+    "Vault recovery operations by reason category",
+    ["reason_category"],
+)
+
+vault_recovery_duration_seconds = Histogram(
+    "agent_obs_vault_recovery_duration_seconds",
+    "Vault recovery operation latency",
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+vault_audit_write_total = Counter(
+    "agent_obs_vault_audit_write_total",
+    "Audit event write attempts by status",
+    ["status"],
+)
 
 
 class MFARequiredError(Exception):
@@ -106,6 +137,8 @@ class VaultClient:
         verify_tls: bool = True,
         mfa_config: Optional[MFAConfig] = None,
         redis_url: Optional[str] = None,
+        audit_store: Optional[HotStore] = None,
+        audit_enabled: bool = True,
     ) -> None:
         self.addr = addr
         self.token = token
@@ -113,6 +146,8 @@ class VaultClient:
         self.verify_tls = verify_tls
         self.mfa_config = mfa_config or MFAConfig.from_env()
         self.redis_url = redis_url or os.environ.get("VAULT_MFA_REDIS_URL")
+        self._audit_store = audit_store
+        self._audit_enabled = audit_enabled
         self._client: Optional[hvac.Client] = None
         self._health_cache: dict = {"available": False, "checked_at": 0}
         self._health_cache_ttl = 30  # Cache health check for 30 seconds
@@ -127,6 +162,13 @@ class VaultClient:
                 verify=self.verify_tls,
             )
         return self._client
+    
+    def _get_audit_store(self) -> HotStore:
+        """Get or create audit store instance."""
+        if self._audit_store is None and self._audit_enabled:
+            from agent_obs.storage.hot import HotStore
+            self._audit_store = HotStore()
+        return self._audit_store
 
     async def store(
         self,
@@ -230,7 +272,16 @@ class VaultClient:
         logger.debug("vault.store_batch stored %d/%d items", len(results), len(items))
         return results
 
-    async def recover(self, vault_key: str, mfa_token: str = "", login: str = "") -> str:
+    async def recover(
+        self,
+        vault_key: str,
+        mfa_token: str = "",
+        login: str = "",
+        reason: str = "",
+        trace_id: str = "",
+        ip_address: str = "",
+        user_agent: str = "",
+    ) -> str:
         """Recover the original PII value for a given vault_key.
 
         Parameters
@@ -241,6 +292,14 @@ class VaultClient:
             TOTP token for MFA verification. Required if MFA is configured.
         login:
             Engineer's login/email for rate-limiting and MFA verification.
+        reason:
+            Engineer-provided reason for recovery (required).
+        trace_id:
+            Optional trace_id for correlation.
+        ip_address:
+            Client IP address (default "unknown").
+        user_agent:
+            Client user agent (default "cli").
 
         Returns
         -------
@@ -249,23 +308,37 @@ class VaultClient:
 
         Raises
         ------
+        AuditReasonRequiredError
+            If reason is not provided or empty.
         KeyError
             If the vault_key does not exist or has expired.
         ConnectionError
             If Vault is unreachable.
         MFARequiredError
             If MFA is required and token is missing or invalid.
+        AuditWriteError
+            If writing audit event to ClickHouse fails.
         """
+        # Validate reason is required
+        if not reason.strip():
+            raise AuditReasonRequiredError(
+                "Recovery reason is required for audit compliance. "
+                "Provide --reason flag in CLI or reason parameter in code."
+            )
+        
         # MFA verification before accessing Vault
-        if self.mfa_config and (login or mfa_token):
+        if self.mfa_config:
             if not login:
                 raise ValueError("login is required when MFA is enabled")
             
+            # Check if empty token was provided
+            if not mfa_token:
+                raise MFARequiredError("MFA verification required for vault recovery")
+            
             await self.verify_mfa(login, mfa_token)
         
-        # If MFA is configured but no login/token provided, require them
-        elif self.mfa_config:
-            raise MFARequiredError("MFA verification required for vault recovery")
+        # Record recovery start time for metrics
+        start_time = time.time()
         
         try:
             client = self._get_client()
@@ -287,6 +360,42 @@ class VaultClient:
                 raise KeyError(f"vault_key expired: {vault_key}")
 
             logger.debug("vault.recover key=%s", vault_key)
+            
+            # Create and write audit event
+            audit_store = self._get_audit_store()
+            if audit_store:
+                audit_event = RecoveryAuditEvent.for_vault_recovery(
+                    vault_key=vault_key,
+                    login=login or "unknown",
+                    reason=reason,
+                    trace_id=trace_id,
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                )
+                
+                try:
+                    # Run in executor to avoid blocking event loop
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, audit_store.write_audit_event, audit_event)
+                    vault_audit_write_total.labels(status="success").inc()
+                    logger.debug(
+                        "Audit event written: audit_id=%s reason=%s",
+                        audit_event.audit_id,
+                        reason,
+                    )
+                except Exception as e:
+                    vault_audit_write_total.labels(status="failed").inc()
+                    logger.error("Audit write failed: %s", str(e))
+                    raise AuditWriteError(f"Failed to write audit event: {str(e)}")
+            
+            # Record metrics
+            duration = time.time() - start_time
+            if audit_store and audit_event:
+                vault_recovery_total.labels(reason_category=audit_event.reason_category).inc()
+            else:
+                vault_recovery_total.labels(reason_category="unknown").inc()
+            vault_recovery_duration_seconds.observe(duration)
+            
             return original
 
         except KeyError as e:
@@ -469,31 +578,68 @@ def generate_totp_secret(login: str) -> str:
     return totp_secret
 
 
-def main() -> None:
+async def main() -> None:
     """CLI entry point for vault client operations."""
     import argparse
     
     parser = argparse.ArgumentParser(
         description="HashiCorp Vault client with MFA support for agent-obs"
     )
-    parser.add_argument(
-        "command",
-        choices=["issue-mfa", "health"],
-        help="Command to execute"
-    )
-    parser.add_argument(
+    
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # issue-mfa command (existing)
+    issue_mfa_parser = subparsers.add_parser("issue-mfa", help="Generate TOTP secret for engineer")
+    issue_mfa_parser.add_argument(
         "--login",
         help="Engineer's login/email for MFA operations",
-        required=False
+        required=True
+    )
+    
+    # health command (existing)
+    health_parser = subparsers.add_parser("health", help="Check vault availability")
+    
+    # recover command (PC20)
+    recover_parser = subparsers.add_parser("recover", help="Recover PII from vault")
+    recover_parser.add_argument(
+        "--key",
+        help="Vault key for the PII to recover",
+        required=True
+    )
+    recover_parser.add_argument(
+        "--mfa",
+        help="TOTP token for MFA verification",
+        default=""
+    )
+    recover_parser.add_argument(
+        "--login",
+        help="Engineer's login/email for MFA verification",
+        required=True
+    )
+    recover_parser.add_argument(
+        "--reason",
+        help="Reason for recovery (required for audit compliance)",
+        required=True
+    )
+    recover_parser.add_argument(
+        "--trace-id",
+        help="Trace ID for correlation (optional)",
+        default=""
+    )
+    recover_parser.add_argument(
+        "--ip",
+        help="Client IP address (optional)",
+        default=""
+    )
+    recover_parser.add_argument(
+        "--ua",
+        help="Client user agent (optional)",
+        default=""
     )
     
     args = parser.parse_args()
     
     if args.command == "issue-mfa":
-        if not args.login:
-            print("Error: --login is required for issue-mfa command")
-            exit(1)
-        
         # Generate and display TOTP secret
         secret = generate_totp_secret(args.login)
         
@@ -510,7 +656,39 @@ def main() -> None:
         else:
             print("Vault is not available")
             exit(1)
+    
+    elif args.command == "recover":
+        # Create client with audit enabled
+        client = VaultClient()
+        
+        try:
+            # Perform recovery
+            original = await client.recover(
+                vault_key=args.key,
+                mfa_token=args.mfa,
+                login=args.login,
+                reason=args.reason,
+                trace_id=args.trace_id,
+                ip_address=args.ip,
+                user_agent=args.ua,
+            )
+            
+            print(f"Recovered PII: {original}")
+            
+        except AuditReasonRequiredError as e:
+            print(f"Error: {e}")
+            exit(1)
+        except MFARequiredError as e:
+            print(f"Error: {e}")
+            exit(1)
+        except KeyError as e:
+            print(f"Error: {e}")
+            exit(1)
+        except Exception as e:
+            print(f"Error: {e}")
+            exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
