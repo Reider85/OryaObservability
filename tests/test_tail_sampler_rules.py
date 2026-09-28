@@ -48,9 +48,28 @@ def kept_by_reason(reason_counters: dict[str, int]) -> dict[str, float]:
 
 class TestRulesFileStructure:
     def test_has_single_group(self, rules):
+        """The tail sampler rules must live in exactly one group.
+
+        Other, unrelated groups are allowed to coexist: PC21 added a
+        `cron_storage` group to this same file. What matters is that the
+        tail sampler rules are not fragmented across several groups.
+        """
         groups = rules.get("groups", [])
-        assert len(groups) == 1
+        sampler_groups = [g for g in groups if g["name"] == "tail_sampler"]
+        assert len(sampler_groups) == 1
+        # Still the first group, since other tests index groups[0].
         assert groups[0]["name"] == "tail_sampler"
+
+    def test_tail_sampler_rules_are_not_split_across_groups(self, rules):
+        """Guards the invariant the index-based lookups below rely on."""
+        record_names = [
+            r.get("record")
+            for g in rules.get("groups", [])
+            for r in g.get("rules", [])
+            if r.get("record")
+        ]
+        assert record_names.count("job:tail_sampler_kept_ratio:ratio") == 1
+        assert record_names.count("job:tail_sampler_kept_by_reason:ratio") == 1
 
     def test_kept_ratio_rule_exists(self, rules):
         names = [r["record"] for r in rules["groups"][0]["rules"]]

@@ -30,7 +30,14 @@ PARTITION BY toYYYYMMDD(start_time)
 TTL start_time + INTERVAL 14 DAY
 SETTINGS index_granularity = 8192;
 
--- eval_results_hot table: evaluation results for hot tier (14 days retention)
+-- eval_results_hot table: evaluation results for hot tier
+--
+-- INVARIANT (PC21): the hot TTL must stay STRICTLY LONGER than the cron
+-- archive trigger (AGENT_OBS_CRON_EVAL_RETENTION_DAYS, default 14d).
+-- ClickHouse drops a row at INSERT time if it is already past the TTL, so a
+-- TTL equal to the trigger means cleanup_eval_results.py can never observe a
+-- single row and the warm migration silently becomes a no-op. 21d leaves a
+-- 7-day window for the daily job to ship rows to Postgres warm.
 CREATE TABLE IF NOT EXISTS eval_results_hot (
     trace_id String,
     eval_id String,
@@ -46,10 +53,17 @@ CREATE TABLE IF NOT EXISTS eval_results_hot (
 )
 ENGINE = ReplacingMergeTree()
 ORDER BY (trace_id, eval_id, eval_name, eval_timestamp)
-TTL eval_timestamp + INTERVAL 14 DAY
+TTL eval_timestamp + INTERVAL 21 DAY
 SETTINGS index_granularity = 8192;
 
--- audit_events_hot table: security audit events for hot tier (365 days retention)
+-- audit_events_hot table: security audit events for hot tier
+--
+-- Same INVARIANT as eval_results_hot (PC21): the hot TTL must outlast the cron
+-- archive trigger (AGENT_OBS_CRON_AUDIT_RETENTION_DAYS, default 365d), or
+-- ClickHouse deletes the rows before cleanup_audit_events.py can ship them to
+-- S3 Parquet. 400d leaves a 35-day window. The cold bucket then keeps each
+-- object for 365 days from upload, so total audit retention stays well above
+-- the 1-year minimum required by ARCHITECT.md 3.4.
 CREATE TABLE IF NOT EXISTS audit_events_hot (
     audit_id String,
     timestamp DateTime64(3),
@@ -66,7 +80,7 @@ CREATE TABLE IF NOT EXISTS audit_events_hot (
 ENGINE = MergeTree()
 ORDER BY (timestamp, audit_id)
 PARTITION BY toYYYYMMDD(timestamp)
-TTL timestamp + INTERVAL 365 DAY
+TTL timestamp + INTERVAL 400 DAY
 SETTINGS index_granularity = 8192;
 
 -- Create views for easier querying

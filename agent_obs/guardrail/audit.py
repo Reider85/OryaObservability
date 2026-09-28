@@ -1,12 +1,15 @@
 """Audit events and contracts for vault recovery and compliance logging.
 
 PC20: Audit trail для каждого vault recovery (§3.4 ARCHITECT.md, retention 1 год).
+PC21: Audit trail для истёкших TTL-lease'ов, которые находит cron-cleanup.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -175,6 +178,96 @@ class RecoveryAuditEvent:
         return f"secret/data/{vault_key}"
 
 
-# Import time and uuid at module level for use in for_vault_recovery
-import time
-import uuid
+@dataclass
+class LeaseExpiryAuditEvent:
+    """Audit event for a PII vault entry whose TTL has expired (PC21).
+
+    Vault reclaims the secret lease on its own, but the metadata has to be
+    recorded before it disappears (§3.4 ARCHITECT.md, retention 1 год).
+    Maps to the same ``audit_events_hot`` DDL columns as
+    :class:`RecoveryAuditEvent`.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    trace_id: str     # always "" — a lease has no originating trace
+    actor: dict[str, str]
+    action: str
+    resource: dict[str, str]
+    reason: str
+    ip_address: str
+    user_agent: str
+    decision: str = "allow"  # expiry is a system action, never denied
+
+    @property
+    def reason_category(self) -> str:
+        """Reason category for Prometheus metrics."""
+        return classify_reason_category(self.reason)
+
+    @classmethod
+    def for_expired_lease(
+        cls,
+        vault_key: str,
+        expired_at: float,
+        source: str = "kv_metadata",
+    ) -> "LeaseExpiryAuditEvent":
+        """Create an audit event for an expired vault entry.
+
+        Parameters
+        ----------
+        vault_key:
+            Vault secret path (e.g. ``"pii/5f3a/1758326400"``).
+        expired_at:
+            Unix timestamp at which the TTL elapsed.
+        source:
+            How the cron job found the entry: ``"kv_metadata"`` (LIST of
+            ``secret/metadata/pii`` + ``created_at + ttl_seconds``) or
+            ``"lease"`` (``sys/leases`` list with a past ``expire_time``).
+        """
+        return cls(
+            audit_id=f"lee-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            trace_id="",
+            actor={"type": "system", "id": "cron-cleanup"},
+            action="vault.lease_expired",
+            resource={"type": "pii_vault_key", "id": vault_key},
+            reason=f"ttl_expired source={source} expired_at={int(expired_at)}",
+            ip_address="unknown",
+            user_agent="cron",
+            decision="allow",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "decision": self.decision,
+            "reason_category": self.reason_category,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row tuple (positional parameters).
+
+        Matches audit_events_hot DDL columns:
+        (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+        """
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )

@@ -269,7 +269,7 @@
 | T2.3.2 | VaultClient.store(mask, original, ttl=24h) и VaultClient.recover(mask, mfa_token) | **TODO** | `PC18` |
 | T2.3.3 | Интеграция TOTP MFA (pyotp) для recovery | **TODO** | `PC19` |
 | T2.3.4 | Логирование каждого recovery в audit trail (кто, когда, какой mask, по какой причине) | **TODO** | `PC20` |
-| T2.3.5 | Cron-джоб для очистки истёкших TTL | **TODO** | `PC21` |
+| T2.3.5 | Cron-джоб для очистки истёкших TTL | **DONE** | `PC21` |
 #### E2.4 — Async eval-pipeline с late annotation
 
 **ТРИЗ-обоснование.** Принцип 9 (предварительное противопоставление): precompute embeddings golden-ответов офлайн. Принцип 24 (посредник): асинхронный eval-worker через очередь — пользователь получает ответ сразу.

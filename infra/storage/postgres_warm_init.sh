@@ -1,64 +1,57 @@
 #!/bin/bash
-
-# PostgreSQL initialization script for warm storage
-# This script creates the warm_store database and runs the DDL
-# It waits for PostgreSQL to be ready before executing
+# Grants for the warm tier, run by the postgres entrypoint from
+# /docker-entrypoint-initdb.d/init.sh, i.e. immediately after 01-schema.sql.
+#
+# The schema itself is applied by the 01-schema.sql mount; this script only
+# creates the least-privilege application role and grants it access.
+#
+# Notes on why this looks the way it does:
+#   * No `createdb` — POSTGRES_DB already created warm_store.
+#   * No `CREATE USER IF NOT EXISTS` — PostgreSQL has no such form, and the
+#     entrypoint runs psql with ON_ERROR_STOP=1, so a syntax error here aborts
+#     initdb and leaves the warm tier with no schema at all. A DO block is the
+#     supported way to make role creation idempotent.
+#   * No -h/-p — during initdb the server listens on a unix socket only.
+#     -U/-d come from POSTGRES_USER/POSTGRES_DB because the entrypoint does not
+#     export PGUSER here, and its default of "postgres" does not exist in this
+#     stack (the superuser is named by POSTGRES_USER).
 
 set -e
 
-# Wait for PostgreSQL to be ready
-echo "Waiting for PostgreSQL to be ready..."
-until pg_isready -h localhost -p 5432 -U warm; do
-    echo "PostgreSQL is unavailable - sleeping"
-    sleep 2
-done
+PSQL=(psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-warm}" -d "${POSTGRES_DB:-warm_store}")
 
-echo "PostgreSQL is ready"
+echo "Creating warm_user role (if absent)..."
+"${PSQL[@]}" <<'EOSQL'
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'warm_user') THEN
+        CREATE ROLE warm_user LOGIN PASSWORD 'warm_password';
+    END IF;
+END
+$$;
+EOSQL
 
-# Create the warm_store database
-echo "Creating warm_store database..."
-createdb -h localhost -p 5432 -U warm warm_store
+echo "Granting privileges on warm_store to warm_user..."
+"${PSQL[@]}" <<'EOSQL'
+GRANT CONNECT ON DATABASE warm_store TO warm_user;
+GRANT USAGE ON SCHEMA public TO warm_user;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO warm_user;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO warm_user;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO warm_user;
 
-# Create warm user with limited privileges
-echo "Creating warm user..."
-psql -h localhost -p 5432 -U postgres -c "
-CREATE USER IF NOT EXISTS warm_user 
-WITH PASSWORD 'warm_password'
-"
+-- Keep future tables (e.g. traces_warm added by PC22) reachable as well.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL PRIVILEGES ON TABLES TO warm_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL PRIVILEGES ON SEQUENCES TO warm_user;
+EOSQL
 
-# Grant privileges to warm_user on warm_store database
-echo "Granting privileges to warm_user..."
-psql -h localhost -p 5432 -U postgres -c "
-GRANT ALL PRIVILEGES ON DATABASE warm_store TO warm_user
-"
-
-# Grant usage on schema
-psql -h localhost -p 5432 -U warm -d warm_store -c "
-GRANT ALL ON ALL TABLES IN SCHEMA public TO warm_user
-"
-psql -h localhost -p 5432 -U warm -d warm_store -c "
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO warm_user
-"
-psql -h localhost -p 5432 -U warm -d warm_store -c "
-GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO warm_user
-"
-
-# Run the DDL script
-echo "Running DDL script..."
-psql -h localhost -p 5432 -U warm -d warm_store -f /docker-entrypoint-initdb.d/postgres_warm.sql
-
-# Verify tables were created
-echo "Verifying tables..."
-psql -h localhost -p 5432 -U warm -d warm_store -c "
-SELECT 
-    tablename,
-    tableowner,
-    hasindexes,
-    hasrules,
-    hastriggers
-FROM pg_tables 
+echo "Verifying warm tables..."
+"${PSQL[@]}" -c "
+SELECT tablename
+FROM pg_tables
 WHERE schemaname = 'public'
-ORDER BY tablename
+ORDER BY tablename;
 "
 
 echo "PostgreSQL warm storage initialization completed successfully"

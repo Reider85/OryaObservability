@@ -9,8 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
-from dataclasses import asdict
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -323,6 +322,157 @@ class HotStore:
             })
         
         return events
+
+    def write_audit_events(self, events: list) -> int:
+        """Write a batch of audit events to audit_events_hot in one INSERT.
+
+        Accepts any object exposing ``to_clickhouse_row()`` — both
+        ``RecoveryAuditEvent`` (PC20) and ``LeaseExpiryAuditEvent`` (PC21).
+
+        Returns
+        -------
+        int
+            Number of rows ClickHouse reported as inserted.
+
+        Raises
+        ------
+        Exception
+            If ClickHouse write fails
+        """
+        if not events:
+            return 0
+        client = self._get_client()
+        rows = [event.to_clickhouse_row() for event in events]
+
+        inserted = client.execute(
+            """
+            INSERT INTO audit_events_hot
+            (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+            VALUES
+            """,
+            rows,
+        )
+        logger.debug("Audit batch written: count=%d", len(rows))
+        return int(inserted) if inserted is not None else len(rows)
+
+    # --- Tiered retention queries (PC21) -------------------------------------
+    # The cron jobs read the hot tier in batches, ship the rows to the warm/cold
+    # tier, and only then delete them from ClickHouse. Each SELECT is bounded by
+    # `limit` so a single run can never pull the whole table.
+
+    def get_audit_events_older_than(self, cutoff: datetime, limit: int = 10_000) -> list[dict]:
+        """Read audit events older than ``cutoff`` for cold archival (PC21).
+
+        Ordered oldest-first so a partially-completed run keeps making progress
+        on the same prefix of the data.
+
+        Note: clickhouse-driver only substitutes parameters for a SELECT when
+        they are passed as a **dict**. A list is interpreted as INSERT row data
+        and the raw ``%s`` is shipped to the server (Code 62).
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT audit_id, timestamp, trace_id, actor, action, decision,
+                   resource, reason, ip_address, user_agent
+            FROM audit_events_hot
+            WHERE timestamp < %(cutoff)s
+            ORDER BY timestamp ASC
+            LIMIT %(limit)s
+            """,
+            {"cutoff": cutoff, "limit": limit},
+        )
+        return [self._audit_row_to_dict(row) for row in rows]
+
+    def delete_audit_events(self, audit_ids: list[str]) -> int:
+        """Delete archived audit events from the hot tier (PC21).
+
+        Only called after the Parquet object has been uploaded successfully.
+        """
+        if not audit_ids:
+            return 0
+        client = self._get_client()
+        client.execute(
+            "DELETE FROM audit_events_hot WHERE audit_id IN %(ids)s",
+            {"ids": audit_ids},
+        )
+        logger.info("audit_events_hot purged: rows=%d", len(audit_ids))
+        return len(audit_ids)
+
+    def get_eval_results_older_than(self, cutoff: datetime, limit: int = 10_000) -> list[dict]:
+        """Read eval results older than ``cutoff`` for warm migration (PC21).
+
+        Returns dicts that still carry ``reasoning``; ``WarmStore`` drops it.
+
+        Parameters must be a dict: clickhouse-driver treats a list as INSERT
+        row data for any statement, so a SELECT given a list reaches the server
+        with an unsubstituted ``%s`` (Code 62).
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT trace_id, eval_id, eval_name, eval_timestamp, eval_latency_seconds,
+                   scores, judge_model, judge_prompt_sha256, reasoning, flags
+            FROM eval_results_hot
+            WHERE eval_timestamp < %(cutoff)s
+            ORDER BY eval_timestamp ASC
+            LIMIT %(limit)s
+            """,
+            {"cutoff": cutoff, "limit": limit},
+        )
+        results: list[dict] = []
+        for row in rows:
+            results.append(
+                {
+                    "trace_id": row[0],
+                    "eval_id": row[1],
+                    "eval_name": row[2],
+                    "eval_timestamp": row[3],
+                    "eval_latency_seconds": row[4],
+                    "scores": json.loads(row[5]) if isinstance(row[5], str) else row[5],
+                    "judge_model": row[6] or "",
+                    "judge_prompt_sha256": row[7] or "",
+                    "reasoning": row[8] or "",
+                    "flags": list(row[9]) if row[9] else [],
+                }
+            )
+        return results
+
+    def delete_eval_results(self, keys: list[tuple[str, str, str]]) -> int:
+        """Delete migrated eval results from the hot tier (PC21).
+
+        ``eval_results_hot`` is a ``ReplacingMergeTree`` ordered by
+        ``(trace_id, eval_id, eval_name, eval_timestamp)``, so the delete key is
+        that same tuple. Only called after the warm-tier upsert succeeded.
+        """
+        if not keys:
+            return 0
+        client = self._get_client()
+        client.execute(
+            """
+            DELETE FROM eval_results_hot
+            WHERE (trace_id, eval_id, eval_name, eval_timestamp) IN %(keys)s
+            """,
+            {"keys": keys},
+        )
+        logger.info("eval_results_hot purged: rows=%d", len(keys))
+        return len(keys)
+
+    @staticmethod
+    def _audit_row_to_dict(row: tuple) -> dict:
+        """Map an ``audit_events_hot`` row tuple to a dict."""
+        return {
+            "audit_id": row[0],
+            "timestamp": row[1],
+            "trace_id": row[2],
+            "actor": json.loads(row[3]) if isinstance(row[3], str) else row[3],
+            "action": row[4],
+            "decision": row[5],
+            "resource": json.loads(row[6]) if isinstance(row[6], str) else row[6],
+            "reason": row[7],
+            "ip_address": row[8],
+            "user_agent": row[9],
+        }
 
     def close(self) -> None:
         """Close the ClickHouse connection."""

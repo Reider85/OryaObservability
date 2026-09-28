@@ -82,3 +82,39 @@ eval_job_latency_seconds = Histogram(
     "LLM judge job processing latency",
     buckets=[1, 2, 5, 10, 15, 30, 60],
 )
+
+# --- Cron maintenance jobs (PC21) -------------------------------------------
+# These are emitted by the out-of-process cron service (scripts/cron/scheduler.py),
+# never by the SDK in-process. `job_name` is a bounded set: cleanup_vault,
+# cleanup_audit_events, cleanup_eval_results.
+
+cron_runs_total = Counter(
+    "agent_obs_cron_runs_total",
+    "Cron maintenance job runs started",
+    ["job_name"],
+)
+
+cron_errors_total = Counter(
+    "agent_obs_cron_errors_total",
+    "Cron maintenance job runs that failed",
+    ["job_name"],
+)
+
+cron_rows_deleted_total = Counter(
+    "agent_obs_cron_rows_deleted_total",
+    "Rows deleted or archived by a cron maintenance job",
+    ["job_name"],
+)
+
+cron_duration_seconds = Histogram(
+    "agent_obs_cron_duration_seconds",
+    "Cron maintenance job wall-clock duration",
+    ["job_name"],
+    buckets=[0.5, 1, 2.5, 5, 10, 30, 60, 300, 900],
+)
+
+cron_last_success_timestamp_seconds = Gauge(
+    "agent_obs_cron_last_success_timestamp_seconds",
+    "Unix timestamp of the last successful cron maintenance run",
+    ["job_name"],
+)

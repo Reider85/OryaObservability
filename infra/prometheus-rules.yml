@@ -22,3 +22,50 @@ groups:
           sum(
             otelcol_processor_tail_sampling_count_traces_sampled{decision="sampled"}
           )
+
+  # PC21 (T2.3.5): the maintenance jobs must actually run. Each threshold is
+  # 2 cycles, so a single slow or failed run does not page anyone.
+  - name: cron
+    rules:
+      - alert: CronTargetDown
+        expr: up{job="cron"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "cron maintenance service is not scrapeable"
+          description: >-
+            Prometheus has been unable to scrape cron:9777 for 5 minutes, so all
+            tiered-retention jobs (vault TTL cleanup, audit archival, eval warm
+            migration) have stopped. Restart the `cron` container.
+
+      - alert: CronHourlyJobStale
+        expr: |
+          (time() - agent_obs_cron_last_success_timestamp_seconds{job_name="cleanup_vault"}) > 7200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "cleanup_vault has not succeeded for more than 2 hourly cycles"
+          description: >-
+            The hourly vault TTL cleanup last succeeded at
+            {{ $value | humanizeDuration }} ago (threshold 2h). Expired PII
+            vault entries are accumulating and their audit trail is being lost.
+
+      - alert: CronDailyJobStale
+        expr: |
+          (
+            time() - agent_obs_cron_last_success_timestamp_seconds{
+              job_name=~"cleanup_audit_events|cleanup_eval_results"
+            }
+          ) > 172800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job_name }} has not succeeded for more than 2 daily cycles"
+          description: >-
+            Last successful run was {{ $value | humanizeDuration }} ago
+            (threshold 48h). Audit events are past their 365-day retention
+            window, or eval results are past their 14-day hot window, and the
+            hot tier keeps growing past its ClickHouse TTL.

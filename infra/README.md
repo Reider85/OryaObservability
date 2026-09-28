@@ -15,7 +15,9 @@ Local self-hosted observability stack for the `agent-obs` MVP
 | `clickhouse` | `clickhouse/clickhouse-server` | `8123`, `9000` | Langfuse event/observation storage (compose network only) |
 | `minio` | `quay.io/minio/minio:latest` | `9000` | S3-compatible storage for Langfuse (S3 buckets; compose network only) |
 | `otel-collector` | `otel/opentelemetry-collector-contrib:0.128.0` | `4317` gRPC, `4318` HTTP, `8888` self-telemetry | OTLP → tail-sampling → batch → Langfuse |
-| `prometheus` | `prom/prometheus:latest` | `9091` (host) → `9090` | Scrapes Collector self-telemetry; recording rules for `tail_sampler_kept_ratio` (P21) |
+| `cron` | built from `infra/cron/Dockerfile` | `9777` metrics | Tiered-retention maintenance jobs: hourly vault TTL cleanup, daily audit archival, daily eval warm migration (PC21) |
+| `alertmanager` | `prom/alertmanager:latest` | `9093` | Receives Prometheus alerts (PC21) |
+| `prometheus` | `prom/prometheus:latest` | `9091` (host) → `9090` | Scrapes Collector self-telemetry and the cron service; recording rules for `tail_sampler_kept_ratio` (P21) and cron staleness alerts (PC21) |
 
 > Langfuse v3 **requires** `CLICKHOUSE_URL`/`CLICKHOUSE_MIGRATION_URL` and an
 > `ENCRYPTION_KEY` + `NEXTAUTH_SECRET` + `LANGFUSE_SALT` in `.env`. MinIO hosts
@@ -151,7 +153,84 @@ curl http://localhost:9091/api/v1/query --data-urlencode \
   'query=job:tail_sampler_kept_ratio:ratio'
 ```
 
-## 7. Useful commands
+## 7. Cron maintenance jobs (PC21)
+
+The `cron` service runs the tiered-retention jobs. It is a **separate process**
+— the SDK never performs this work in-process, per the architecture invariant
+that the SDK is the only in-process component.
+
+| Job | Default schedule (UTC) | What it does |
+|---|---|---|
+| `cleanup_vault` | `0 * * * *` (hourly) | Finds PII vault entries past their TTL and records a `vault.lease_expired` audit event in `audit_events_hot`. Vault itself reclaims the secret. |
+| `cleanup_audit_events` | `17 3 * * *` (daily) | Audit events older than 365 days → Snappy Parquet in the `audit-events` bucket, then purged from ClickHouse hot. |
+| `cleanup_eval_results` | `47 3 * * *` (daily) | Eval results older than 14 days → Postgres warm as **structure only** (`scores` + timestamp, no `reasoning`), then purged from ClickHouse hot. |
+
+Both archival jobs **ship first, delete second**: if the upload or the warm
+upsert fails, the hot rows are left in place and the batch is retried on the
+next cycle.
+
+Schedules and retention windows are configurable in `.env`
+(`AGENT_OBS_CRON_VAULT_SPEC`, `AGENT_OBS_CRON_AUDIT_RETENTION_DAYS`, …). The
+retention values must stay in sync with the ClickHouse TTLs in
+`storage/clickhouse_ddl.sql` (`audit_events_hot` = 365 DAY,
+`eval_results_hot` = 14 DAY).
+
+```bash
+# Metrics exposed by the cron process
+curl http://localhost:9777/metrics | grep agent_obs_cron
+
+# Run a single job immediately, without the scheduler
+docker compose exec cron python scripts/cron/cleanup_vault.py --dry-run
+docker compose exec cron python scripts/cron/cleanup_audit_events.py --dry-run
+
+# Run every job once and exit (also emits the metrics below)
+docker compose exec cron python scripts/cron/scheduler.py --run-once
+```
+
+### Metrics
+
+| Metric | Type | Labels |
+|---|---|---|
+| `agent_obs_cron_runs_total` | counter | `job_name` |
+| `agent_obs_cron_errors_total` | counter | `job_name` |
+| `agent_obs_cron_rows_deleted_total` | counter | `job_name` |
+| `agent_obs_cron_duration_seconds` | histogram | `job_name` |
+| `agent_obs_cron_last_success_timestamp_seconds` | gauge | `job_name` |
+
+The last one only advances on a **successful** run, which is what makes the
+"missed run" detection possible across container restarts (a counter would reset
+to zero on every restart).
+
+### Alerts
+
+`prometheus-rules.yml` has a `cron` group with three rules, routed to
+`alertmanager` (which PC27 previously assumed already existed):
+
+- `CronTargetDown` — `up{job="cron"} == 0` for 5 min (critical)
+- `CronHourlyJobStale` — `cleanup_vault` has not succeeded for more than
+  2 cycles (2 h)
+- `CronDailyJobStale` — `cleanup_audit_events` / `cleanup_eval_results` have not
+  succeeded for more than 2 cycles (48 h)
+
+```bash
+docker compose exec prometheus \
+  promtool check rules /etc/prometheus/rules.yml
+```
+
+### Applying the `eval_results_warm` schema
+
+`postgres_warm.sql` is mounted into `/docker-entrypoint-initdb.d/`, which
+Postgres only runs **on an empty volume**. If the `postgres-warm` volume already
+existed before PC21, create the table manually or rebuild:
+
+```bash
+docker compose exec postgres-warm psql -U warm -d warm_store \
+  -f /docker-entrypoint-initdb.d/01-schema.sql
+# or, to wipe and re-provision everything:
+docker compose down -v
+```
+
+## 8. Useful commands
 
 ```bash
 docker compose logs -f langfuse          # Langfuse web logs
@@ -165,7 +244,7 @@ docker compose down -v                   # stop and wipe data
 > `docker compose down -v` wipes the volumes. The `up -d` re-run boots a fresh
 > Langfuse v3 stack that re-runs Postgres + ClickHouse migrations (allow 30–60 s).
 
-## 8. The SDK side (later waves)
+## 9. The SDK side (later waves)
 
 `agent_obs` uses `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
 from `.env` (see P17–P19 in `analytics/MVP-PROMPT.md`). Keep these in sync with

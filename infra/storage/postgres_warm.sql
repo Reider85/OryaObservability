@@ -1,11 +1,12 @@
 -- PostgreSQL DDL for warm storage
 -- This script creates the tables for warm-tier storage: traces_warm and compliance_catalog
-
--- Create warm_store database (if it doesn't exist)
-CREATE DATABASE IF NOT EXISTS warm_store;
-
--- Switch to warm_store database
-\c warm_store;
+--
+-- The database itself is created by the postgres entrypoint from POSTGRES_DB,
+-- which also runs this file with psql already connected to it. There is
+-- deliberately no `CREATE DATABASE` here: that statement has no
+-- `IF NOT EXISTS` form in PostgreSQL, so including one aborts the whole
+-- initdb (the entrypoint runs psql with ON_ERROR_STOP=1) and leaves the warm
+-- tier with no schema at all.
 
 -- traces_warm table: aggregated trace data for warm tier (90 days retention)
 CREATE TABLE IF NOT EXISTS traces_warm (
@@ -28,6 +29,50 @@ CREATE INDEX IF NOT EXISTS idx_traces_warm_tenant_agent_start ON traces_warm(ten
 CREATE INDEX IF NOT EXISTS idx_traces_warm_start_time ON traces_warm(start_time);
 CREATE INDEX IF NOT EXISTS idx_traces_warm_status ON traces_warm(status);
 
+-- eval_results_warm table: structure-only eval scores (PC21, T2.3.5)
+--
+-- The hot tier (ClickHouse eval_results_hot) has a 14-day TTL; the daily cron
+-- job scripts/cron/cleanup_eval_results.py migrates older rows here and then
+-- purges them from hot.
+--
+-- There is deliberately NO `reasoning` column. The LLM judge's prose is the
+-- bulky, unbounded part of an eval result and the warm tier is specified as
+-- "structure-only, без reasoning, только scores+timestamp". Omitting the
+-- column from the schema makes that reduction impossible to bypass by mistake.
+CREATE TABLE IF NOT EXISTS eval_results_warm (
+    trace_id VARCHAR(255) NOT NULL,
+    eval_id VARCHAR(255) NOT NULL,
+    eval_name VARCHAR(255) NOT NULL,
+    eval_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    eval_latency_seconds DOUBLE PRECISION,
+    -- e.g. {"faithfulness": 0.92, "answer_relevancy": 0.88, "completeness": 0.85}
+    scores JSONB,
+    judge_model VARCHAR(255),
+    flags JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    -- Same key as the hot ReplacingMergeTree ORDER BY, so the migration is
+    -- idempotent: a re-run hits ON CONFLICT DO UPDATE instead of duplicating.
+    PRIMARY KEY (trace_id, eval_id, eval_name, eval_timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_results_warm_timestamp ON eval_results_warm(eval_timestamp);
+CREATE INDEX IF NOT EXISTS idx_eval_results_warm_name ON eval_results_warm(eval_name);
+
+-- Recency rollup for dashboards, mirroring the hot view.
+-- CREATE OR REPLACE, not CREATE VIEW IF NOT EXISTS: PostgreSQL supports the
+-- IF NOT EXISTS form for tables and indexes but not for views.
+CREATE OR REPLACE VIEW eval_results_warm_view AS
+SELECT
+    trace_id,
+    eval_name,
+    eval_timestamp,
+    eval_latency_seconds,
+    scores,
+    judge_model,
+    created_at
+FROM eval_results_warm;
+
 -- compliance_catalog table: PII compliance catalog (generated from masking, 90 days retention)
 CREATE TABLE IF NOT EXISTS compliance_catalog (
     id SERIAL PRIMARY KEY,
@@ -47,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_compliance_catalog_pii_type ON compliance_catalog
 CREATE INDEX IF NOT EXISTS idx_compliance_catalog_last_seen ON compliance_catalog(last_seen);
 
 -- Create view for easier compliance reporting
-CREATE VIEW IF NOT EXISTS compliance_summary AS
+CREATE OR REPLACE VIEW compliance_summary AS
 SELECT 
     agent_id,
     tool,
@@ -96,5 +141,5 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Grant permissions to warm user (will be created in init script)
--- This will be executed by the init script after creating the user
+-- Table ownership/grants are handled by postgres_warm_init.sh, which the
+-- postgres entrypoint runs immediately after this file.

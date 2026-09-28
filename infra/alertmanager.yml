@@ -1,0 +1,40 @@
+# Alertmanager routing for the observability stack (PC21).
+#
+# Prometheus sends firing alerts here via the `alerting:` block in
+# prometheus.yml. The default receiver is a `null` receiver: the local stack has
+# no notification destination, and dropping the alert is preferable to failing
+# the Prometheus evaluation. Replace `null` with a real receiver before relying
+# on the cron staleness alerts outside development.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: [alertname, job_name]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # A missed cron cycle is a warning; a job that has been failing repeatedly
+    # is escalated so it does not get lost in the noise of a single blip.
+    - matchers:
+        - severity="critical"
+      receiver: default
+      group_wait: 10s
+      repeat_interval: 1h
+
+inhibit_rules:
+  # While the cron target is down, Prometheus sees no cron metrics at all, so the
+  # staleness alerts stay silent. One noisy "target down" is enough.
+  - source_matchers:
+      - alertname="CronTargetDown"
+    target_matchers:
+      - alertname=~"Cron(Hourly|Daily)JobStale"
+
+receivers:
+  - name: default
+    # No notification channel configured. Example for a real deployment:
+    #
+    # webhook_configs:
+    #   - url: http://slack-gateway:8080/hooks/observability
+    #     send_resolved: true

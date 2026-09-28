@@ -73,8 +73,9 @@ services:
       timeout: 5s
       retries: 6
       start_period: 15s
-    ports:
-      - "5433:5432"  # Expose on 5433 to avoid conflict with local Postgres
+    # No host port, same as postgres above: the cron service reaches the warm
+    # tier over the compose network. Publishing 5433 collides with unrelated
+    # local Postgres instances.
 
   redis:
     image: redis:7
@@ -142,7 +143,7 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
     volumes:
       - minio_data:/data
-      - ./storage/minio_init.sh:/docker-entrypoint-initdb.d/minio_init.sh:ro
+      - ./storage/minio_init.sh:/init/minio_init.sh:ro
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -203,6 +204,24 @@ services:
         condition: service_healthy
     environment:
       <<: *langfuse-env
+
+  # One-shot bucket + lifecycle provisioning. Must be a separate service: the
+  # MinIO image has no entrypoint init hook, and minio_init.sh blocks until
+  # MinIO answers, so it cannot be chained into the minio command.
+  # The audit-events bucket must keep objects 365 days (§3.4 ARCHITECT.md:
+  # audit retention is at least 1 year) — PC21 archives into it.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - ./storage/minio_init.sh:/init/minio_init.sh:ro
+    entrypoint: ["/bin/sh", "/init/minio_init.sh"]
+    restart: on-failure
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.128.0
@@ -280,11 +299,88 @@ services:
     restart: unless-stopped
     depends_on:
       - otel-collector
+      - cron
+      - alertmanager
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus-rules.yml:/etc/prometheus/rules.yml:ro
     ports:
       - "9091:9090"
+
+  # PC21: tiered-retention maintenance jobs. Separate process from the SDK and
+  # from the agent — it only reaches the storage backends directly.
+  # Prometheus scrapes :9777/metrics; "missed run" alerts live in prometheus-rules.yml.
+  cron:
+    build:
+      context: ..
+      dockerfile: infra/cron/Dockerfile
+    image: agent-obs-cron:latest
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres-warm:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /app
+      # Schedule (5-field cron, evaluated in UTC)
+      AGENT_OBS_CRON_VAULT_SPEC: ${AGENT_OBS_CRON_VAULT_SPEC:-0 * * * *}
+      AGENT_OBS_CRON_AUDIT_SPEC: ${AGENT_OBS_CRON_AUDIT_SPEC:-17 3 * * *}
+      AGENT_OBS_CRON_EVAL_SPEC: ${AGENT_OBS_CRON_EVAL_SPEC:-47 3 * * *}
+      AGENT_OBS_CRON_PORT: ${AGENT_OBS_CRON_PORT:-9777}
+      # Retention windows (must match the ClickHouse TTLs)
+      AGENT_OBS_CRON_AUDIT_RETENTION_DAYS: ${AGENT_OBS_CRON_AUDIT_RETENTION_DAYS:-365}
+      AGENT_OBS_CRON_EVAL_RETENTION_DAYS: ${AGENT_OBS_CRON_EVAL_RETENTION_DAYS:-14}
+      AGENT_OBS_CRON_BATCH_SIZE: ${AGENT_OBS_CRON_BATCH_SIZE:-10000}
+      AGENT_OBS_CRON_MAX_EVENTS: ${AGENT_OBS_CRON_MAX_EVENTS:-1000}
+      # KV v2 has no server-side TTL, so nothing reclaims expired entries on its
+      # own. Off by default because PC21 assigns reclamation to Vault.
+      AGENT_OBS_CRON_VAULT_DELETE_EXPIRED: ${AGENT_OBS_CRON_VAULT_DELETE_EXPIRED:-false}
+      AGENT_OBS_LOG_LEVEL: ${AGENT_OBS_LOG_LEVEL:-INFO}
+      # Backends. The ClickHouse credentials must be the *same* variables the
+      # clickhouse service is provisioned with, otherwise every job fails with
+      # "there is no user with such name".
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-observability}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      WARM_PG_DSN: ${WARM_PG_DSN:-postgresql://warm:warm@postgres-warm:5432/warm_store}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      S3_AUDIT_BUCKET: ${S3_AUDIT_BUCKET:-audit-events}
+      VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+    volumes:
+      - ../:/app:ro
+    ports:
+      - "9777:9777"  # metrics endpoint, exposed for DoD verification
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9777/metrics', timeout=3).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # PC21: Prometheus alert receiver. PC27 assumed this already existed; the
+  # cron staleness alerts need it to be routed anywhere.
+  alertmanager:
+    image: prom/alertmanager:latest
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
 
 volumes:
   postgres_data:
