@@ -30,16 +30,20 @@ from agent_obs.storage.maintenance import (
     AUDIT_ARCHIVE_SCHEMA_FIELDS,
     DEFAULT_AUDIT_RETENTION_DAYS,
     DEFAULT_EVAL_RETENTION_DAYS,
+    DEFAULT_SPAN_RETENTION_DAYS,
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
+    JOB_MIGRATE_SPANS,
     AuditArchiveResult,
     EvalWarmResult,
+    TraceWarmResult,
     VaultCleanupResult,
     archive_expired_audit_events,
     cleanup_vault_expired,
     list_kv_keys_recursive,
     migrate_eval_results_to_warm,
+    migrate_spans_to_warm,
     run_cron_job,
     run_cron_job_async,
 )
@@ -132,6 +136,40 @@ def _eval_tuple(trace_id, days_ago, reasoning="long judge prose"):
         row["reasoning"],
         row["flags"],
     )
+
+
+def _span_dict(
+    trace_id,
+    days_ago,
+    span_id="span-1",
+    agent_id="agent-1",
+    tenant_id="tenant-1",
+    name="llm.call",
+    span_type="llm.call",
+    status="ok",
+    cost_usd=0.01,
+    attributes=None,
+):
+    """Build a span in the dict shape ``HotStore.get_spans_older_than`` returns."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days_ago)
+    end = start + timedelta(seconds=2)
+    return {
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": "",
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+        "name": name,
+        "span_type": span_type,
+        "start_time": start,
+        "end_time": end,
+        "status": status,
+        "attributes": attributes or {},
+        "events": [],
+        "cost_usd": cost_usd,
+        "response_embedding": None,
+    }
 
 
 @pytest.fixture(scope="module")
@@ -754,6 +792,161 @@ class TestMigrateEvalResults:
         assert (before - timedelta(days=14) - cutoff).total_seconds() < 5
 
 
+class TestMigrateSpansToWarm:
+    """Daily migration of spans older than 14d from hot to warm tier (PC22)."""
+
+    @pytest.fixture
+    def warm_store(self):
+        store = MagicMock()
+        store.insert_traces = AsyncMock(return_value=2)
+        store.close = AsyncMock()
+        return store
+
+    @pytest.fixture
+    def hot_store(self):
+        store = MagicMock()
+        store.get_spans_older_than.side_effect = [
+            [
+                _span_dict("t1", 20, span_id="s1", cost_usd=0.01,
+                           attributes={"llm.input_chars": 100, "llm.input_sha256": "abc"}),
+                _span_dict("t1", 20, span_id="s2", name="tool.call", span_type="tool.call",
+                           cost_usd=0.005, status="error"),
+                _span_dict("t2", 21, span_id="s3", cost_usd=0.02,
+                           attributes={"llm.output_chars": 200, "llm.output_sha256": "def"}),
+            ],
+            [],
+        ]
+        store.delete_spans.return_value = 2
+        return store
+
+    @pytest.mark.asyncio
+    async def test_migrates_then_purges_hot(self, hot_store, warm_store):
+        result = await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        assert isinstance(result, TraceWarmResult)
+        assert result.scanned_spans == 3
+        assert result.traces_migrated == 2
+        assert result.traces_deleted == 2
+        assert result.errors == 0
+
+    @pytest.mark.asyncio
+    async def test_aggregates_spans_by_trace(self, hot_store, warm_store):
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        rows = warm_store.insert_traces.call_args[0][0]
+        assert len(rows) == 2
+
+        by_id = {r["trace_id"]: r for r in rows}
+        # trace t1 has 2 spans: cost 0.01 + 0.005 = 0.015, span_count=2, error_count=1
+        assert by_id["t1"]["cost_usd_total"] == pytest.approx(0.015)
+        assert by_id["t1"]["span_count"] == 2
+        assert by_id["t1"]["error_count"] == 1
+        assert by_id["t1"]["input_chars"] == 100
+        assert by_id["t1"]["input_sha256"] == "abc"
+        # trace t2 has 1 span
+        assert by_id["t2"]["cost_usd_total"] == pytest.approx(0.02)
+        assert by_id["t2"]["span_count"] == 1
+        assert by_id["t2"]["error_count"] == 0
+        assert by_id["t2"]["output_chars"] == 200
+        assert by_id["t2"]["output_sha256"] == "def"
+
+    @pytest.mark.asyncio
+    async def test_compression_drops_text_fields(self, hot_store, warm_store):
+        """llm.input_text / llm.output_text must NOT appear in warm rows."""
+        hot_store.get_spans_older_than.side_effect = [
+            [_span_dict("t1", 20, attributes={
+                "llm.input_text": "secret user email ivan@example.com",
+                "llm.output_text": "Here is the answer",
+                "llm.input_chars": 100,
+                "llm.input_sha256": "abc",
+                "llm.output_chars": 200,
+                "llm.output_sha256": "def",
+            })],
+            [],
+        ]
+
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        rows = warm_store.insert_traces.call_args[0][0]
+        row = rows[0]
+        # Text fields must not be present
+        assert "llm.input_text" not in row
+        assert "llm.output_text" not in row
+        # Compressed metadata must be present
+        assert row["input_chars"] == 100
+        assert row["input_sha256"] == "abc"
+        assert row["output_chars"] == 200
+        assert row["output_sha256"] == "def"
+
+    @pytest.mark.asyncio
+    async def test_warm_failure_keeps_hot_rows(self, hot_store, warm_store):
+        warm_store.insert_traces.side_effect = Exception("warm postgres down")
+
+        result = await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        assert result.traces_migrated == 0
+        assert result.traces_deleted == 0
+        assert result.errors == 1
+        hot_store.delete_spans.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_touches_neither_backend(self, hot_store, warm_store):
+        result = await migrate_spans_to_warm(
+            hot_store=hot_store, warm_store=warm_store, dry_run=True
+        )
+
+        assert result.traces_migrated == 2
+        assert result.traces_deleted == 0
+        warm_store.insert_traces.assert_not_called()
+        hot_store.delete_spans.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rerun_migrates_nothing(self, hot_store, warm_store):
+        hot_store.get_spans_older_than.side_effect = [[], []]
+        result = await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        assert result.traces_migrated == 0
+        warm_store.insert_traces.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_default_retention_is_14_days(self, hot_store, warm_store):
+        assert DEFAULT_SPAN_RETENTION_DAYS == 14
+        hot_store.get_spans_older_than.side_effect = [[], []]
+
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        before = datetime.now(timezone.utc)
+        cutoff = hot_store.get_spans_older_than.call_args[0][0]
+        assert (before - timedelta(days=14) - cutoff).total_seconds() < 5
+
+    @pytest.mark.asyncio
+    async def test_eval_avg_is_empty_dict(self, hot_store, warm_store):
+        """eval_avg starts empty — eval scores are migrated separately."""
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        rows = warm_store.insert_traces.call_args[0][0]
+        for row in rows:
+            assert row["eval_avg"] == {}
+
+    @pytest.mark.asyncio
+    async def test_error_status_counted_correctly(self, hot_store, warm_store):
+        """Only non-'ok' status counts as an error."""
+        hot_store.get_spans_older_than.side_effect = [
+            [
+                _span_dict("t1", 20, status="ok"),
+                _span_dict("t1", 20, span_id="s2", status="error"),
+                _span_dict("t1", 20, span_id="s3", status="ok"),
+            ],
+            [],
+        ]
+
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        rows = warm_store.insert_traces.call_args[0][0]
+        assert rows[0]["error_count"] == 1
+        assert rows[0]["span_count"] == 3
+
+
 class TestWarmStoreColumns:
     """The warm table must have no reasoning column, and the client must not send one."""
 
@@ -763,6 +956,16 @@ class TestWarmStoreColumns:
         assert "reasoning" not in EVAL_RESULTS_WARM_COLUMNS
         assert "scores" in EVAL_RESULTS_WARM_COLUMNS
         assert "eval_timestamp" in EVAL_RESULTS_WARM_COLUMNS
+
+    def test_traces_warm_columns_include_compression_fields(self):
+        from agent_obs.storage.warm import TRACES_WARM_COLUMNS
+
+        assert "input_chars" in TRACES_WARM_COLUMNS
+        assert "input_sha256" in TRACES_WARM_COLUMNS
+        assert "output_chars" in TRACES_WARM_COLUMNS
+        assert "output_sha256" in TRACES_WARM_COLUMNS
+        assert "trace_id" in TRACES_WARM_COLUMNS
+        assert "cost_usd_total" in TRACES_WARM_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1053,7 @@ class TestHotStoreTieredQueries:
         for call in (
             lambda: store.get_audit_events_older_than(datetime.now(timezone.utc)),
             lambda: store.get_eval_results_older_than(datetime.now(timezone.utc)),
+            lambda: store.get_spans_older_than(datetime.now(timezone.utc)),
         ):
             clickhouse.reset_mock()
             clickhouse.execute.return_value = []
@@ -870,6 +1074,46 @@ class TestHotStoreTieredQueries:
         assert "DELETE FROM eval_results_hot" in sql
         assert "(trace_id, eval_id, eval_name, eval_timestamp) IN %(keys)s" in sql
         assert params["keys"] == [("t1", "e1", "faithfulness", now)]
+
+    def test_spans_select_is_bounded_and_ordered(self, store, clickhouse):
+        clickhouse.execute.return_value = []
+        cutoff = datetime.now(timezone.utc)
+        store.get_spans_older_than(cutoff, limit=500)
+
+        sql, params = clickhouse.execute.call_args[0]
+        assert "FROM spans_hot" in sql
+        assert "start_time < %(cutoff)s" in sql
+        assert "ORDER BY start_time ASC" in sql
+        assert "LIMIT %(limit)s" in sql
+        assert params == {"cutoff": cutoff, "limit": 500}
+
+    def test_spans_select_returns_full_shape(self, store, clickhouse):
+        now = datetime.now(timezone.utc)
+        clickhouse.execute.return_value = [
+            (
+                "trace-1", "span-1", "", "agent-1", "tenant-1",
+                "llm.call", "llm.call", now - timedelta(days=15), now - timedelta(days=15, seconds=-2),
+                "ok", '{"llm.input_chars": 100, "llm.input_sha256": "abc123"}', "[]",
+                0.01, None,
+            )
+        ]
+        spans = store.get_spans_older_than(now)
+
+        assert len(spans) == 1
+        assert spans[0]["trace_id"] == "trace-1"
+        assert spans[0]["attributes"]["llm.input_chars"] == 100
+        assert spans[0]["attributes"]["llm.input_sha256"] == "abc123"
+
+    def test_spans_delete_uses_in_clause(self, store, clickhouse):
+        store.delete_spans(["t1", "t2"])
+        sql, params = clickhouse.execute.call_args[0]
+        assert "DELETE FROM spans_hot" in sql
+        assert "trace_id IN %(trace_ids)s" in sql
+        assert params["trace_ids"] == ["t1", "t2"]
+
+    def test_spans_delete_noop_on_empty(self, store, clickhouse):
+        store.delete_spans([])
+        clickhouse.execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -940,19 +1184,25 @@ class TestNextRunAt:
 class TestSchedulerJobTable:
     """The scheduled job table used by the container entrypoint."""
 
-    def test_all_three_jobs_registered(self):
+    def test_all_four_jobs_registered(self):
         names = [job.name for job in scheduler.build_jobs()]
-        assert names == [JOB_CLEANUP_VAULT, JOB_CLEANUP_AUDIT_EVENTS, JOB_CLEANUP_EVAL_RESULTS]
+        assert names == [
+            JOB_CLEANUP_VAULT,
+            JOB_CLEANUP_AUDIT_EVENTS,
+            JOB_CLEANUP_EVAL_RESULTS,
+            JOB_MIGRATE_SPANS,
+        ]
 
     def test_cadences_drive_the_alert_thresholds(self):
         cadences = {job.name: job.interval_seconds for job in scheduler.build_jobs()}
         assert cadences[JOB_CLEANUP_VAULT] == 3600     # 2 cycles = 2h alert
         assert cadences[JOB_CLEANUP_AUDIT_EVENTS] == 86400
         assert cadences[JOB_CLEANUP_EVAL_RESULTS] == 86400
+        assert cadences[JOB_MIGRATE_SPANS] == 86400
 
     def test_daily_jobs_are_staggered(self):
         specs = [job.spec for job in scheduler.build_jobs() if job.interval_seconds == 86400]
-        assert len(set(specs)) == 2, "daily jobs must not share a slot"
+        assert len(set(specs)) == 3, "daily jobs must not share a slot"
 
     def test_specs_are_valid(self):
         for job in scheduler.build_jobs():
@@ -993,7 +1243,7 @@ class TestSchedulerJobTable:
     def test_scheduled_invoke_returns_an_awaitable(self):
         """`invoke` may be sync or async, but what it returns must be awaitable."""
         for job in scheduler.build_jobs():
-            if job.name == JOB_CLEANUP_EVAL_RESULTS:
+            if job.name in (JOB_CLEANUP_EVAL_RESULTS, JOB_MIGRATE_SPANS):
                 # Needs a live asyncpg pool; covered by the env-propagation tests.
                 continue
             awaitable = job.invoke()
@@ -1051,6 +1301,8 @@ class TestInfraCronConfig:
         assert "../:/app:ro" in service["volumes"]
         assert service["environment"]["AGENT_OBS_CRON_AUDIT_RETENTION_DAYS"] == "${AGENT_OBS_CRON_AUDIT_RETENTION_DAYS:-365}"
         assert service["environment"]["AGENT_OBS_CRON_EVAL_RETENTION_DAYS"] == "${AGENT_OBS_CRON_EVAL_RETENTION_DAYS:-14}"
+        assert service["environment"]["AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS"] == "${AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS:-14}"
+        assert service["environment"]["AGENT_OBS_CRON_MIGRATION_SPEC"] == "${AGENT_OBS_CRON_MIGRATION_SPEC:-0 4 * * *}"
 
     def test_cron_uses_the_same_clickhouse_credentials_as_the_server(self, compose):
         """Regression: mismatched defaults made every job fail auth (Code 516).
@@ -1237,6 +1489,10 @@ class TestInfraCronConfig:
         scores once hot purges them."""
         assert self._ddl_ttl_days("eval_timestamp") > DEFAULT_EVAL_RETENTION_DAYS
 
+    def test_hot_ttl_outlasts_the_span_migration_trigger(self):
+        """PC22: spans_hot TTL must outlast the span migration trigger."""
+        assert self._ddl_ttl_days("start_time") > DEFAULT_SPAN_RETENTION_DAYS
+
     def test_cold_bucket_keeps_archived_audit_for_a_year(self):
         """§3.4 ARCHITECT.md: the archived object must survive >= 1 year, which
         is measured from upload, i.e. after the hot TTL has expired."""
@@ -1258,8 +1514,10 @@ class TestEnvExample:
             "AGENT_OBS_CRON_VAULT_SPEC",
             "AGENT_OBS_CRON_AUDIT_SPEC",
             "AGENT_OBS_CRON_EVAL_SPEC",
+            "AGENT_OBS_CRON_MIGRATION_SPEC",
             "AGENT_OBS_CRON_AUDIT_RETENTION_DAYS",
             "AGENT_OBS_CRON_EVAL_RETENTION_DAYS",
+            "AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS",
             "AGENT_OBS_CRON_BATCH_SIZE",
             "AGENT_OBS_CRON_VAULT_DELETE_EXPIRED",
         ):

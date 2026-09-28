@@ -6,7 +6,14 @@ CREATE DATABASE IF NOT EXISTS observability;
 
 USE observability;
 
--- spans_hot table: full span data for hot tier (14 days retention)
+-- spans_hot table: full span data for hot tier (21 days retention)
+--
+-- INVARIANT (PC22): the hot TTL must stay STRICTLY LONGER than the cron
+-- migration trigger (AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS, default 14d).
+-- ClickHouse drops a row at INSERT time if it is already past the TTL, so a
+-- TTL equal to the trigger means migrate_spans_to_warm.py can never observe a
+-- single row and the warm migration silently becomes a no-op. 21d leaves a
+-- 7-day window for the daily job to ship rows to Postgres warm.
 CREATE TABLE IF NOT EXISTS spans_hot (
     trace_id String,
     span_id String,
@@ -27,7 +34,7 @@ CREATE TABLE IF NOT EXISTS spans_hot (
 ENGINE = MergeTree()
 ORDER BY (tenant_id, agent_id, start_time)
 PARTITION BY toYYYYMMDD(start_time)
-TTL start_time + INTERVAL 14 DAY
+TTL start_time + INTERVAL 21 DAY
 SETTINGS index_granularity = 8192;
 
 -- eval_results_hot table: evaluation results for hot tier

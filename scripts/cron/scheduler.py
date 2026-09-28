@@ -35,15 +35,18 @@ from agent_obs.storage.maintenance import (
     DEFAULT_AUDIT_RETENTION_DAYS,
     DEFAULT_BATCH_SIZE,
     DEFAULT_EVAL_RETENTION_DAYS,
+    DEFAULT_SPAN_RETENTION_DAYS,
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
+    JOB_MIGRATE_SPANS,
     archive_expired_audit_events,
     build_cold_store,
     build_hot_store,
     build_warm_store,
     cleanup_vault_expired,
     migrate_eval_results_to_warm,
+    migrate_spans_to_warm,
     run_cron_job,
     run_cron_job_async,
 )
@@ -63,6 +66,7 @@ FULL_DOM = set(FIELD_RANGES[2])
 # connections at the same instant.
 DAILY_AUDIT_SPEC = "17 3 * * *"
 DAILY_EVAL_SPEC = "47 3 * * *"
+DAILY_MIGRATION_SPEC = "0 4 * * *"
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,29 @@ def _eval_job() -> Awaitable[Any]:
     return _runner()
 
 
+def _migration_job() -> Awaitable[Any]:
+    """Migrate spans older than 14d to warm tier; pool closed even on failure."""
+    warm = build_warm_store()
+
+    async def _runner() -> Any:
+        try:
+            return await run_cron_job_async(
+                JOB_MIGRATE_SPANS,
+                migrate_spans_to_warm,
+                hot_store=build_hot_store(),
+                warm_store=warm,
+                retention_days=_env_int(
+                    "AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS", DEFAULT_SPAN_RETENTION_DAYS
+                ),
+                batch_size=_env_int("AGENT_OBS_CRON_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+                dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+            )
+        finally:
+            await warm.close()
+
+    return _runner()
+
+
 def build_jobs() -> list[CronJob]:
     """Return the configured job table.
 
@@ -269,6 +296,12 @@ def build_jobs() -> list[CronJob]:
             JOB_CLEANUP_EVAL_RESULTS,
             os.environ.get("AGENT_OBS_CRON_EVAL_SPEC", DAILY_EVAL_SPEC),
             _eval_job,
+            86400,
+        ),
+        CronJob(
+            JOB_MIGRATE_SPANS,
+            os.environ.get("AGENT_OBS_CRON_MIGRATION_SPEC", DAILY_MIGRATION_SPEC),
+            _migration_job,
             86400,
         ),
     ]

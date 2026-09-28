@@ -33,6 +33,29 @@ EVAL_RESULTS_WARM_COLUMNS = (
     "flags",
 )
 
+# Columns of traces_warm (PC22).  Full-text fields (llm.input_text /
+# llm.output_text) are intentionally absent — only char-count and sha256
+# hashes survive the hot→warm compression.
+TRACES_WARM_COLUMNS = (
+    "trace_id",
+    "tenant_id",
+    "agent_id",
+    "start_time",
+    "end_time",
+    "status",
+    "cost_usd_total",
+    "span_count",
+    "error_count",
+    "eval_avg",
+    "input_chars",
+    "input_sha256",
+    "output_chars",
+    "output_sha256",
+)
+
+# Columns that are part of the primary key (not updated on conflict).
+_TRACES_WARM_PK = {"trace_id"}
+
 
 class WarmStore:
     """Async client for the warm-tier Postgres database.
@@ -156,6 +179,76 @@ class WarmStore:
             row = await conn.fetchrow("SELECT count(*) AS n FROM eval_results_warm")
         return int(row["n"]) if row else 0
 
+    async def insert_traces(self, rows: list[dict[str, Any]]) -> int:
+        """Upsert aggregated trace rows into ``traces_warm``.
+
+        Idempotent by design: ``trace_id`` is the primary key and a conflict
+        triggers an ``ON CONFLICT DO UPDATE``, so replaying the same day never
+        duplicates rows.
+
+        Each row must contain the keys matching ``TRACES_WARM_COLUMNS``.  The
+        caller (``migrate_spans_to_warm``) performs the aggregation from raw
+        spans and the compression (stripping ``llm.input_text`` /
+        ``llm.output_text``).
+
+        Returns
+        -------
+        int
+            Number of rows written.
+        """
+        if not rows:
+            return 0
+
+        pool = await self.connect()
+        values: list[tuple] = []
+        for row in rows:
+            eval_avg = row.get("eval_avg")
+            if not isinstance(eval_avg, str):
+                eval_avg = json.dumps(eval_avg or {})
+            values.append(
+                (
+                    row.get("trace_id", ""),
+                    row.get("tenant_id", ""),
+                    row.get("agent_id", ""),
+                    row.get("start_time"),
+                    row.get("end_time"),
+                    row.get("status", ""),
+                    row.get("cost_usd_total", 0.0),
+                    row.get("span_count", 0),
+                    row.get("error_count", 0),
+                    eval_avg,
+                    row.get("input_chars", 0),
+                    row.get("input_sha256", ""),
+                    row.get("output_chars", 0),
+                    row.get("output_sha256", ""),
+                )
+            )
+
+        columns = ", ".join(TRACES_WARM_COLUMNS)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(TRACES_WARM_COLUMNS)))
+        updates = ", ".join(
+            f"{col} = EXCLUDED.{col}"
+            for col in TRACES_WARM_COLUMNS
+            if col not in _TRACES_WARM_PK
+        )
+        query = (
+            f"INSERT INTO traces_warm ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT (trace_id) DO UPDATE SET {updates}"
+        )
+
+        async with pool.acquire() as conn:
+            await conn.executemany(query, values)
+
+        logger.info("warm traces written: rows=%d", len(values))
+        return len(values)
+
+    async def count_traces(self) -> int:
+        """Return the row count of ``traces_warm`` (used by tests/DoD)."""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT count(*) AS n FROM traces_warm")
+        return int(row["n"]) if row else 0
+
     async def close(self) -> None:
         """Close the connection pool."""
         if self._pool is not None:
@@ -185,4 +278,4 @@ def _redact_dsn(dsn: str) -> str:
     return f"{scheme}//{credentials}@{host}"
 
 
-__all__ = ["EVAL_RESULTS_WARM_COLUMNS", "WarmStore"]
+__all__ = ["EVAL_RESULTS_WARM_COLUMNS", "TRACES_WARM_COLUMNS", "WarmStore"]

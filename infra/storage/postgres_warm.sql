@@ -9,6 +9,10 @@
 -- tier with no schema at all.
 
 -- traces_warm table: aggregated trace data for warm tier (90 days retention)
+-- Columns input_chars/input_sha256/output_chars/output_sha256 are populated by
+-- the PC22 hot→warm migration.  Full-text fields (llm.input_text /
+-- llm.output_text) are intentionally absent — only char-count and sha256
+-- hashes survive the hot→warm compression.
 CREATE TABLE IF NOT EXISTS traces_warm (
     trace_id VARCHAR(255) PRIMARY KEY,
     tenant_id VARCHAR(255) NOT NULL,
@@ -20,6 +24,10 @@ CREATE TABLE IF NOT EXISTS traces_warm (
     span_count INTEGER DEFAULT 0,
     error_count INTEGER DEFAULT 0,
     eval_avg JSONB, -- Contains evaluation scores: {"faithfulness": 0.92, "answer_relevancy": 0.88, "completeness": 0.85}
+    input_chars INTEGER DEFAULT 0,
+    input_sha256 VARCHAR(64) DEFAULT '',
+    output_chars INTEGER DEFAULT 0,
+    output_sha256 VARCHAR(64) DEFAULT '',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );

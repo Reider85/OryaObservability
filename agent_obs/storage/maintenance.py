@@ -46,9 +46,11 @@ logger = logging.getLogger(__name__)
 JOB_CLEANUP_VAULT = "cleanup_vault"
 JOB_CLEANUP_AUDIT_EVENTS = "cleanup_audit_events"
 JOB_CLEANUP_EVAL_RESULTS = "cleanup_eval_results"
+JOB_MIGRATE_SPANS = "migrate_spans_to_warm"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 365
 DEFAULT_EVAL_RETENTION_DAYS = 14
+DEFAULT_SPAN_RETENTION_DAYS = 14
 DEFAULT_BATCH_SIZE = 10_000
 DEFAULT_MAX_EVENTS = 1000
 VAULT_PREFIX = "pii/"
@@ -98,6 +100,21 @@ class EvalWarmResult:
     @property
     def affected(self) -> int:
         return self.migrated
+
+
+@dataclass
+class TraceWarmResult:
+    """Outcome of one ``migrate_spans_to_warm`` run (PC22)."""
+
+    scanned_spans: int = 0
+    traces_migrated: int = 0
+    traces_deleted: int = 0
+    errors: int = 0
+
+    @property
+    def affected(self) -> int:
+        """Rows the job changed — drives ``cron_rows_deleted_total``."""
+        return self.traces_migrated
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +564,118 @@ async def migrate_eval_results_to_warm(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Job 4: spans_hot 14d -> Postgres traces_warm (PC22, T2.6.4)
+# ---------------------------------------------------------------------------
+
+def _aggregate_spans_by_trace(spans: list[dict]) -> dict[str, dict]:
+    """Group raw spans into trace-level aggregates for ``traces_warm``.
+
+    Each trace produces exactly one row with:
+    - ``cost_usd_total`` = sum of ``cost_usd`` across spans
+    - ``span_count`` = number of spans
+    - ``error_count`` = spans whose ``status`` is not ``"ok"``
+    - ``input_chars`` / ``input_sha256`` / ``output_chars`` / ``output_sha256``
+      extracted from span attributes (SDK pre-computes these)
+    - ``eval_avg`` left empty (eval scores are migrated separately)
+    - ``start_time`` / ``end_time`` = earliest / latest span in the trace
+    """
+    traces: dict[str, dict] = {}
+    for span in spans:
+        tid = span["trace_id"]
+        if tid not in traces:
+            attrs = span.get("attributes") or {}
+            traces[tid] = {
+                "trace_id": tid,
+                "tenant_id": span.get("tenant_id", ""),
+                "agent_id": span.get("agent_id", ""),
+                "start_time": span["start_time"],
+                "end_time": span["end_time"],
+                "status": span.get("status", ""),
+                "cost_usd_total": 0.0,
+                "span_count": 0,
+                "error_count": 0,
+                "eval_avg": {},
+                "input_chars": attrs.get("llm.input_chars", 0),
+                "input_sha256": attrs.get("llm.input_sha256", ""),
+                "output_chars": attrs.get("llm.output_chars", 0),
+                "output_sha256": attrs.get("llm.output_sha256", ""),
+            }
+        t = traces[tid]
+        t["cost_usd_total"] += span.get("cost_usd", 0.0)
+        t["span_count"] += 1
+        if span.get("status") != "ok":
+            t["error_count"] += 1
+        if span["start_time"] < t["start_time"]:
+            t["start_time"] = span["start_time"]
+        if span["end_time"] > t["end_time"]:
+            t["end_time"] = span["end_time"]
+        # Merge compressed metadata from the root span (agent.loop) if present
+        attrs = span.get("attributes") or {}
+        for key in ("llm.input_chars", "llm.input_sha256", "llm.output_chars", "llm.output_sha256"):
+            val = attrs.get(key)
+            if val:
+                t[key] = val
+    return traces
+
+
+async def migrate_spans_to_warm(
+    hot_store: Any,
+    warm_store: Any,
+    retention_days: int = DEFAULT_SPAN_RETENTION_DAYS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_batches: int = 100,
+    dry_run: bool = False,
+) -> TraceWarmResult:
+    """Move spans past ``retention_days`` to warm tier, then purge hot.
+
+    PC22: each batch of raw spans is aggregated by ``trace_id`` into a single
+    ``traces_warm`` row with content compression (``llm.input_text`` /
+    ``llm.output_text`` dropped; only char-counts and sha256 hashes survive).
+
+    Ordering rule: **ship first, delete second.** If the warm upsert fails, the
+    hot rows are left untouched and retried on the next cycle.
+    """
+    result = TraceWarmResult()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+    for _ in range(max_batches):
+        spans = hot_store.get_spans_older_than(cutoff, limit=batch_size)
+        if not spans:
+            break
+        result.scanned_spans += len(spans)
+
+        traces = _aggregate_spans_by_trace(spans)
+
+        if dry_run:
+            result.traces_migrated += len(traces)
+            logger.info(
+                "migrate_spans_to_warm: dry-run, would migrate %d traces from %d spans",
+                len(traces), len(spans),
+            )
+            break
+
+        try:
+            await warm_store.insert_traces(list(traces.values()))
+        except Exception as e:
+            logger.error("migrate_spans_to_warm: warm upsert failed, keeping hot rows: %s", str(e))
+            result.errors += 1
+            break
+
+        trace_ids = list(traces.keys())
+        result.traces_deleted += hot_store.delete_spans(trace_ids)
+        result.traces_migrated += len(traces)
+
+        if len(spans) < batch_size:
+            break
+
+    logger.info(
+        "migrate_spans_to_warm: scanned_spans=%d traces_migrated=%d traces_deleted=%d errors=%d",
+        result.scanned_spans, result.traces_migrated, result.traces_deleted, result.errors,
+    )
+    return result
+
+
 def build_hot_store() -> Any:
     """Construct a ``HotStore`` from the standard ClickHouse env variables."""
     from agent_obs.storage.hot import HotStore
@@ -574,12 +703,15 @@ __all__ = [
     "DEFAULT_BATCH_SIZE",
     "DEFAULT_EVAL_RETENTION_DAYS",
     "DEFAULT_MAX_EVENTS",
+    "DEFAULT_SPAN_RETENTION_DAYS",
     "JOB_CLEANUP_AUDIT_EVENTS",
     "JOB_CLEANUP_EVAL_RESULTS",
     "JOB_CLEANUP_VAULT",
+    "JOB_MIGRATE_SPANS",
     "VAULT_PREFIX",
     "AuditArchiveResult",
     "EvalWarmResult",
+    "TraceWarmResult",
     "VaultCleanupResult",
     "archive_expired_audit_events",
     "build_cold_store",
@@ -588,6 +720,7 @@ __all__ = [
     "cleanup_vault_expired",
     "list_kv_keys_recursive",
     "migrate_eval_results_to_warm",
+    "migrate_spans_to_warm",
     "run_cron_job",
     "run_cron_job_async",
 ]

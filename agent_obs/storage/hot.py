@@ -474,6 +474,69 @@ class HotStore:
             "user_agent": row[9],
         }
 
+    # --- Tiered retention: spans_hot -> Postgres warm (PC22) ----------------
+
+    def get_spans_older_than(self, cutoff: datetime, limit: int = 10_000) -> list[dict]:
+        """Read spans older than ``cutoff`` for warm migration (PC22).
+
+        Returns dicts with the full span shape so the caller can aggregate
+        by ``trace_id``.  Ordered oldest-first so a partially-completed run
+        keeps making progress on the same prefix of the data.
+
+        Parameters must be a dict: clickhouse-driver treats a list as INSERT
+        row data for any statement.
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT trace_id, span_id, parent_span_id, agent_id, tenant_id,
+                   name, span_type, start_time, end_time, status,
+                   attributes, events, cost_usd, response_embedding
+            FROM spans_hot
+            WHERE start_time < %(cutoff)s
+            ORDER BY start_time ASC
+            LIMIT %(limit)s
+            """,
+            {"cutoff": cutoff, "limit": limit},
+        )
+        spans: list[dict] = []
+        for row in rows:
+            spans.append(
+                {
+                    "trace_id": row[0],
+                    "span_id": row[1],
+                    "parent_span_id": row[2],
+                    "agent_id": row[3],
+                    "tenant_id": row[4],
+                    "name": row[5],
+                    "span_type": row[6],
+                    "start_time": row[7],
+                    "end_time": row[8],
+                    "status": row[9],
+                    "attributes": json.loads(row[10]) if isinstance(row[10], str) else row[10],
+                    "events": json.loads(row[11]) if isinstance(row[11], str) else row[11],
+                    "cost_usd": row[12],
+                    "response_embedding": row[13],
+                }
+            )
+        return spans
+
+    def delete_spans(self, trace_ids: list[str]) -> int:
+        """Delete migrated spans from the hot tier (PC22).
+
+        Only called after the warm-tier upsert succeeded.  ``spans_hot`` is a
+        ``MergeTree`` so a plain ``DELETE … WHERE trace_id IN (…)`` suffices.
+        """
+        if not trace_ids:
+            return 0
+        client = self._get_client()
+        client.execute(
+            "DELETE FROM spans_hot WHERE trace_id IN %(trace_ids)s",
+            {"trace_ids": trace_ids},
+        )
+        logger.info("spans_hot purged: traces=%d", len(trace_ids))
+        return len(trace_ids)
+
     def close(self) -> None:
         """Close the ClickHouse connection."""
         if self._client is not None:
