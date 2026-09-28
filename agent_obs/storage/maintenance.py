@@ -50,6 +50,7 @@ JOB_CLEANUP_AUDIT_EVENTS = "cleanup_audit_events"
 JOB_CLEANUP_EVAL_RESULTS = "cleanup_eval_results"
 JOB_MIGRATE_SPANS = "migrate_spans_to_warm"
 JOB_MIGRATE_TRACES = "migrate_traces_to_cold"
+JOB_DRIFT_DETECTION = "drift_detection"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 365
 DEFAULT_EVAL_RETENTION_DAYS = 14

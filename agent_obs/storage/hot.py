@@ -537,6 +537,23 @@ class HotStore:
         logger.info("spans_hot purged: traces=%d", len(trace_ids))
         return len(trace_ids)
 
+    def _execute_clickhouse(self, query: str, params: dict | None = None) -> list[tuple]:
+        """Execute a ClickHouse query and return results.
+        
+        Args:
+            query: ClickHouse SQL query
+            params: Query parameters for safe interpolation
+            
+        Returns:
+            List of result rows as tuples
+        """
+        client = self._get_client()
+        if params:
+            results = client.execute(query, params)
+        else:
+            results = client.execute(query)
+        return results
+
     def close(self) -> None:
         """Close the ClickHouse connection."""
         if self._client is not None:

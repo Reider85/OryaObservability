@@ -39,6 +39,7 @@ from agent_obs.storage.maintenance import (
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
+    JOB_DRIFT_DETECTION,
     JOB_MIGRATE_SPANS,
     JOB_MIGRATE_TRACES,
     archive_expired_audit_events,
@@ -301,6 +302,39 @@ def _cold_migration_job() -> Awaitable[Any]:
     return _runner()
 
 
+def _drift_job() -> Awaitable[Any]:
+    """Run drift detection analysis on LLM response embeddings."""
+    from agent_obs.drift import DriftDetector
+    from agent_obs.storage.hot import HotStore
+    
+    async def _runner() -> Any:
+        detector = DriftDetector(
+            sdk=None,  # Will be set by the caller
+            hotstore=HotStore(
+                clickhouse_url=os.environ.get("CLICKHOUSE_URL", "http://localhost:8123"),
+                database="observability"
+            ),
+            baseline_hours=_env_int("AGENT_OBS_CRON_DRIFT_BASELINE_HOURS", 168),  # 7 days
+            last_window_hours=_env_int("AGENT_OBS_CRON_DRIFT_WINDOW_HOURS", 1),    # 1 hour
+            kl_threshold=_env_float("AGENT_OBS_CRON_DRIFT_KL_THRESHOLD", 0.1),      # Tunable threshold
+        )
+        
+        # Get list of agents to monitor (could be from config or database)
+        agents = _env_list("AGENT_OBS_CRON_DRIFT_AGENTS", ["default"])
+        
+        results = []
+        for agent_id in agents:
+            try:
+                result = await detector.run_once(agent_id)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Drift detection failed for agent {agent_id}: {e}")
+        
+        return results
+    
+    return _runner()
+
+
 def build_jobs() -> list[CronJob]:
     """Return the configured job table.
 
@@ -326,6 +360,12 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_EVAL_SPEC", DAILY_EVAL_SPEC),
             _eval_job,
             86400,
+        ),
+        CronJob(
+            JOB_DRIFT_DETECTION,
+            os.environ.get("AGENT_OBS_CRON_DRIFT_SPEC", "*/15 * * * *"),  # Every 15 minutes
+            _drift_job,
+            900,  # 15 minutes
         ),
         CronJob(
             JOB_MIGRATE_SPANS,

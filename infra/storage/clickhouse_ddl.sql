@@ -117,3 +117,33 @@ FROM eval_results_hot;
 
 -- Grant permissions to observability user (will be created in init script)
 -- This will be executed by the init script after creating the user
+
+-- PC25: Drift history table for KL-divergence analysis
+CREATE TABLE IF NOT EXISTS drift_history (
+    id UUID DEFAULT generateUUIDv4(),
+    trace_id String,
+    eval_id String,
+    eval_name String DEFAULT 'drift_detection',
+    eval_version String DEFAULT '1.0.0',
+    eval_timestamp DateTime64(3),
+    eval_latency_seconds Float64,
+    kl_score Float64,
+    threshold Float64,
+    is_drift_detected UInt8,
+    severity String,
+    baseline_window_start DateTime64(3),
+    baseline_window_end DateTime64(3),
+    last_window_start DateTime64(3),
+    last_window_end DateTime64(3),
+    sample_size_baseline UInt32,
+    sample_size_last UInt32,
+    agent_id String,
+    model_name String,
+    flags Array(String),
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (agent_id, created_at)
+PARTITION BY toYYYYMMDD(created_at)
+TTL created_at + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
