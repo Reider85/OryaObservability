@@ -9,3 +9,22 @@ venv/
 .coverage
 htmlcov/
 .env
+
+# --- Ad-hoc scratch scripts in the repo root ---
+# One-off investigation helpers (PII detector triage, KL divergence checks,
+# INN/phone fixture generation) that several past sessions committed to the
+# root. Real code lives in agent_obs/, tests/, scripts/, pilot_agent/.
+#
+# Patterns are root-anchored ("/") on purpose so they cannot affect anything
+# under tests/ or the packages. test_*.py here is scratch, not tests: pytest
+# is restricted to testpaths = ["tests"], and these files assert nothing
+# (print-only), so they were never and could never provide coverage.
+/debug_*.py
+/check_*.py
+/analyze_*.py
+/create_*.py
+/generate_*.py
+/recalculate_*.py
+/simple_*.py
+/step_by_step_*.py
+/test_*.py
