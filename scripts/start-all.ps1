@@ -113,7 +113,9 @@ if ($LASTEXITCODE -ne 0) {
 if (-not $NoWait) {
     Write-Header 'Waiting for services to become healthy'
 
-    $services = @('postgres', 'redis', 'clickhouse', 'minio', 'langfuse')
+    $services = @('postgres', 'redis', 'clickhouse', 'minio', 'langfuse',
+                   'vault', 'eval-redis', 'postgres-warm', 'eval-worker',
+                   'cron', 'alertmanager', 'prometheus')
     $allHealthy = $true
 
     foreach ($svc in $services) {
@@ -141,6 +143,11 @@ Write-Host "    Langfuse UI        : http://localhost:3000"  -ForegroundColor Wh
 Write-Host "    OTel gRPC          : localhost:4317"          -ForegroundColor White
 Write-Host "    OTel HTTP          : localhost:4318"          -ForegroundColor White
 Write-Host "    Prometheus         : http://localhost:9091"  -ForegroundColor White
+Write-Host "    Vault UI           : http://localhost:8200"  -ForegroundColor White
+Write-Host "    ClickHouse HTTP    : http://localhost:8123"  -ForegroundColor White
+Write-Host "    MinIO Console      : http://localhost:9001"  -ForegroundColor White
+Write-Host "    Cron Metrics       : http://localhost:9777"  -ForegroundColor White
+Write-Host "    Alertmanager       : http://localhost:9093"  -ForegroundColor White
 Write-Host ""
 
 Write-Host "  Logs:    docker compose -f $ComposeFile logs -f"   -ForegroundColor DarkGray
