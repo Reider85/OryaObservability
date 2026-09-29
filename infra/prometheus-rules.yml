@@ -83,3 +83,25 @@ groups:
             Last successful run was {{ $value | humanizeDuration }} ago
             (threshold 14d). Traces are past their 90-day warm window and not
             being moved to cold storage, which will eventually fill the warm tier.
+
+  # PC25/PC26/PC27: Drift detection via KL-divergence on response embeddings.
+  # The gauge agent_obs_drift_kl_score is emitted by the out-of-process cron
+  # drift detection script (scripts/cron/drift_detection.py) every 15 minutes.
+  # The threshold gauge agent_obs_drift_threshold_value is updated by the
+  # monthly calibration job (scripts/cron/calibrate_drift_threshold.py).
+  # Alertmanager deduplicates via group_interval on the drift route (see
+  # infra/alertmanager.yml).
+  - name: drift-detection
+    rules:
+      - alert: DriftDetected
+        expr: agent_obs_drift_kl_score > on(agent_id) agent_obs_drift_threshold_value
+        for: 5m
+        labels:
+          severity: warning
+          component: drift-detector
+        annotations:
+          summary: "Drift detected for agent {{ $labels.agent_id }}"
+          description: >-
+            KL-divergence {{ $value }} exceeds calibrated threshold for
+            agent {{ $labels.agent_id }}. Investigate via Phoenix UMAP:
+            http://phoenix:6006/datasets/latest/embeddings?agent={{ $labels.agent_id }}

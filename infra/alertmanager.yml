@@ -15,6 +15,18 @@ route:
   group_interval: 5m
   repeat_interval: 4h
   routes:
+    # PC27: drift-detection alerts are grouped per agent and suppressed for 30
+    # minutes so that a sustained drift does not flood the on-call channel.
+    # The 5m `for:` in the Prometheus rule already debounces the first fire;
+    # group_interval here provides the 30-min dedup window.
+    - matchers:
+        - component="drift-detector"
+      receiver: default
+      group_by: [alertname, agent_id]
+      group_wait: 30s
+      group_interval: 30m
+      repeat_interval: 2h
+
     # A missed cron cycle is a warning; a job that has been failing repeatedly
     # is escalated so it does not get lost in the noise of a single blip.
     - matchers:
