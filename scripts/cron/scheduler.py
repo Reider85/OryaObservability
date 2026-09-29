@@ -36,6 +36,7 @@ from agent_obs.storage.maintenance import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_EVAL_RETENTION_DAYS,
     DEFAULT_SPAN_RETENTION_DAYS,
+    JOB_CALIBRATE_DRIFT_THRESHOLD,
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
@@ -62,6 +63,10 @@ logging.basicConfig(
 logger = logging.getLogger("agent_obs.cron.scheduler")
 
 DEFAULT_PORT = 9777
+# Repository root, so the sibling cron modules stay importable when this file
+# is executed directly (``python scripts/cron/scheduler.py`` puts
+# scripts/cron on sys.path, not the repo root).
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Day-of-week uses 0-7 so both Sunday spellings parse; 7 is normalised to 0.
 FIELD_RANGES = (range(0, 60), range(0, 24), range(1, 32), range(1, 13), range(0, 8))
 FULL_DOW = set(range(7))
@@ -72,6 +77,9 @@ DAILY_AUDIT_SPEC = "17 3 * * *"
 DAILY_EVAL_SPEC = "47 3 * * *"
 DAILY_MIGRATION_SPEC = "0 4 * * *"
 WEEKLY_COLD_SPEC = "17 4 * * 0"  # Sunday 04:17 UTC, staggered off daily migration
+# PC26: threshold calibration runs once a month, just after the weekly cold
+# migration and well clear of the daily jobs' window.
+MONTHLY_CALIBRATION_SPEC = "23 5 1 * *"  # 1st of the month, 05:23 UTC
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +194,32 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ[name])
     except (KeyError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float from the environment, falling back to ``default`` if unusable."""
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    """Read a comma-separated list, falling back to ``default`` if unset/blank."""
+    raw = os.environ.get(name)
+    if not raw:
+        return list(default)
+    parts = [part.strip() for part in raw.split(",")]
+    items = [part for part in parts if part]
+    return items or list(default)
+
+
+def _env_str(name: str, default: str) -> str:
+    """Read a string from the environment, falling back to ``default`` if unset/blank."""
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return default
+    return raw.strip()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -303,25 +337,31 @@ def _cold_migration_job() -> Awaitable[Any]:
 
 
 def _drift_job() -> Awaitable[Any]:
-    """Run drift detection analysis on LLM response embeddings."""
+    """Run drift detection analysis on LLM response embeddings.
+
+    The KL threshold is *not* passed here: leaving it unset lets DriftDetector
+    read the per-agent value that scripts/cron/calibrate_drift_threshold.py
+    wrote to configs/drift_thresholds.yaml (PC26). An explicit env override is
+    still honoured for operators who need to pin a value.
+    """
     from agent_obs.drift import DriftDetector
     from agent_obs.storage.hot import HotStore
-    
+
     async def _runner() -> Any:
+        pinned = os.environ.get("AGENT_OBS_CRON_DRIFT_KL_THRESHOLD")
         detector = DriftDetector(
-            sdk=None,  # Will be set by the caller
-            hotstore=HotStore(
-                clickhouse_url=os.environ.get("CLICKHOUSE_URL", "http://localhost:8123"),
-                database="observability"
-            ),
+            sdk=None,  # Drift detection reads Hot directly; the SDK is not used
+            hotstore=build_hot_store(),
             baseline_hours=_env_int("AGENT_OBS_CRON_DRIFT_BASELINE_HOURS", 168),  # 7 days
             last_window_hours=_env_int("AGENT_OBS_CRON_DRIFT_WINDOW_HOURS", 1),    # 1 hour
-            kl_threshold=_env_float("AGENT_OBS_CRON_DRIFT_KL_THRESHOLD", 0.1),      # Tunable threshold
+            kl_threshold=_env_float("AGENT_OBS_CRON_DRIFT_KL_THRESHOLD", 0.0) if pinned else None,
+            thresholds_path=_env_str(
+                "AGENT_OBS_CRON_DRIFT_THRESHOLDS_PATH", DEFAULT_THRESHOLDS_PATH
+            ),
         )
-        
-        # Get list of agents to monitor (could be from config or database)
+
         agents = _env_list("AGENT_OBS_CRON_DRIFT_AGENTS", ["default"])
-        
+
         results = []
         for agent_id in agents:
             try:
@@ -329,9 +369,51 @@ def _drift_job() -> Awaitable[Any]:
                 results.append(result)
             except Exception as e:
                 logger.error(f"Drift detection failed for agent {agent_id}: {e}")
-        
+
         return results
-    
+
+    return _runner()
+
+
+def _drift_calibration_job() -> Awaitable[Any]:
+    """PC26: recalibrate the drift threshold as p99 of the 30d KL history.
+
+    Monthly, and deliberately not chained to _drift_job: calibration writes
+    configs/drift_thresholds.yaml, which the next 15-minute detection tick
+    picks up on its own. Running them in the same process would also mean a
+    calibration failure took drift detection down with it.
+    """
+    from agent_obs.drift.threshold import (
+        DEFAULT_HISTORY_WINDOW_DAYS,
+        DEFAULT_THRESHOLDS_PATH,
+    )
+
+    # scheduler.py runs with scripts/cron on sys.path, so the sibling
+    # calibration module is not importable as a package by default.
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    from scripts.cron.calibrate_drift_threshold import calibrate_all
+
+    async def _runner() -> Any:
+        hotstore = build_hot_store()
+        try:
+            agents = _env_list("AGENT_OBS_CRON_DRIFT_AGENTS", []) or None
+            return await calibrate_all(
+                hotstore,
+                agents,
+                thresholds_path=_env_str(
+                    "AGENT_OBS_CRON_DRIFT_THRESHOLDS_PATH", DEFAULT_THRESHOLDS_PATH
+                ),
+                window_days=_env_int(
+                    "AGENT_OBS_CRON_DRIFT_CALIBRATION_WINDOW_DAYS",
+                    DEFAULT_HISTORY_WINDOW_DAYS,
+                ),
+                percentile=_env_float("AGENT_OBS_CRON_DRIFT_PERCENTILE", 99.0),
+                dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+            )
+        finally:
+            hotstore.close()
+
     return _runner()
 
 
@@ -366,6 +448,12 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_DRIFT_SPEC", "*/15 * * * *"),  # Every 15 minutes
             _drift_job,
             900,  # 15 minutes
+        ),
+        CronJob(
+            JOB_CALIBRATE_DRIFT_THRESHOLD,
+            os.environ.get("AGENT_OBS_CRON_DRIFT_CALIBRATION_SPEC", MONTHLY_CALIBRATION_SPEC),
+            _drift_calibration_job,
+            2_592_000,  # 30 days
         ),
         CronJob(
             JOB_MIGRATE_SPANS,

@@ -1,0 +1,30 @@
+# PC26 (T2.5.3) — calibrated drift-detection thresholds.
+#
+# alert_threshold for an agent = p99 of its KL-divergence scores over the
+# trailing 30 days of drift_history. Recalibrated monthly by
+# scripts/cron/calibrate_drift_threshold.py.
+#
+# DO NOT hand-edit kl_threshold here: the calibration job rewrites this file
+# atomically, and DriftDetector re-reads it on every run, so a manual value
+# survives only until the next monthly tick.
+#
+# Agents with no entry here fall back to default_kl_threshold below.
+
+version: 1
+default_kl_threshold: 0.1
+history_window_days: 30
+calibration_percentile: 99
+
+thresholds:
+  default_agent:
+    kl_threshold: 0.1
+    calibrated_at: null
+    sample_size: 0
+  chat_agent:
+    kl_threshold: 0.1
+    calibrated_at: null
+    sample_size: 0
+  code_agent:
+    kl_threshold: 0.1
+    calibrated_at: null
+    sample_size: 0

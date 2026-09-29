@@ -36,6 +36,8 @@ from agent_obs.storage.maintenance import (
     JOB_CLEANUP_VAULT,
     JOB_MIGRATE_SPANS,
     JOB_MIGRATE_TRACES,
+    JOB_CALIBRATE_DRIFT_THRESHOLD,
+    JOB_DRIFT_DETECTION,
     AuditArchiveResult,
     EvalWarmResult,
     TraceWarmResult,
@@ -1185,15 +1187,35 @@ class TestNextRunAt:
 class TestSchedulerJobTable:
     """The scheduled job table used by the container entrypoint."""
 
-    def test_all_five_jobs_registered(self):
-        names = [job.name for job in scheduler.build_jobs()]
-        assert names == [
+    def test_all_expected_jobs_registered(self):
+        """Set-based so adding a job (PC25 drift, PC26 calibration) doesn't break this.
+
+        The exact count is asserted separately in test_job_count_is_explicit so a
+        newly registered job has to be a deliberate act.
+        """
+        names = {job.name for job in scheduler.build_jobs()}
+        assert names == {
             JOB_CLEANUP_VAULT,
             JOB_CLEANUP_AUDIT_EVENTS,
             JOB_CLEANUP_EVAL_RESULTS,
             JOB_MIGRATE_SPANS,
             JOB_MIGRATE_TRACES,
-        ]
+            JOB_DRIFT_DETECTION,
+            JOB_CALIBRATE_DRIFT_THRESHOLD,
+        }
+
+    def test_job_count_is_explicit(self):
+        assert len(scheduler.build_jobs()) == 7
+
+    def test_drift_calibration_is_monthly(self):
+        """PC26: calibration is monthly, never on the 15-minute detection cadence."""
+        job = next(
+            j for j in scheduler.build_jobs() if j.name == JOB_CALIBRATE_DRIFT_THRESHOLD
+        )
+        assert job.interval_seconds == 2_592_000  # 30 days
+        # 1st of the month: day-of-month field must be a single day, not "*".
+        assert job.spec.split()[2] == "1"
+        assert job.spec.split()[3] == "*"
 
     def test_cadences_drive_the_alert_thresholds(self):
         cadences = {job.name: job.interval_seconds for job in scheduler.build_jobs()}
