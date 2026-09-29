@@ -554,6 +554,56 @@ class HotStore:
             results = client.execute(query)
         return results
 
+    def write_drift_history(self, report: dict) -> None:
+        """Write drift detection result to drift_history table.
+        
+        Args:
+            report: DriftReport serialized as dict
+        """
+        client = self._get_client()
+        
+        # Convert timestamp to ClickHouse DateTime64(3) format
+        eval_timestamp = datetime.fromtimestamp(report["eval_timestamp"], tz=datetime.timezone.utc)
+        
+        client.execute(
+            """
+            INSERT INTO drift_history (
+                trace_id, eval_id, eval_name, eval_version, eval_timestamp,
+                eval_latency_seconds, kl_score, threshold, is_drift_detected,
+                severity, baseline_window_start, baseline_window_end,
+                last_window_start, last_window_end, sample_size_baseline,
+                sample_size_last, agent_id, model_name, flags
+            ) VALUES (
+                %(trace_id)s, %(eval_id)s, %(eval_name)s, %(eval_version)s, %(eval_timestamp)s,
+                %(eval_latency_seconds)s, %(kl_score)s, %(threshold)s, %(is_drift_detected)s,
+                %(severity)s, %(baseline_window_start)s, %(baseline_window_end)s,
+                %(last_window_start)s, %(last_window_end)s, %(sample_size_baseline)s,
+                %(sample_size_last)s, %(agent_id)s, %(model_name)s, %(flags)s
+            )
+            """,
+            {
+                "trace_id": report["trace_id"],
+                "eval_id": report["eval_id"],
+                "eval_name": report["eval_name"],
+                "eval_version": report["eval_version"],
+                "eval_timestamp": eval_timestamp,
+                "eval_latency_seconds": report["eval_latency_seconds"],
+                "kl_score": report["kl_score"],
+                "threshold": report["threshold"],
+                "is_drift_detected": 1 if report["is_drift_detected"] else 0,
+                "severity": report["severity"],
+                "baseline_window_start": datetime.fromtimestamp(report["baseline_window_start"], tz=datetime.timezone.utc),
+                "baseline_window_end": datetime.fromtimestamp(report["baseline_window_end"], tz=datetime.timezone.utc),
+                "last_window_start": datetime.fromtimestamp(report["last_window_start"], tz=datetime.timezone.utc),
+                "last_window_end": datetime.fromtimestamp(report["last_window_end"], tz=datetime.timezone.utc),
+                "sample_size_baseline": report["sample_size_baseline"],
+                "sample_size_last": report["sample_size_last"],
+                "agent_id": report["agent_id"],
+                "model_name": report["model_name"],
+                "flags": report["flags"],
+            }
+        )
+
     def close(self) -> None:
         """Close the ClickHouse connection."""
         if self._client is not None:
