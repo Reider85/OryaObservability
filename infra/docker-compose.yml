@@ -387,6 +387,26 @@ services:
     ports:
       - "9093:9093"
 
+  # PC28: Arize Phoenix self-hosted for UMAP embedding visualization.
+  # Used by drift detector (PC25-PC27) for root-cause analysis.
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    restart: unless-stopped
+    environment:
+      PHOENIX_PORT: "6006"
+      PHOENIX_HOST: "0.0.0.0"
+      PHOENIX_SQLITE_DATABASE_PATH: /data/phoenix.db
+    volumes:
+      - phoenix_data:/data
+    ports:
+      - "6006:6006"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6006/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
 volumes:
   postgres_data:
   postgres_warm_data:
@@ -396,3 +416,4 @@ volumes:
   clickhouse_logs:
   minio_data:
   vault_data:
+  phoenix_data:

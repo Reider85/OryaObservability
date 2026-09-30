@@ -41,6 +41,7 @@ from agent_obs.storage.maintenance import (
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
     JOB_DRIFT_DETECTION,
+    JOB_EXPORT_EMBEDDINGS,
     JOB_MIGRATE_SPANS,
     JOB_MIGRATE_TRACES,
     archive_expired_audit_events,
@@ -417,6 +418,24 @@ def _drift_calibration_job() -> Awaitable[Any]:
     return _runner()
 
 
+def _phoenix_export_job() -> Awaitable[Any]:
+    """PC28: export embeddings from ClickHouse to Phoenix UMAP visualizer.
+
+    Runs every 5 minutes, pulls embeddings from the last hour, and pushes
+    them to Phoenix for UMAP visualization and drift root-cause analysis.
+    """
+    # scheduler.py runs with scripts/cron on sys.path, so the sibling
+    # export module is not importable as a package by default.
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    from scripts.cron.export_embeddings_to_phoenix import run_phoenix_export
+
+    async def _runner() -> Any:
+        return await run_phoenix_export()
+
+    return _runner()
+
+
 def build_jobs() -> list[CronJob]:
     """Return the configured job table.
 
@@ -466,6 +485,12 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_COLD_SPEC", WEEKLY_COLD_SPEC),
             _cold_migration_job,
             604800,  # 7 days * 24 hours * 3600 seconds
+        ),
+        CronJob(
+            JOB_EXPORT_EMBEDDINGS,
+            os.environ.get("AGENT_OBS_CRON_PHOENIX_SPEC", "*/5 * * * *"),  # Every 5 minutes
+            _phoenix_export_job,
+            300,  # 5 minutes
         ),
     ]
 
