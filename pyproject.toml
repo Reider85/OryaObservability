@@ -56,3 +56,6 @@ include = ["agent_obs*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# scripts/ is a namespace package that is not installed via pip; tests import
+# scripts.sampler.*, so the repo root must be on sys.path.
+pythonpath = ["."]

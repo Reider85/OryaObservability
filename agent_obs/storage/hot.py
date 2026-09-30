@@ -326,6 +326,62 @@ class HotStore:
         
         return events
 
+    def get_sampler_rate_history(
+        self, from_ts: datetime, to_ts: datetime, limit: int = 1000
+    ) -> list[dict]:
+        """Read tail-sampler rate-change audit events within a time range (PC31).
+
+        Returns rows from ``audit_events_hot`` where
+        ``action = 'sampler.rate_change'``, ordered oldest-first so the Query
+        API can present a chronological history for incident investigation.
+
+        The sampler-specific numbers (prev/new rate, reasons, driving metrics)
+        ride inside the ``resource`` JSON blob — this method flattens them into
+        top-level keys so the API response matches
+        :meth:`SamplerRateChangeAuditEvent.to_dict`.
+
+        Parameters must be a dict for SELECT queries: clickhouse-driver treats
+        a list as INSERT row data, so a list reaches the server with an
+        unsubstituted ``%s`` (Code 62).
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT audit_id, timestamp, trace_id, actor, action, decision,
+                   resource, reason, ip_address, user_agent
+            FROM audit_events_hot
+            WHERE action = %(action)s
+              AND timestamp >= %(from_ts)s
+              AND timestamp <= %(to_ts)s
+            ORDER BY timestamp ASC
+            LIMIT %(limit)s
+            """,
+            {
+                "action": "sampler.rate_change",
+                "from_ts": from_ts,
+                "to_ts": to_ts,
+                "limit": limit,
+            },
+        )
+        events: list[dict] = []
+        for row in rows:
+            resource = json.loads(row[6]) if isinstance(row[6], str) else row[6]
+            if not isinstance(resource, dict):
+                resource = {}
+            event = self._audit_row_to_dict(row)
+            event.update(
+                {
+                    "prev_rate": resource.get("prev_rate"),
+                    "new_rate": resource.get("new_rate"),
+                    "prev_reason": resource.get("prev_reason"),
+                    "new_reason": resource.get("new_reason"),
+                    "system_cpu_ratio": resource.get("system_cpu_ratio"),
+                    "agent_error_rate_5m": resource.get("agent_error_rate_5m"),
+                }
+            )
+            events.append(event)
+        return events
+
     def write_audit_events(self, events: list) -> int:
         """Write a batch of audit events to audit_events_hot in one INSERT.
 

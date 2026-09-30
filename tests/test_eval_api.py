@@ -1,9 +1,13 @@
-"""Tests for eval API (PC13)."""
+"""Tests for eval API (PC13) and sampler rate-history query API (PC31)."""
+
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ConnectError
 
-from agent_obs.eval.api import app
+from agent_obs.eval.api import _parse_range_bound, app
 
 
 @pytest.fixture
@@ -119,3 +123,232 @@ class TestEvalAPI:
             
             response = client.get("/traces/invalid-trace-id/evals")
             assert response.status_code == 200  # Should work with empty results
+
+
+# ---------------------------------------------------------------------------
+# PC31: sampler rate-history query API
+# ---------------------------------------------------------------------------
+
+
+class TestParseRangeBound:
+    """Datetime parsing for the from/to query params."""
+
+    def test_bare_date_start_is_utc_midnight(self):
+        result = _parse_range_bound("2026-09-20", end_of_day=False)
+        assert result == datetime(2026, 9, 20, tzinfo=timezone.utc)
+
+    def test_bare_date_end_is_end_of_day(self):
+        result = _parse_range_bound("2026-09-21", end_of_day=True)
+        assert result.year == 2026
+        assert result.month == 9
+        assert result.day == 21
+        assert result.hour == 23
+        assert result.minute == 59
+        assert result.tzinfo == timezone.utc
+
+    def test_full_datetime_is_preserved(self):
+        result = _parse_range_bound("2026-09-20T14:30:00", end_of_day=False)
+        assert result == datetime(2026, 9, 20, 14, 30, 0, tzinfo=timezone.utc)
+
+    def test_datetime_with_offset_is_converted_to_utc(self):
+        result = _parse_range_bound("2026-09-20T14:30:00+03:00", end_of_day=False)
+        assert result == datetime(2026, 9, 20, 11, 30, 0, tzinfo=timezone.utc)
+
+    def test_invalid_string_raises(self):
+        with pytest.raises(ValueError, match="invalid datetime"):
+            _parse_range_bound("not-a-date", end_of_day=False)
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            _parse_range_bound("   ", end_of_day=False)
+
+
+class TestSamplerRateHistoryAPI:
+    """GET /audit/sampler-rate-history (PC31 DoD: query API returns history)."""
+
+    @staticmethod
+    def _history_events():
+        return [
+            {
+                "audit_id": "sra-1",
+                "timestamp": "2026-09-20T12:00:00+00:00",
+                "trace_id": "",
+                "actor": {"type": "system", "id": "policy-engine"},
+                "action": "sampler.rate_change",
+                "decision": "applied",
+                "resource": {"type": "sampler_policy", "id": "normal-trace"},
+                "reason": "policy changed from 0.10 to 0.05, reason=cpu_high (system_cpu_ratio=0.92 > 0.80)",
+                "ip_address": "unknown",
+                "user_agent": "policy-engine",
+                "prev_rate": 0.10,
+                "new_rate": 0.05,
+                "prev_reason": "default",
+                "new_reason": "cpu_high",
+                "system_cpu_ratio": 0.92,
+                "agent_error_rate_5m": 0.01,
+            },
+            {
+                "audit_id": "sra-2",
+                "timestamp": "2026-09-20T12:30:00+00:00",
+                "trace_id": "",
+                "actor": {"type": "system", "id": "policy-engine"},
+                "action": "sampler.rate_change",
+                "decision": "applied",
+                "resource": {"type": "sampler_policy", "id": "normal-trace"},
+                "reason": "policy changed from 0.05 to 0.30, reason=error_high (agent_error_rate_5m=0.070 > 0.050)",
+                "ip_address": "unknown",
+                "user_agent": "policy-engine",
+                "prev_rate": 0.05,
+                "new_rate": 0.30,
+                "prev_reason": "cpu_high",
+                "new_reason": "error_high",
+                "system_cpu_ratio": 0.10,
+                "agent_error_rate_5m": 0.07,
+            },
+            {
+                "audit_id": "sra-3",
+                "timestamp": "2026-09-20T13:00:00+00:00",
+                "trace_id": "",
+                "actor": {"type": "system", "id": "policy-engine"},
+                "action": "sampler.rate_change",
+                "decision": "applied",
+                "resource": {"type": "sampler_policy", "id": "normal-trace"},
+                "reason": "policy changed from 0.30 to 0.10, reason=default (system_cpu_ratio=0.20, agent_error_rate_5m=0.010)",
+                "ip_address": "unknown",
+                "user_agent": "policy-engine",
+                "prev_rate": 0.30,
+                "new_rate": 0.10,
+                "prev_reason": "error_high",
+                "new_reason": "default",
+                "system_cpu_ratio": 0.20,
+                "agent_error_rate_5m": 0.01,
+            },
+        ]
+
+    @staticmethod
+    def _mock_hot_store(events):
+        store = MagicMock()
+        store.get_sampler_rate_history.return_value = events
+        return store
+
+    def test_three_rate_changes_return_history(self, client: TestClient) -> None:
+        """PC31 DoD: 3 changes → 3 events with prev/new rate and reason."""
+        events = self._history_events()
+        store = self._mock_hot_store(events)
+
+        with patch("agent_obs.storage.hot.HotStore", return_value=store):
+            response = client.get(
+                "/audit/sampler-rate-history",
+                params={"from": "2026-09-20", "to": "2026-09-21"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 3
+        assert len(data["events"]) == 3
+        first = data["events"][0]
+        assert first["prev_rate"] == pytest.approx(0.10)
+        assert first["new_rate"] == pytest.approx(0.05)
+        assert first["new_reason"] == "cpu_high"
+        assert first["action"] == "sampler.rate_change"
+        second = data["events"][1]
+        assert second["new_rate"] == pytest.approx(0.30)
+        assert second["new_reason"] == "error_high"
+        third = data["events"][2]
+        assert third["new_rate"] == pytest.approx(0.10)
+        assert third["new_reason"] == "default"
+
+    def test_passes_parsed_range_to_hot_store(self, client: TestClient) -> None:
+        """Bare dates are parsed: from=midnight, to=end of day, UTC."""
+        store = self._mock_hot_store([])
+
+        with patch("agent_obs.storage.hot.HotStore", return_value=store):
+            response = client.get(
+                "/audit/sampler-rate-history",
+                params={"from": "2026-09-20", "to": "2026-09-21"},
+            )
+
+        assert response.status_code == 200
+        args = store.get_sampler_rate_history.call_args
+        from_ts, to_ts = args[0][0], args[0][1]
+        assert from_ts == datetime(2026, 9, 20, tzinfo=timezone.utc)
+        assert to_ts.hour == 23
+        assert to_ts.minute == 59
+        assert to_ts.day == 21
+        assert kwargs_or_limit(args) == 1000
+
+    def test_empty_history_returns_count_zero(self, client: TestClient) -> None:
+        store = self._mock_hot_store([])
+        with patch("agent_obs.storage.hot.HotStore", return_value=store):
+            response = client.get(
+                "/audit/sampler-rate-history",
+                params={"from": "2026-09-20", "to": "2026-09-21"},
+            )
+        assert response.status_code == 200
+        data = response.json()
+        assert data == {"events": [], "count": 0}
+
+    def test_clickhouse_error_returns_503(self, client: TestClient) -> None:
+        store = MagicMock()
+        store.get_sampler_rate_history.side_effect = ConnectError("Connection refused")
+        with patch("agent_obs.storage.hot.HotStore", return_value=store):
+            response = client.get(
+                "/audit/sampler-rate-history",
+                params={"from": "2026-09-20", "to": "2026-09-21"},
+            )
+        assert response.status_code == 503
+        assert "ClickHouse unavailable" in response.json()["detail"]
+
+    def test_generic_error_returns_500(self, client: TestClient) -> None:
+        store = MagicMock()
+        store.get_sampler_rate_history.side_effect = Exception("boom")
+        with patch("agent_obs.storage.hot.HotStore", return_value=store):
+            response = client.get(
+                "/audit/sampler-rate-history",
+                params={"from": "2026-09-20", "to": "2026-09-21"},
+            )
+        assert response.status_code == 500
+        assert "Failed to retrieve sampler rate history" in response.json()["detail"]
+
+    def test_invalid_from_returns_422(self, client: TestClient) -> None:
+        response = client.get(
+            "/audit/sampler-rate-history",
+            params={"from": "not-a-date", "to": "2026-09-21"},
+        )
+        assert response.status_code == 422
+
+    def test_invalid_to_returns_422(self, client: TestClient) -> None:
+        response = client.get(
+            "/audit/sampler-rate-history",
+            params={"from": "2026-09-20", "to": "2026-13-45"},
+        )
+        assert response.status_code == 422
+
+    def test_from_after_to_returns_422(self, client: TestClient) -> None:
+        response = client.get(
+            "/audit/sampler-rate-history",
+            params={"from": "2026-09-21", "to": "2026-09-20"},
+        )
+        assert response.status_code == 422
+        assert "must be <=" in response.json()["detail"]
+
+    def test_missing_params_return_422(self, client: TestClient) -> None:
+        response = client.get("/audit/sampler-rate-history")
+        assert response.status_code == 422
+
+    def test_limit_is_passed_through(self, client: TestClient) -> None:
+        store = self._mock_hot_store([])
+        with patch("agent_obs.storage.hot.HotStore", return_value=store):
+            response = client.get(
+                "/audit/sampler-rate-history",
+                params={"from": "2026-09-20", "to": "2026-09-21", "limit": 50},
+            )
+        assert response.status_code == 200
+        assert kwargs_or_limit(store.get_sampler_rate_history.call_args) == 50
+
+
+def kwargs_or_limit(call_args) -> int:
+    """Extract the limit kwarg (or positional) from a mock call."""
+    if call_args.kwargs and "limit" in call_args.kwargs:
+        return call_args.kwargs["limit"]
+    return call_args.args[2] if len(call_args.args) > 2 else 1000
