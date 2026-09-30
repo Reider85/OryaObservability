@@ -47,11 +47,18 @@ def test_fields_filled_from_factory():
         parent=parent,
         user_id="u-1",
         session_id="s-1",
+        tool_name="crm",
     )
     assert ctx.agent_id == "b"
     assert ctx.agent_version == "2.0"
     assert ctx.user_id == "u-1"
     assert ctx.session_id == "s-1"
+    assert ctx.tool_name == "crm"
+
+
+def test_tool_name_defaults_to_none():
+    ctx = SpanContext.new(agent_id="a")
+    assert ctx.tool_name is None
 
 
 def test_to_dict_serialization():
@@ -64,6 +71,7 @@ def test_to_dict_serialization():
     assert data["agent_version"] == "0.1.0"
     assert data["user_id"] == ""
     assert data["session_id"] == ""
+    assert data["tool_name"] is None
     assert set(data.keys()) == {
         "trace_id",
         "span_id",
@@ -72,6 +80,7 @@ def test_to_dict_serialization():
         "agent_version",
         "user_id",
         "session_id",
+        "tool_name",
     }
 
 

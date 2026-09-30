@@ -98,6 +98,7 @@ class SpanContext:
     agent_version: str = ""
     user_id: str = ""
     session_id: str = ""
+    tool_name: Optional[str] = None
 
     @classmethod
     def new(
@@ -107,6 +108,7 @@ class SpanContext:
         parent: Optional["SpanContext"] = None,
         user_id: str = "",
         session_id: str = "",
+        tool_name: Optional[str] = None,
     ) -> "SpanContext":
         """Create a new span context.
 
@@ -127,6 +129,7 @@ class SpanContext:
             agent_version=agent_version,
             user_id=user_id,
             session_id=session_id,
+            tool_name=tool_name,
         )
 
     def to_dict(self) -> dict:
@@ -139,6 +142,7 @@ class SpanContext:
             "agent_version": self.agent_version,
             "user_id": self.user_id,
             "session_id": self.session_id,
+            "tool_name": self.tool_name,
         }
 
 
@@ -1137,6 +1141,7 @@ class ObservabilitySDK:
             parent=parent_ctx if parent_ctx is not None else ctx,
             user_id=ctx.user_id,
             session_id=ctx.session_id,
+            tool_name=tool_name,
         )
         span = Span(
             name=f"tool.call:{tool_name}",

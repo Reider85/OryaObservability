@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS compliance_catalog (
 CREATE INDEX IF NOT EXISTS idx_compliance_catalog_agent ON compliance_catalog(agent_id);
 CREATE INDEX IF NOT EXISTS idx_compliance_catalog_pii_type ON compliance_catalog(pii_type);
 CREATE INDEX IF NOT EXISTS idx_compliance_catalog_last_seen ON compliance_catalog(last_seen);
+-- Unique key required by ON CONFLICT in update_compliance_catalog()
+CREATE UNIQUE INDEX IF NOT EXISTS uq_compliance_catalog_key
+    ON compliance_catalog(agent_id, tool, field, pii_type);
 
 -- Create view for easier compliance reporting
 CREATE OR REPLACE VIEW compliance_summary AS

@@ -22,6 +22,7 @@ from typing import Optional
 
 from prometheus_client import Counter, Histogram
 
+from agent_obs.compliance.catalog import ComplianceCatalog, parse_redacted_field
 from agent_obs.guardrail.field_masker import FieldMasker
 from agent_obs.guardrail.injection_classifier import InjectionClassifier, InjectionScore
 from agent_obs.guardrail.pii_detector import PIIDetector
@@ -157,6 +158,11 @@ class GuardrailEngine:
         Vault client for storing mask → original mappings.
     config:
         Engine configuration (thresholds, TTL).
+    catalog:
+        Optional compliance catalog (PC33). When set, every masked PII event
+        is recorded as (agent_id, tool, field, pii_type) via
+        ``ComplianceCatalog.record()`` — an in-memory increment that never
+        blocks the check path.
     """
 
     def __init__(
@@ -166,12 +172,14 @@ class GuardrailEngine:
         vault_client: VaultClient,
         config: GuardrailConfig | None = None,
         field_masker: FieldMasker | None = None,
+        catalog: ComplianceCatalog | None = None,
     ) -> None:
         self.pii_detector = pii_detector
         self.injection_classifier = injection_classifier
         self.vault_client = vault_client
         self.config = config or GuardrailConfig()
         self.field_masker = field_masker
+        self.catalog = catalog
         self._audit_log: list[AuditEvent] = []  # in-memory for tests; PC20 → ClickHouse
 
     # ------------------------------------------------------------------
@@ -232,6 +240,21 @@ class GuardrailEngine:
             if pii_matches:
                 masked_text, redacted_fields = self._apply_pii_masking(
                     text, pii_matches, field
+                )
+
+        # --- Step 1b: compliance catalog record (PC33) ---
+        # Side-product of masking: every redacted field becomes one catalog
+        # entry. record() is a sync dict increment — no I/O on this path.
+        if self.catalog is not None and redacted_fields:
+            agent_id = getattr(context, "agent_id", "") or ""
+            tool = getattr(context, "tool_name", None) or ""
+            for rf in redacted_fields:
+                rf_field, pii_type = parse_redacted_field(rf)
+                self.catalog.record(
+                    agent_id=agent_id,
+                    tool=tool,
+                    field=rf_field,
+                    pii_type=pii_type,
                 )
 
         # --- Step 2: Vault store (fail-closed: masking already applied) ---

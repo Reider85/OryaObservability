@@ -45,6 +45,7 @@ pytest tests/load/
 - **Guardrail is fail-closed for masking, fail-open for classification.** If PII masking fails, text is replaced with `[REDACTED:guardrail_unavailable]`. If injection classifier is unavailable, it returns `benign` (score 0.0).
 - **Content sampling is deterministic by `trace_id`.** All spans sharing a trace agree on whether to store full text or just sha256 + char count. Rate controlled by `AGENT_OBS_CONTENT_RATE` (default 10%).
 - **Guardrail verdicts are cached on spans** (`span.guardrail_verdicts`) so pre-call hooks and `_enqueue` don't re-detect the same text. The `guardrail_verdicts` dict is excluded from `to_dict()` serialization.
+- **Compliance catalog is a free side-product of masking (PC33).** `GuardrailEngine.check_input()` calls `ComplianceCatalog.record()` (sync dict increment, no I/O) for every `redacted_fields` entry. Persistence is a background `asyncio` task batching UPSERTs to Postgres `compliance_catalog` once per minute (`flush_interval`). On flush failure the buffer is kept and retried; `asyncpg` stays optional via `AGENT_OBS_COMPLIANCE_PG` (NullCatalogWriter fallback). `tool_name` for catalog rows comes from `SpanContext.tool_name`, set only in `tool_call`.
 
 ## Span types (only 3 in MVP)
 
@@ -69,6 +70,8 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_FAIL_ON_CONFIG` | `1` | 1 = fail fast on missing Langfuse config; 0 = degrade to stdout exporter. |
 | `TAIL_SAMPLER_COST_THRESHOLD` | `0.05` | USD threshold for keeping traces 100%. |
 | `TAIL_SAMPLER_NORMAL_RATE` | `10` | Percent of normal traces kept by tail sampler. |
+| `AGENT_OBS_COMPLIANCE_PG` | `auto` | Compliance catalog Postgres writer: `on`/`off`/`auto`. `auto` = Postgres only if asyncpg importable **and** `COMPLIANCE_PG_DSN` set, else in-memory no-op. |
+| `COMPLIANCE_PG_DSN` | — | DSN for compliance catalog Postgres writes. Default when `AGENT_OBS_COMPLIANCE_PG=on`: warm-tier DSN (`postgresql://warm:warm@localhost:5433/warm_store`). |
 
 ## Code style
 
@@ -89,3 +92,4 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 - `PilotAgent` in `pilot_agent/agent.py` calls `compute_cost(usage, model=config.model, book=self.price_book)` with keyword `book=`, while `llm_call()` uses positional `price_book=`. These are different call sites — be careful when changing the `compute_cost` signature.
 - Tests in `tests/test_guardrail_engine.py` use a `PIIMatch` from `pii_detector.py` (local re-definition), not from `pii_types.py`. The two classes are structurally identical but not the same type — don't mix imports in tests without checking.
 - The injection classifier loads the HuggingFace model lazily on first `classify()` call. First call is slow (cold-start). In tests, always mock `InjectionClassifier` — never let it download real weights.
+- `tests/test_cron_jobs.py` and `tests/test_cron_cold_migration.py` hang at test execution (even on a clean tree, even for a single mocked test) on some Windows machines — pre-existing environment issue, not caused by local changes. Don't wait on them; verify related code via other test files.
