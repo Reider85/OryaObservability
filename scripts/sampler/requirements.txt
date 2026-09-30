@@ -1,9 +1,19 @@
 # PC30 sampler proxy — base image dependencies.
 #
-# The proxy only needs httpx (downstream forwarding) and prometheus-client
-# (its own /metrics). Both already ship with the agent_obs package, so this
-# layer is thin. The OTLP/gRPC receiver is optional: grpcio and
-# opentelemetry-proto live in requirements-grpc.txt and are imported lazily, so
-# the base image does not have to carry ~50 MB of gRPC runtime.
+# httpx and prometheus-client are used directly. The rest are pulled in
+# transitively by the `agent_obs` package __init__: importing anything under
+# agent_obs.guardrail or agent_obs.storage executes the parent __init__, which
+# walks into the cost and guardrail modules. The proxy never loads model
+# weights, so the heavy ML stack (torch, spacy, presidio, transformers) stays
+# out — same reasoning as infra/cron/Dockerfile.
+#
+#   pyyaml           <- agent_obs.cost.price_book
+#   clickhouse-driver <- agent_obs.storage.hot (audit_events_hot writes)
+#   pyotp            <- agent_obs.guardrail.vault_client
+#   hvac             <- agent_obs.guardrail.vault_client
 httpx>=0.27
 prometheus-client>=0.20
+pyyaml>=6.0
+clickhouse-driver>=0.2.7
+pyotp>=2.9
+hvac>=2.0.0

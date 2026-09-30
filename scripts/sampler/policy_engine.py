@@ -369,6 +369,37 @@ def build_policy_engine_from_env(**overrides) -> PolicyEngine:
         "error_threshold": float(
             os.environ.get("AGENT_OBS_SAMPLER_ERROR_THRESHOLD", ERROR_RATE_THRESHOLD)
         ),
+        "enable_audit": os.environ.get(
+            "AGENT_OBS_SAMPLER_AUDIT_ENABLED", "1"
+        ).lower()
+        not in ("0", "false", "no"),
     }
+    if params["enable_audit"]:
+        # Guarded at the call site on purpose: the proxy must start even when
+        # the audit sink cannot be built, so this cannot be allowed to raise.
+        try:
+            params["hot_store"] = _build_hot_store_from_env()
+        except Exception as exc:
+            logger.warning("Sampler audit sink unavailable, continuing: %s", exc)
+            params["hot_store"] = None
     params.update(overrides)
     return PolicyEngine(**params)
+
+
+def _build_hot_store_from_env():
+    """Return a HotStore for audit writes, or None if ClickHouse is unusable.
+
+    Returning None is deliberate: PolicyEngine.record_audit() skips writing
+    when hot_store is None, so a missing ClickHouse degrades the audit trail
+    instead of taking the sampler down. The proxy must keep sampling even if
+    the audit sink is down -- dropping traces is worse than losing an audit row.
+    """
+    try:
+        from agent_obs.storage.hot import HotStore
+
+        return HotStore()
+    except Exception as exc:
+        logger.warning(
+            "Sampler audit disabled, cannot build HotStore: %s", exc
+        )
+        return None

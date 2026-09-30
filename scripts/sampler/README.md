@@ -96,6 +96,17 @@ A missing trace can then be explained: *"the sampler was at 5% because
 An audit write failure never blocks the rate change — it is logged and counted
 in `agent_obs_tail_sampler_policy_evaluations_total{outcome="audit_failed"}`.
 
+The sink is optional in the same direction: if `HotStore` cannot be constructed
+(ClickHouse down, driver missing), the proxy logs a warning and starts with the
+audit trail disabled rather than refusing to sample. Set
+`AGENT_OBS_SAMPLER_AUDIT_ENABLED=0` to skip the audit sink deliberately.
+
+> **Live-verified caveat:** the audit row only lands if the `observability`
+> database exists. `infra/storage/clickhouse_init.sh` only runs on a *fresh*
+> ClickHouse data directory, so an existing volume never gets it and writes fail
+> with `Database ... does not exist`. Check with
+> `SELECT count() FROM system.databases WHERE name='observability'`.
+
 ## Metrics
 
 Exposed by the proxy on `:9095/metrics`:
@@ -138,8 +149,14 @@ python -m scripts.sampler.sampler_proxy \
 python -c "import asyncio; from scripts.sampler.policy_engine import PolicyEngine; \
            e=PolicyEngine(); print(asyncio.run(e.run_once()))"
 
-# Force a rate by hand
-curl -X POST localhost:4321/sampler/status   # GET to read
+# Force a rate by hand — there is no override endpoint. POST to
+# /sampler/status is the OTLP ingest path and will reject a rate body.
+# Drive the rate through the policy inputs instead (e.g. load the CPU) and
+# let the next poll cycle pick it up, or run the engine out of band:
+#   docker exec -it <container> python -c "
+#     import asyncio, sys; sys.path.insert(0,'/app')
+#     from scripts.sampler.policy_engine import build_policy_engine_from_env
+#     e = build_policy_engine_from_env(); print(asyncio.run(e.read_signals()))"
 ```
 
 Docker:

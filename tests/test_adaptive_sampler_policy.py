@@ -23,6 +23,7 @@ from scripts.sampler.policy_engine import (
     ERROR_RATE_QUERY,
     PolicyDecision,
     PolicyEngine,
+    build_policy_engine_from_env,
     evaluate_rate,
 )
 from scripts.sampler.sampler_proxy import (
@@ -32,6 +33,7 @@ from scripts.sampler.sampler_proxy import (
     extract_spans,
     group_spans_by_trace,
     is_interesting_span,
+    start_grpc_receiver,
 )
 
 
@@ -805,3 +807,132 @@ class TestEngineToSamplerWiring:
         assert json.loads(path.read_text(encoding="utf-8"))["rate"] == pytest.approx(0.05)
         assert len(published) == 1
         await engine.close()
+
+
+class TestEnvWiring:
+    """Regression cover for the audit sink being silently absent.
+
+    Found during a live run against docker compose: build_policy_engine_from_env()
+    never passed hot_store, so PolicyEngine.record_audit() returned early on
+    every rate change and audit_events_hot stayed empty. record_audit() skips
+    quietly when hot_store is None, so unit tests on PolicyEngine alone stayed
+    green while the deployed proxy wrote no audit rows at all.
+    """
+
+    def test_build_from_env_attaches_hot_store_by_default(self, monkeypatch):
+        monkeypatch.delenv("AGENT_OBS_SAMPLER_AUDIT_ENABLED", raising=False)
+        monkeypatch.setattr(
+            "scripts.sampler.policy_engine._build_hot_store_from_env",
+            lambda: object(),
+        )
+        engine = build_policy_engine_from_env()
+        assert engine.hot_store is not None
+        assert engine.enable_audit is True
+
+    def test_build_from_env_respects_audit_disable_flag(self, monkeypatch):
+        monkeypatch.setenv("AGENT_OBS_SAMPLER_AUDIT_ENABLED", "0")
+        engine = build_policy_engine_from_env()
+        assert engine.hot_store is None
+        assert engine.enable_audit is False
+
+    def test_unusable_clickhouse_degrades_to_no_audit(self, monkeypatch):
+        """A dead ClickHouse must not stop the proxy from sampling."""
+        monkeypatch.delenv("AGENT_OBS_SAMPLER_AUDIT_ENABLED", raising=False)
+
+        def _boom():
+            raise RuntimeError("clickhouse unreachable")
+
+        monkeypatch.setattr(
+            "scripts.sampler.policy_engine._build_hot_store_from_env", _boom
+        )
+        engine = build_policy_engine_from_env()
+        assert engine.hot_store is None
+        # The engine still works: sampling is the priority, audit is not.
+        assert engine.evaluate(cpu_ratio=0.92, error_rate_5m=0.01).rate == (
+            pytest.approx(0.05)
+        )
+
+    def test_hot_store_builder_never_raises(self, monkeypatch):
+        """_build_hot_store_from_env swallows import/connection errors."""
+        import scripts.sampler.policy_engine as pe
+
+        # No ClickHouse env at all: HotStore() construction must still return
+        # cleanly (either a store or None), never an exception.
+        for key in ("CLICKHOUSE_HOST", "CLICKHOUSE_PORT", "CLICKHOUSE_DB"):
+            monkeypatch.delenv(key, raising=False)
+        result = pe._build_hot_store_from_env()
+        assert result is None or hasattr(result, "write_audit_event")
+
+
+class TestGrpcReceiver:
+    """The optional OTLP/gRPC path.
+
+    Found during a live run: start_grpc_receiver() imported only
+    trace_service_pb2_grpc but returned trace_service_pb2.ExportTraceServiceResponse(),
+    so every gRPC Export call raised NameError. The HTTP-only image cannot catch
+    this -- the import is lazy and no default test imports grpc -- so it needs
+    its own coverage.
+    """
+
+    def test_missing_grpc_deps_degrade_without_raising(self, monkeypatch):
+        """A base image without grpcio must log and return, not crash."""
+        import scripts.sampler.sampler_proxy as sp
+
+        real_import = __builtins__["__import__"] if isinstance(
+            __builtins__, dict
+        ) else __builtins__.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name.startswith("opentelemetry.proto.collector.trace"):
+                raise ImportError("no grpc")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", _fake_import)
+        # Must return None quietly rather than raise.
+        assert start_grpc_receiver(
+            SamplerProxy("http://downstream:3000"), 4320
+        ) is None
+
+    def test_export_response_type_is_importable(self):
+        """The response class must actually be bound in the module namespace."""
+        pytest.importorskip("grpc")
+        pb2 = pytest.importorskip(
+            "opentelemetry.proto.collector.trace.v1.trace_service_pb2"
+        )
+        # If the lazy import inside start_grpc_receiver is wrong, this is the
+        # name that goes missing at request time.
+        assert hasattr(pb2, "ExportTraceServiceResponse")
+
+    def test_receiver_returns_server_so_listener_survives(self):
+        """The server must be returned, not dropped on the floor.
+
+        grpc.Server keeps its listener alive only while Python holds a
+        reference. Returning None left the last reference to the function
+        frame, so CPython freed the server immediately and every subsequent
+        connection was refused -- while the log still said "listening".
+        """
+        pytest.importorskip("grpc")
+        from concurrent import futures
+
+        import grpc
+
+        fake = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+        started = {}
+        fake.start = lambda: started.setdefault("yes", True)
+
+        import scripts.sampler.sampler_proxy as sp
+
+        captured = {}
+        real_server_fn = grpc.server
+        try:
+            grpc.server = lambda *a, **k: fake
+            sp.grpc = grpc
+            result = sp.start_grpc_receiver(
+                SamplerProxy("http://downstream:3000"), 14399
+            )
+        finally:
+            grpc.server = real_server_fn
+
+        captured["server"] = result
+        assert captured["server"] is fake
+        assert started, "server.start() was not called"

@@ -556,8 +556,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.mode,
     )
 
+    grpc_server = None
     if args.grpc:
-        start_grpc_receiver(proxy, args.grpc_port)
+        # Keep the reference for the process lifetime -- see start_grpc_receiver.
+        grpc_server = start_grpc_receiver(proxy, args.grpc_port)
+        if grpc_server is None:
+            logger.warning("gRPC receiver unavailable; continuing with HTTP only")
 
     stop_event = threading.Event()
 
@@ -587,14 +591,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
-def start_grpc_receiver(proxy: SamplerProxy, port: int) -> None:
+def start_grpc_receiver(proxy: SamplerProxy, port: int) -> Any:
     """Start the optional OTLP/gRPC receiver.
+
+    Returns the running grpc.Server, which the caller must hold for the process
+    lifetime (see the note before the return below), or None if the gRPC extra
+    is not installed or the port could not be bound.
 
     grpcio and opentelemetry-proto are imported lazily so the base image does
     not have to carry them for the HTTP path to work.
     """
     try:
-        from opentelemetry.proto.collector.trace.v1 import trace_service_pb2_grpc
+        from opentelemetry.proto.collector.trace.v1 import (
+            trace_service_pb2,
+            trace_service_pb2_grpc,
+        )
     except ImportError:
         logger.error(
             "grpcio/opentelemetry-proto not installed; skipping gRPC receiver. "
@@ -616,9 +627,19 @@ def start_grpc_receiver(proxy: SamplerProxy, port: int) -> None:
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     trace_service_pb2_grpc.add_TraceServiceServicer_to_server(TraceService(), server)
-    server.add_insecure_port(f"0.0.0.0:{port}")
+    bound = server.add_insecure_port(f"0.0.0.0:{port}")
+    if bound == 0:
+        logger.error("Could not bind OTLP/gRPC receiver on :%d", port)
+        return None
     server.start()
     logger.info("OTLP/gRPC receiver listening on :%d", port)
+    # The server MUST be returned. grpc.Server holds its listener in C++ and
+    # only stays alive while Python holds a reference; once this function
+    # returns, refcounting drops the last one, the object is freed and the
+    # listener shuts down. Verified live: add_insecure_port returned the port
+    # and the log said "listening", but every connection was refused until a
+    # reference was held. The caller keeps this alive for the process lifetime.
+    return server
 
 
 if __name__ == "__main__":

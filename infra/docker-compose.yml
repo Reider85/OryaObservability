@@ -252,6 +252,10 @@ services:
     build:
       context: ..
       dockerfile: scripts/sampler/Dockerfile
+      # HTTP-only image. The last stage in the Dockerfile carries grpcio for the
+      # optional OTLP/gRPC receiver, and Docker builds the last stage when no
+      # target is given — so name the base stage explicitly to keep it out.
+      target: sampler-base
     image: agent-obs-sampler:latest
     restart: unless-stopped
     depends_on:
