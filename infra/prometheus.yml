@@ -26,3 +26,9 @@ scrape_configs:
   - job_name: cron
     static_configs:
       - targets: ["cron:9777"]
+
+  # PC29: pilot agent exposes system_cpu_ratio and agent_error_rate_5m for
+  # the adaptive tail-sampler policy engine (PC30).
+  - job_name: pilot-agent
+    static_configs:
+      - targets: ["pilot-agent:9090"]

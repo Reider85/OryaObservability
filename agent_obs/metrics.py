@@ -208,3 +208,16 @@ drift_sanity_check_total = Counter(
     "Quarterly drift baseline sanity-check results",
     ["agent_id", "result"],
 )
+
+# --- PC29 Adaptive sampler metrics -------------------------------------------
+
+system_cpu_ratio = Gauge(
+    "agent_obs_system_cpu_ratio",
+    "System CPU utilization ratio (0.0-1.0), updated every 10s by the SDK",
+)
+
+agent_error_rate_5m = Gauge(
+    "agent_obs_agent_error_rate_5m",
+    "Fraction of error spans in the sliding 5-minute window",
+    ["agent_id"],
+)

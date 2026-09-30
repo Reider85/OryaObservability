@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import collections
 import contextvars
 import functools
 import logging
@@ -333,6 +334,12 @@ class ObservabilitySDK:
         ] = asyncio.Queue(maxsize=50_000)
         self._embedding_worker_task: asyncio.Task | None = None
         self._embedding_shutdown: asyncio.Event = asyncio.Event()
+        # PC29: CPU monitoring and sliding-window error rate tracking.
+        self._cpu_monitor_task: asyncio.Task | None = None
+        self._cpu_shutdown: asyncio.Event = asyncio.Event()
+        self._error_rate_windows: dict[
+            str, collections.deque[tuple[float, bool]]
+        ] = {}  # agent_id -> deque of (timestamp, is_error)
         if guardrail is not None and self._load_guardrail_enabled(config):
             self._guardrail = guardrail
             logger.info(
@@ -351,6 +358,9 @@ class ObservabilitySDK:
                 asyncio.get_running_loop()
                 self._embedding_worker_task = asyncio.create_task(
                     self._embedding_worker()
+                )
+                self._cpu_monitor_task = asyncio.create_task(
+                    self._cpu_monitor_task_fn()
                 )
             except RuntimeError:
                 # No running loop — SDK constructed outside async context.
@@ -458,6 +468,9 @@ class ObservabilitySDK:
             )
 
             spans_total.labels(agent_id=span.context.agent_id).inc()
+
+            is_error = span.attributes.get("status") == "error"
+            self._update_error_rate(span.context.agent_id, is_error)
 
             if span.span_type == SpanType.LLM_CALL and "cost.usd" in span.attributes:
                 agent_id = span.context.agent_id
@@ -720,6 +733,63 @@ class ObservabilitySDK:
             if self._embedding_shutdown.is_set() and self._embedding_queue.empty():
                 break
 
+    # --- PC29: CPU monitor and error rate tracking -------------------------
+
+    async def _cpu_monitor_task_fn(self) -> None:
+        """Background task that samples system CPU every 10 seconds.
+
+        Writes to the ``agent_obs_system_cpu_ratio`` Prometheus gauge so that
+        the OTel Collector (or Prometheus) can pick it up for adaptive
+        tail-sampling decisions (PC30).
+        """
+        from agent_obs.metrics import system_cpu_ratio
+
+        try:
+            import psutil
+        except ImportError:
+            logger.warning(
+                "psutil not installed; system_cpu_ratio metric will not be updated"
+            )
+            return
+
+        # Prime psutil (first call always returns 0.0)
+        psutil.cpu_percent(interval=None)
+
+        while True:
+            try:
+                await asyncio.wait_for(self._cpu_shutdown.wait(), timeout=10.0)
+                break  # shutdown requested
+            except asyncio.TimeoutError:
+                pass
+            try:
+                ratio = psutil.cpu_percent(interval=None) / 100.0
+                system_cpu_ratio.set(ratio)
+            except Exception:
+                logger.debug("Failed to read CPU percent", exc_info=True)
+
+    def _update_error_rate(self, agent_id: str, is_error: bool) -> None:
+        """Record a span event and recompute the 5-minute error rate gauge.
+
+        Called from ``_enqueue`` for every span.  Old entries (>5 min) are
+        evicted before recomputation so the gauge always reflects a sliding
+        window.  Each agent_id has its own independent window.
+        """
+        now = _now()
+        window = self._error_rate_windows.setdefault(agent_id, collections.deque())
+        window.append((now, is_error))
+
+        cutoff = now - 300.0  # 5 minutes
+        while window and window[0][0] < cutoff:
+            window.popleft()
+
+        total = len(window)
+        if total == 0:
+            return
+        errors = sum(1 for _, err in window if err)
+        from agent_obs.metrics import agent_error_rate_5m
+
+        agent_error_rate_5m.labels(agent_id=agent_id).set(errors / total)
+
     async def _flush_embedding_batch(
         self, batch: list[tuple[str, str, list[float]]]
     ) -> None:
@@ -820,6 +890,21 @@ class ObservabilitySDK:
             except asyncio.CancelledError:
                 pass
             self._embedding_worker_task = None
+
+        # PC29: stop the CPU monitor task.
+        self._cpu_shutdown.set()
+        if self._cpu_monitor_task is not None:
+            try:
+                await asyncio.wait_for(self._cpu_monitor_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._cpu_monitor_task.cancel()
+                try:
+                    await self._cpu_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            except asyncio.CancelledError:
+                pass
+            self._cpu_monitor_task = None
 
         if self._worker_task is None:
             return
