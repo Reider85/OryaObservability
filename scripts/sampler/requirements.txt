@@ -1,0 +1,9 @@
+# PC30 sampler proxy — base image dependencies.
+#
+# The proxy only needs httpx (downstream forwarding) and prometheus-client
+# (its own /metrics). Both already ship with the agent_obs package, so this
+# layer is thin. The OTLP/gRPC receiver is optional: grpcio and
+# opentelemetry-proto live in requirements-grpc.txt and are imported lazily, so
+# the base image does not have to carry ~50 MB of gRPC runtime.
+httpx>=0.27
+prometheus-client>=0.20

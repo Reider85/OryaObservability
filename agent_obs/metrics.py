@@ -221,3 +221,34 @@ agent_error_rate_5m = Gauge(
     "Fraction of error spans in the sliding 5-minute window",
     ["agent_id"],
 )
+
+# --- PC30 Adaptive sampling policy metrics ------------------------------------
+
+# The policy engine (scripts/sampler/policy_engine.py) sets this gauge on every
+# rate change. ``policy_reason`` is one of cpu_high | error_high | default, so
+# the label set stays bounded (PC0 rule: no unbounded metric cardinality).
+tail_sampler_current_rate = Gauge(
+    "agent_obs_tail_sampler_current_rate",
+    "Current sampling rate applied to normal (non-interesting) traces",
+    ["policy_reason"],
+)
+
+# Counts rate transitions. Labels are the *reasons* rather than the raw rates so
+# the series count is bounded at 3x3 instead of growing with every float value.
+tail_sampler_rate_changes_total = Counter(
+    "agent_obs_tail_sampler_rate_changes_total",
+    "Number of adaptive sampling rate changes, labelled by reason transition",
+    ["from_reason", "to_reason"],
+)
+
+tail_sampler_policy_evaluations_total = Counter(
+    "agent_obs_tail_sampler_policy_evaluations_total",
+    "Policy engine evaluations of system load and error rate",
+    ["outcome"],
+)
+
+tail_sampler_traces_sampled_total = Counter(
+    "agent_obs_tail_sampler_traces_sampled_total",
+    "Traces kept by the sampler proxy",
+    ["decision"],
+)

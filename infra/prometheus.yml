@@ -32,3 +32,10 @@ scrape_configs:
   - job_name: pilot-agent
     static_configs:
       - targets: ["pilot-agent:9090"]
+
+  # PC30: the sampler proxy publishes the rate currently applied to normal
+  # traces plus the reason it was chosen. The policy engine reads it back
+  # through Prometheus; this scrape is what makes that loop observable.
+  - job_name: sampler-proxy
+    static_configs:
+      - targets: ["sampler-proxy:9095"]

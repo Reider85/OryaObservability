@@ -243,6 +243,66 @@ services:
       - "4318:4318"
       - "8888:8888"
 
+  # PC30: adaptive tail-sampler proxy. The Collector interpolates
+  # ${env:TAIL_SAMPLER_NORMAL_RATE} once at start and has no admin API, so the
+  # normal-trace rate cannot be changed without a restart. The proxy holds the
+  # rate in memory and swaps it on a lock; the policy engine pushes a new value
+  # every 30s from the PC29 gauges. See scripts/sampler/README.md.
+  sampler-proxy:
+    build:
+      context: ..
+      dockerfile: scripts/sampler/Dockerfile
+    image: agent-obs-sampler:latest
+    restart: unless-stopped
+    depends_on:
+      langfuse:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /app
+      # Where kept traces are forwarded. Set to the collector instead of
+      # Langfuse to keep the Collector in the trace path.
+      DOWNSTREAM_URL: ${SAMPLER_DOWNSTREAM_URL:-http://langfuse:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      AGENT_OBS_TLS_CA: ${AGENT_OBS_TLS_CA:-}
+      # Read the PC29 gauges from here.
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-http://prometheus:9090}
+      AGENT_OBS_SAMPLER_MODE: ${AGENT_OBS_SAMPLER_MODE:-proxy}
+      AGENT_OBS_SAMPLER_POLL_INTERVAL: ${AGENT_OBS_SAMPLER_POLL_INTERVAL:-30}
+      AGENT_OBS_SAMPLER_CPU_THRESHOLD: ${AGENT_OBS_SAMPLER_CPU_THRESHOLD:-0.8}
+      AGENT_OBS_SAMPLER_ERROR_THRESHOLD: ${AGENT_OBS_SAMPLER_ERROR_THRESHOLD:-0.05}
+      SAMPLER_PROXY_PORT_GRPC: ${AGENT_OBS_SAMPLER_PROXY_PORT_GRPC:-4320}
+      SAMPLER_PROXY_PORT_HTTP: ${AGENT_OBS_SAMPLER_PROXY_PORT_HTTP:-4321}
+      # 9095, not 9091 — Prometheus already publishes 9091.
+      SAMPLER_PROXY_METRICS_PORT: ${AGENT_OBS_SAMPLER_PROXY_METRICS_PORT:-9095}
+      SAMPLER_RATE_FILE: ${SAMPLER_RATE_FILE:-/shared/sampler_rate.json}
+      AGENT_OBS_LOG_LEVEL: ${AGENT_OBS_LOG_LEVEL:-INFO}
+      # Audit writes for rate changes (PC30) go to the ClickHouse hot store.
+      # Credentials must match the clickhouse service provisioning.
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-observability}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - ../:/app:ro
+      - sampler_shared:/shared
+    ports:
+      - "4321:4321"  # OTLP/HTTP — point LANGFUSE_HOST here in proxy mode
+      - "9095:9095"  # metrics + /sampler/status
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9095/metrics', timeout=3).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   vault:
     image: hashicorp/vault:1.18
     restart: unless-stopped
@@ -417,3 +477,4 @@ volumes:
   minio_data:
   vault_data:
   phoenix_data:
+  sampler_shared:

@@ -27,6 +27,27 @@ REASON_CATEGORIES = frozenset(
     }
 )
 
+# PC30: bounded set of reasons a sampling rate can change to. Used as the
+# ``policy_reason`` label on agent_obs_tail_sampler_current_rate and as the
+# ``new_reason``/``prev_reason`` labels on the change counter, so metric
+# cardinality never grows with the float value of the rate itself.
+SAMPLER_POLICY_REASONS = ("cpu_high", "error_high", "default")
+
+# PC30 rule thresholds, quoted into the audit reason so a row is self-contained.
+# Kept here (not in the policy engine) because the audit layer must be able to
+# render a reason without importing the sampler package.
+CPU_HIGH_THRESHOLD = 0.8
+ERROR_RATE_THRESHOLD = 0.05
+
+# PC30: the rate each rule selects for "normal" traces. cpu_high wins over
+# error_high — a saturated host is the more immediate threat to the exporter,
+# and PC30 lists the cpu check first.
+SAMPLER_RATES = {
+    "cpu_high": 0.05,
+    "error_high": 0.30,
+    "default": 0.10,
+}
+
 
 def classify_reason_category(reason: str) -> str:
     """Classify recovery reason into bounded set for Prometheus label cardinality.
@@ -267,6 +288,142 @@ class LeaseExpiryAuditEvent:
             self.action,
             self.decision,
             json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
+class SamplerRateChangeAuditEvent:
+    """Audit event for a tail-sampler rate change (PC30).
+
+    The adaptive policy engine raises the sampling rate when the agent's error
+    rate climbs (errors are the signal we least want to lose) and drops it when
+    the host is CPU-saturated.  Every transition is recorded so a missing trace
+    can later be explained by "the sampler was at 5% because CPU was 0.92".
+
+    The ``audit_events_hot`` schema has no dedicated numeric columns for the
+    rates, so prev/new rate and reason plus the two driving metrics are packed
+    into the ``resource`` JSON blob.  ``to_dict`` flattens them for the Query
+    API added in PC31.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    actor: dict[str, str]
+    resource: dict[str, str]
+    reason: str
+    prev_rate: float
+    new_rate: float
+    prev_reason: str
+    new_reason: str
+    system_cpu_ratio: float
+    agent_error_rate_5m: float
+    trace_id: str = ""  # always "" — a rate change is not trace-scoped
+    action: str = "sampler.rate_change"
+    ip_address: str = "unknown"
+    user_agent: str = "policy-engine"
+    decision: str = "applied"  # a change is either applied or not recorded
+
+    @classmethod
+    def for_rate_change(
+        cls,
+        prev_rate: float,
+        new_rate: float,
+        prev_reason: str,
+        new_reason: str,
+        system_cpu_ratio: float,
+        agent_error_rate_5m: float,
+        actor_id: str = "policy-engine",
+    ) -> "SamplerRateChangeAuditEvent":
+        """Create an audit event for one sampling-rate transition.
+
+        The human-readable ``reason`` embeds the numbers that caused the
+        decision, e.g. ``"policy changed from 0.10 to 0.05, reason=cpu_high
+        (system_cpu_ratio=0.92 > 0.80)"`` — PC30 requires the reason to be
+        legible in the audit trail without cross-referencing other rows.
+        """
+        if new_reason == "cpu_high":
+            detail = (
+                f"system_cpu_ratio={system_cpu_ratio:.2f} > "
+                f"{CPU_HIGH_THRESHOLD:.2f}"
+            )
+        elif new_reason == "error_high":
+            detail = (
+                f"agent_error_rate_5m={agent_error_rate_5m:.3f} > "
+                f"{ERROR_RATE_THRESHOLD:.3f}"
+            )
+        else:
+            detail = (
+                f"system_cpu_ratio={system_cpu_ratio:.2f} <= {CPU_HIGH_THRESHOLD:.2f} "
+                f"and agent_error_rate_5m={agent_error_rate_5m:.3f} <= "
+                f"{ERROR_RATE_THRESHOLD:.3f}"
+            )
+
+        return cls(
+            audit_id=f"sra-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "system", "id": actor_id},
+            resource={"type": "sampler_policy", "id": "normal-trace"},
+            reason=(
+                f"policy changed from {prev_rate:.2f} to {new_rate:.2f}, "
+                f"reason={new_reason} ({detail})"
+            ),
+            prev_rate=prev_rate,
+            new_rate=new_rate,
+            prev_reason=prev_reason,
+            new_reason=new_reason,
+            system_cpu_ratio=system_cpu_ratio,
+            agent_error_rate_5m=agent_error_rate_5m,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Flatten the rate metadata out of ``resource`` for the Query API."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "prev_rate": self.prev_rate,
+            "new_rate": self.new_rate,
+            "prev_reason": self.prev_reason,
+            "new_reason": self.new_reason,
+            "system_cpu_ratio": self.system_cpu_ratio,
+            "agent_error_rate_5m": self.agent_error_rate_5m,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to a ClickHouse INSERT row matching the audit_events_hot DDL.
+
+        The sampler-specific numbers ride along inside the ``resource`` JSON so
+        the DDL stays unchanged and no migration is needed for PC30.
+        """
+        resource = dict(self.resource)
+        resource.update(
+            {
+                "prev_rate": self.prev_rate,
+                "new_rate": self.new_rate,
+                "prev_reason": self.prev_reason,
+                "new_reason": self.new_reason,
+                "system_cpu_ratio": self.system_cpu_ratio,
+                "agent_error_rate_5m": self.agent_error_rate_5m,
+            }
+        )
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(resource),
             self.reason,
             self.ip_address,
             self.user_agent,

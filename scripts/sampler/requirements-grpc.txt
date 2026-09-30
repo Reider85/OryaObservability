@@ -1,0 +1,9 @@
+# PC30 — optional OTLP/gRPC receiver for the sampler proxy.
+#
+# Install this layer only when the proxy must accept gRPC. The SDK itself ships
+# OTLP/HTTP JSON, so the default deployment does not need it:
+#
+#   docker build --target sampler-grpc -f scripts/sampler/Dockerfile ..
+grpcio>=1.60
+opentelemetry-proto>=1.25
+protobuf>=4.25
