@@ -206,62 +206,82 @@ class DriftDetector:
         baseline_end = time.time() - (self.last_window_hours * 3600)
         
         query = """
-        SELECT response_embedding 
-        FROM spans_hot 
-        WHERE agent_id = %(agent_id)s 
+        SELECT response_embedding
+        FROM spans_hot
+        WHERE agent_id = %(agent_id)s
         AND response_embedding IS NOT NULL
         AND created_at >= toDateTime64(%(baseline_start)s, 3)
         AND created_at < toDateTime64(%(baseline_end)s, 3)
-        ORDER BY created ASC
+        ORDER BY created_at ASC
         """
-        
-        results = await self.hotstore._execute_clickhouse(query, {
-            "agent_id": agent_id,
-            "baseline_start": baseline_start,
-            "baseline_end": baseline_end
-        })
+
+        try:
+            results = await self.hotstore._execute_clickhouse(query, {
+                "agent_id": agent_id,
+                "baseline_start": baseline_start,
+                "baseline_end": baseline_end
+            })
+        except Exception as e:
+            # 1C: spans_hot has no response_embedding column (Nullable(Array)
+            # is illegal in ClickHouse). Degrade instead of failing the run.
+            logger.warning(
+                "spans_hot.response_embedding unavailable (%s); "
+                "no baseline embeddings for agent=%s",
+                e,
+                agent_id,
+            )
+            return []
         embeddings = []
-        
+
         for row in results:
             if row and row[0]:  # response_embedding exists
                 embedding = row[0]
                 if isinstance(embedding, list) and len(embedding) > 0:
                     embeddings.append(embedding)
-        
+
         return embeddings
-    
+
     async def _get_last_window_embeddings(self, agent_id: str) -> list[list[float]]:
         """Get embeddings from last window (most recent hour).
-        
+
         Args:
             agent_id: Target agent identifier
-            
+
         Returns:
             List of response embeddings from last window
         """
         last_window_start = time.time() - (self.last_window_hours * 3600)
-        
+
         query = """
-        SELECT response_embedding 
-        FROM spans_hot 
-        WHERE agent_id = %(agent_id)s 
+        SELECT response_embedding
+        FROM spans_hot
+        WHERE agent_id = %(agent_id)s
         AND response_embedding IS NOT NULL
         AND created_at >= toDateTime64(%(last_window_start)s, 3)
-        ORDER BY created ASC
+        ORDER BY created_at ASC
         """
-        
-        results = await self.hotstore._execute_clickhouse(query, {
-            "agent_id": agent_id,
-            "last_window_start": last_window_start
-        })
+
+        try:
+            results = await self.hotstore._execute_clickhouse(query, {
+                "agent_id": agent_id,
+                "last_window_start": last_window_start
+            })
+        except Exception as e:
+            logger.warning(
+                "spans_hot.response_embedding unavailable (%s); "
+                "no last-window embeddings for agent=%s",
+                e,
+                agent_id,
+            )
+            return []
         embeddings = []
-        
+
         for row in results:
             if row and row[0]:  # response_embedding exists
                 embedding = row[0]
                 if isinstance(embedding, list) and len(embedding) > 0:
                     embeddings.append(embedding)
-        
+
         return embeddings
     
     def _compute_severity(self, kl_score: float, threshold: float) -> str:

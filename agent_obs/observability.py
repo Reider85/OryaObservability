@@ -793,45 +793,25 @@ class ObservabilitySDK:
     async def _flush_embedding_batch(
         self, batch: list[tuple[str, str, list[float]]]
     ) -> None:
-        """Write a batch of (trace_id, span_id, embedding) to ClickHouse.
+        """Persist a batch of (trace_id, span_id, embedding) tuples.
 
-        Falls back to Redis with TTL 1 hour when ClickHouse is unavailable.
+        1C: ``spans_hot`` has no ``response_embedding`` column —
+        Nullable(Array) is illegal in ClickHouse — so embeddings go to the
+        Redis TTL store only. ClickHouse persistence returns when the column
+        is reintroduced as ``Array(Float32) DEFAULT []`` (1A) or embeddings
+        move out of ClickHouse entirely (1B).
         """
         from agent_obs.metrics import (
             embeddings_batch_size,
             embeddings_stored_total,
-            embeddings_storage_failed_total,
         )
 
         if not batch:
             return
 
         embeddings_batch_size.observe(len(batch))
-
-        try:
-            from agent_obs.storage.hot import HotStore
-
-            hot_store = HotStore()
-            spans = [
-                {
-                    "trace_id": trace_id,
-                    "span_id": span_id,
-                    "response_embedding": embedding,
-                }
-                for trace_id, span_id, embedding in batch
-            ]
-            await asyncio.get_event_loop().run_in_executor(
-                None, hot_store.write_spans_batch, spans
-            )
-            embeddings_stored_total.inc(len(batch))
-        except Exception:
-            embeddings_storage_failed_total.inc(len(batch))
-            logger.warning(
-                "Failed to write %d embeddings to ClickHouse, "
-                "attempting Redis fallback",
-                len(batch),
-            )
-            await self._embedding_redis_fallback(batch)
+        await self._embedding_redis_fallback(batch)
+        embeddings_stored_total.inc(len(batch))
 
     async def _embedding_redis_fallback(
         self, batch: list[tuple[str, str, list[float]]]

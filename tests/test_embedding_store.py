@@ -117,57 +117,38 @@ class TestEmbeddingQueueFull:
 
 
 # ---------------------------------------------------------------------------
-# _flush_embedding_batch — ClickHouse write
+# _flush_embedding_batch — Redis-only persistence (1C)
 # ---------------------------------------------------------------------------
 
 class TestFlushEmbeddingBatch:
-    """PC24: _flush_embedding_batch writes to ClickHouse via HotStore."""
+    """1C: spans_hot has no response_embedding column, so embeddings go to
+    the Redis TTL store only. ClickHouse writes return with1A/1B."""
 
-    async def test_flush_writes_to_clickhouse(self, sdk):
+    async def test_flush_uses_redis_only(self, sdk):
         batch = [
             ("trace-1", "span-1", [0.1, 0.2]),
             ("trace-2", "span-2", [0.3, 0.4]),
         ]
-        mock_hot_store = MagicMock()
-        with patch("agent_obs.storage.hot.HotStore", return_value=mock_hot_store), \
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_cls, \
              patch("agent_obs.metrics.embeddings_stored_total") as mock_stored, \
              patch("agent_obs.metrics.embeddings_batch_size") as mock_batch_size, \
-             patch("agent_obs.metrics.embeddings_storage_failed_total") as mock_failed:
+             patch.object(sdk, "_embedding_redis_fallback", new_callable=AsyncMock) as mock_fallback:
             mock_stored.inc = MagicMock()
             mock_batch_size.observe = MagicMock()
-            mock_failed.inc = MagicMock()
 
             await sdk._flush_embedding_batch(batch)
 
-            mock_hot_store.write_spans_batch.assert_called_once()
-            written_spans = mock_hot_store.write_spans_batch.call_args[0][0]
-            assert len(written_spans) == 2
-            assert written_spans[0]["trace_id"] == "trace-1"
-            assert written_spans[0]["response_embedding"] == [0.1, 0.2]
-            assert written_spans[1]["trace_id"] == "trace-2"
-            assert written_spans[1]["response_embedding"] == [0.3, 0.4]
-
+            mock_hot_cls.assert_not_called()
+            mock_fallback.assert_called_once_with(batch)
             mock_stored.inc.assert_called_once_with(2)
             mock_batch_size.observe.assert_called_once_with(2)
-            mock_failed.inc.assert_not_called()
 
     async def test_flush_empty_batch_noop(self, sdk):
-        with patch("agent_obs.storage.hot.HotStore") as mock_hot_cls:
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_cls, \
+             patch.object(sdk, "_embedding_redis_fallback", new_callable=AsyncMock) as mock_fallback:
             await sdk._flush_embedding_batch([])
             mock_hot_cls.assert_not_called()
-
-    async def test_flush_failure_triggers_redis_fallback(self, sdk):
-        batch = [("trace-1", "span-1", [0.1])]
-        with patch("agent_obs.storage.hot.HotStore") as mock_hot_cls, \
-             patch("agent_obs.metrics.embeddings_storage_failed_total") as mock_failed, \
-             patch.object(sdk, "_embedding_redis_fallback", new_callable=AsyncMock) as mock_fallback:
-            mock_hot_cls.side_effect = Exception("ClickHouse down")
-            mock_failed.inc = MagicMock()
-
-            await sdk._flush_embedding_batch(batch)
-
-            mock_failed.inc.assert_called_once_with(1)
-            mock_fallback.assert_called_once_with(batch)
+            mock_fallback.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +156,7 @@ class TestFlushEmbeddingBatch:
 # ---------------------------------------------------------------------------
 
 class TestEmbeddingRedisFallback:
-    """PC24: when ClickHouse is unavailable, embeddings go to Redis with TTL 1h."""
+    """PC24: embeddings persist in Redis with TTL 1h (1C primary path)."""
 
     async def test_redis_fallback_exception_is_caught(self, sdk):
         """Verify the fallback doesn't crash even if Redis import fails."""
@@ -183,12 +164,10 @@ class TestEmbeddingRedisFallback:
         # Should not raise — the method catches all exceptions internally.
         await sdk._embedding_redis_fallback(batch)
 
-    async def test_flush_failure_calls_redis_fallback(self, sdk):
-        """End-to-end: ClickHouse failure → Redis fallback is attempted."""
+    async def test_flush_calls_redis_fallback(self, sdk):
+        """End-to-end: _flush_embedding_batch routes embeddings to Redis."""
         batch = [("trace-1", "span-1", [0.1])]
-        with patch("agent_obs.storage.hot.HotStore") as mock_hot_cls, \
-             patch.object(sdk, "_embedding_redis_fallback", new_callable=AsyncMock) as mock_fallback:
-            mock_hot_cls.side_effect = Exception("ClickHouse down")
+        with patch.object(sdk, "_embedding_redis_fallback", new_callable=AsyncMock) as mock_fallback:
             await sdk._flush_embedding_batch(batch)
             mock_fallback.assert_called_once_with(batch)
 

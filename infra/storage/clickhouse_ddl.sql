@@ -14,6 +14,11 @@ USE observability;
 -- TTL equal to the trigger means migrate_spans_to_warm.py can never observe a
 -- single row and the warm migration silently becomes a no-op. 21d leaves a
 -- 7-day window for the daily job to ship rows to Postgres warm.
+--
+-- 1C: no response_embedding column. Nullable(Array(...)) is illegal in
+-- ClickHouse (Nullable cannot wrap Array/Map), so the column is deferred
+-- until embeddings are reintroduced as Array(Float32) DEFAULT [] (1A) or
+-- moved out of ClickHouse entirely (1B). Drift/phoenix degrade while absent.
 CREATE TABLE IF NOT EXISTS spans_hot (
     trace_id String,
     span_id String,
@@ -28,7 +33,6 @@ CREATE TABLE IF NOT EXISTS spans_hot (
     attributes JSON,
     events JSON,
     cost_usd Float64,
-    response_embedding Array(Float32) NULL,
     created_at DateTime64(3) DEFAULT now()
 )
 ENGINE = MergeTree()

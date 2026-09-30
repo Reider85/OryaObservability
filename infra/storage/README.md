@@ -75,22 +75,25 @@ docker compose exec minio mc ls local/
 ## Connectivity Details
 
 ### ClickHouse Hot Storage
-- **Host URL**: `http://localhost:8123`
+- **Host URL (HTTP)**: `http://localhost:8123`
+- **Host native TCP**: `localhost:9004` (container `clickhouse:9000`; host `:9000` is intentionally not published — it collides with unrelated MinIO instances)
 - **Database**: `observability`
-- **User**: `observability_user`
-- **Password**: `observability_password`
+- **In-network user** (Langfuse/cron/sampler): `clickhouse` / `${CLICKHOUSE_PASSWORD}`
+- **App user** (HotStore/drift/phoenix defaults): `observability_user` / `observability_password`
+  — defined via `observability_user.xml` (users.d mount), not SQL CREATE USER
+- **Schema re-apply** (existing volumes): `docker compose run --rm clickhouse-init`
 
 ### PostgreSQL Warm Storage
-- **Host URL**: `postgresql://localhost:5433/warm_store`
-- **User**: `warm_user`
-- **Password**: `warm_password`
+- **Host URL**: `postgresql://localhost:5433/warm_store` (not published by compose; use `docker compose exec postgres-warm psql -U warm -d warm_store`)
+- **User**: `warm`
+- **Password**: `warm`
 
 ### MinIO Cold Storage
-- **API Endpoint**: `http://localhost:9000`
-- **Console**: `http://localhost:9001`
+- **API Endpoint**: in-network `http://minio:9000` (not published to host)
+- **Console**: in-network `:9001` (not published to host)
 - **Access Key**: `minio`
 - **Secret Key**: `miniosecret`
-- **Buckets**: `cold-traces`, `audit-events`
+- **Buckets**: `langfuse`, `cold-traces`, `audit-events`
 
 ## Environment Variables
 
@@ -98,10 +101,17 @@ The following environment variables should be set in your `.env` file:
 
 ```bash
 # ClickHouse Hot Storage
+# Compose in-network services get CLICKHOUSE_USER=clickhouse from
+# docker-compose.yml. Host-run SDK tools use observability_user, defined via
+# observability_user.xml (users.d mount). Do not set CLICKHOUSE_USER in .env
+# for compose-only stacks.
 CLICKHOUSE_DB=observability
-CLICKHOUSE_USER=observability_user
-CLICKHOUSE_PASSWORD=observability_password
 CLICKHOUSE_HOT_URL=http://clickhouse:8123
+# Host-run tools (native protocol):
+#   CLICKHOUSE_HOST=localhost
+#   CLICKHOUSE_PORT=9004
+#   CLICKHOUSE_USER=observability_user
+#   CLICKHOUSE_PASSWORD=observability_password
 
 # PostgreSQL Warm Storage
 WARM_PG_USER=warm_user

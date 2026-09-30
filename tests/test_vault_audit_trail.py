@@ -144,9 +144,16 @@ class TestHotStoreAuditWrite:
 
     @pytest.fixture
     def hot_store_with_mock(self, mock_clickhouse_client):
-        """HotStore with mocked client."""
-        with patch("clickhouse_driver.Client", return_value=mock_clickhouse_client):
-            return HotStore()
+        """HotStore with the mock client injected into the lazy slot.
+
+        HotStore() does not connect in __init__ — patching
+        clickhouse_driver.Client around construction is not enough, because
+        _get_client() runs later in the test body (after the patch has exited)
+        and would open a real connection (to whatever owns localhost:9000).
+        """
+        store = HotStore()
+        store._client = mock_clickhouse_client
+        return store
 
     def test_write_audit_event_success(self, hot_store_with_mock):
         """Test successful audit event write."""

@@ -1,0 +1,21 @@
+<clickhouse>
+  <!-- Docs: <https://clickhouse.com/docs/operations/settings/settings_users/> -->
+  <!--
+    App user for host-run SDK tools (HotStore, drift detector, phoenix export).
+    Defined via config (same pattern as the image's clickhouse user) because
+    the compose-provisioned `clickhouse` account has no CREATE USER grant.
+    Mounted into clickhouse:/etc/clickhouse-server/users.d/ and picked up on
+    server start or SYSTEM RELOAD CONFIG (clickhouse-init runs the reload).
+  -->
+  <users>
+    <observability_user>
+      <password><![CDATA[observability_password]]></password>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <profile>default</profile>
+      <quota>default</quota>
+      <access_management>0</access_management>
+    </observability_user>
+  </users>
+</clickhouse>

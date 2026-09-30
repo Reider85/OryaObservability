@@ -8,20 +8,22 @@ services:
     container_name: drift-detector
     restart: unless-stopped
     environment:
-      # ClickHouse configuration
+      # ClickHouse configuration. Defaults match infra/docker-compose.yml
+      # (in-network `clickhouse` user). Set CLICKHOUSE_USER=observability_user
+      # only after `docker compose run --rm clickhouse-init` has created it.
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_PORT=9000
       - CLICKHOUSE_DB=observability
-      - CLICKHOUSE_USER=observability_user
-      - CLICKHOUSE_PASSWORD=observability_password
-      
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-clickhouse}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse}
+
       # Drift detection configuration
       - DRIFT_INTERVAL_SECONDS=900
       - DRIFT_BASELINE_HOURS=168
       - DRIFT_LAST_WINDOW_HOURS=1
       - DRIFT_KL_THRESHOLD=0.1
       - DRIFT_AGENT_IDS=default_agent,chat_agent,code_agent
-      
+
       # Logging
       - PYTHONUNBUFFERED=1
     depends_on:

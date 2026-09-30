@@ -57,6 +57,9 @@ async def fetch_embeddings_from_clickhouse(
     """Fetch embeddings from ClickHouse spans_hot table.
 
     Returns list of dicts with trace_id, agent_id, response_embedding.
+
+    1C: spans_hot has no response_embedding column, so the query fails and
+    this returns []. Phoenix stays empty until embeddings return (1A/1B).
     """
     try:
         client = hotstore._get_client()

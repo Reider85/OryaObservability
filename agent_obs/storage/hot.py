@@ -159,7 +159,12 @@ class HotStore:
         return results
 
     def write_spans_batch(self, spans: list[dict]) -> None:
-        """Write a batch of span dicts to spans_hot table."""
+        """Write a batch of span dicts to spans_hot table.
+
+        1C: spans_hot has no ``response_embedding`` column (Nullable(Array)
+        is illegal in ClickHouse). Extra keys on the span dicts (including
+        ``response_embedding``) are ignored.
+        """
         if not spans:
             return
         client = self._get_client()
@@ -180,7 +185,6 @@ class HotStore:
                     json.dumps(span.get("attributes", {})),
                     json.dumps(span.get("events", [])),
                     span.get("cost_usd", 0.0),
-                    span.get("response_embedding"),
                 )
             )
         client.execute(
@@ -188,7 +192,7 @@ class HotStore:
             INSERT INTO spans_hot
             (trace_id, span_id, parent_span_id, agent_id, tenant_id, name,
              span_type, start_time, end_time, status, attributes, events,
-             cost_usd, response_embedding)
+             cost_usd)
             VALUES
             """,
             rows,
@@ -201,7 +205,7 @@ class HotStore:
             """
             SELECT trace_id, span_id, parent_span_id, agent_id, tenant_id, name,
                    span_type, start_time, end_time, status, attributes, events,
-                   cost_usd, response_embedding
+                   cost_usd
             FROM spans_hot
             WHERE trace_id = %s
             ORDER BY start_time ASC
@@ -226,7 +230,6 @@ class HotStore:
                     "attributes": json.loads(row[10]) if isinstance(row[10], str) else row[10],
                     "events": json.loads(row[11]) if isinstance(row[11], str) else row[11],
                     "cost_usd": row[12],
-                    "response_embedding": row[13],
                 }
             )
         return spans
@@ -491,7 +494,7 @@ class HotStore:
             """
             SELECT trace_id, span_id, parent_span_id, agent_id, tenant_id,
                    name, span_type, start_time, end_time, status,
-                   attributes, events, cost_usd, response_embedding
+                   attributes, events, cost_usd
             FROM spans_hot
             WHERE start_time < %(cutoff)s
             ORDER BY start_time ASC
@@ -516,7 +519,6 @@ class HotStore:
                     "attributes": json.loads(row[10]) if isinstance(row[10], str) else row[10],
                     "events": json.loads(row[11]) if isinstance(row[11], str) else row[11],
                     "cost_usd": row[12],
-                    "response_embedding": row[13],
                 }
             )
         return spans

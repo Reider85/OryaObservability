@@ -102,9 +102,9 @@ audit trail disabled rather than refusing to sample. Set
 `AGENT_OBS_SAMPLER_AUDIT_ENABLED=0` to skip the audit sink deliberately.
 
 > **Live-verified caveat:** the audit row only lands if the `observability`
-> database exists. `infra/storage/clickhouse_init.sh` only runs on a *fresh*
-> ClickHouse data directory, so an existing volume never gets it and writes fail
-> with `Database ... does not exist`. Check with
+> database exists. The ClickHouse entrypoint hook only ran on a *fresh* data
+> directory; existing volumes never re-applied the schema. Re-apply any time
+> with `docker compose run --rm clickhouse-init` (idempotent). Check with
 > `SELECT count() FROM system.databases WHERE name='observability'`.
 
 ## Metrics

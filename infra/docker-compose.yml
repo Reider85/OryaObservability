@@ -111,7 +111,11 @@ services:
     # Dedicated Redis instance for async eval jobs (separate from Langfuse)
 
   clickhouse:
-    image: clickhouse/clickhouse-server
+    # Pinned: 26.9 verified live against this DDL (JSON columns, UUID,
+    # DateTime64, TTL INTERVAL). Note Nullable(Array(...)) is illegal in
+    # ClickHouse generally — spans_hot therefore has no response_embedding
+    # column (see clickhouse_ddl.sql 1C comment).
+    image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
     user: "101:101"
     environment:
@@ -121,8 +125,12 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - clickhouse_logs:/var/log/clickhouse-server
-      - ./storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Mount name must match clickhouse_init.sh's default DDL_PATH.
+      - ./storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # App user for HotStore/drift/phoenix. Defined via XML because the
+      # compose-provisioned `clickhouse` account has no CREATE USER grant.
+      - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
       interval: 5s
@@ -130,7 +138,35 @@ services:
       retries: 20
       start_period: 10s
     ports:
-      - "8123:8123"  # Expose on host port for DoD verification
+      - "8123:8123"  # HTTP — host tools / DoD verification
+      # Native TCP on a free host port. Host :9000 is commonly occupied by an
+      # unrelated MinIO/ClickHouse (other projects); publishing it here makes
+      # this container fail to start. In-network clients use clickhouse:9000.
+      - "9004:9000"
+
+  # Always-runnable schema + app-user provisioning. The stock entrypoint only
+  # executes /docker-entrypoint-initdb.d on an EMPTY data dir, so existing
+  # volumes never get the observability DB/tables/users from the hook. This
+  # one-shot is the supported re-apply path (same pattern as minio-init):
+  #   docker compose run --rm clickhouse-init
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:26.9
+    restart: on-failure
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "9000"
+      # Admin account for DDL (same as the clickhouse service env). The app
+      # user observability_user comes from users.d XML, not from SQL here.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      DDL_PATH: /init/clickhouse_ddl.sql
+    volumes:
+      - ./storage/clickhouse_ddl.sql:/init/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_init.sh:/init/clickhouse_init.sh:ro
+    entrypoint: ["/bin/bash", "/init/clickhouse_init.sh"]
 
   minio:
     image: quay.io/minio/minio:latest
@@ -150,9 +186,12 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
-    ports:
-      - "9000:9000"  # Expose API on host port for DoD verification
-      - "9001:9001"  # Expose console on host port for DoD verification
+    # No host ports: Langfuse/cron/sampler talk to minio:9000 over the compose
+    # network. Publishing 9000/9001 collides with unrelated local MinIO
+    # instances (other projects), which prevents this container from starting
+    # and surfaces as Langfuse ENOTFOUND minio. Console access:
+    #   docker compose exec minio mc alias set local http://localhost:9000 minio <password>
+    # or `docker compose port minio 9000` after a temporary override.
 
   langfuse:
     image: langfuse/langfuse:3

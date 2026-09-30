@@ -12,8 +12,9 @@ Local self-hosted observability stack for the `agent-obs` MVP
 | `langfuse-worker` | `langfuse/langfuse-worker:3` | internal | Ingestion/queue workers (ClickhouseWriter, otel-ingestion) |
 | `postgres` | `postgres:17` | internal | Langfuse metadata database (compose network only) |
 | `redis` | `redis:7` | internal | Langfuse queues (compose network only, `requirepass`) |
-| `clickhouse` | `clickhouse/clickhouse-server` | `8123`, `9000` | Langfuse event/observation storage (compose network only) |
-| `minio` | `quay.io/minio/minio:latest` | `9000` | S3-compatible storage for Langfuse (S3 buckets; compose network only) |
+| `clickhouse` | `clickhouse/clickhouse-server:26.9` | `8123` HTTP + `9004`→native `9000` (host) | Langfuse event/observation storage + observability hot tier |
+| `clickhouse-init` | `clickhouse/clickhouse-server:26.9` | internal | One-shot schema/user provisioning — re-runnable on existing volumes |
+| `minio` | `quay.io/minio/minio:latest` | internal (`minio:9000`) | S3-compatible storage for Langfuse + cold/audit tiers (compose network only) |
 | `otel-collector` | `otel/opentelemetry-collector-contrib:0.128.0` | `4317` gRPC, `4318` HTTP, `8888` self-telemetry | OTLP → tail-sampling → batch → Langfuse |
 | `cron` | built from `infra/cron/Dockerfile` | `9777` metrics | Tiered-retention maintenance jobs: hourly vault TTL cleanup, daily audit archival, daily eval warm migration (PC21) |
 | `alertmanager` | `prom/alertmanager:latest` | `9093` | Receives Prometheus alerts (PC21) |
@@ -24,10 +25,15 @@ Local self-hosted observability stack for the `agent-obs` MVP
 > the S3 bucket Langfuse uses for media/event uploads (fully offline mode via
 > the compose network; Traefik/Let's Encrypt are **not** used).
 >
-> Postgres/Redis/ClickHouse/MinIO are deliberately **not** exposed on the host:
-> their ports are commonly occupied by a local service. The SDK only talks to
-> Langfuse (`:3000`) and the Collector (`:4317`/`:4318`). To debug the database
-> directly, run `docker compose exec postgres psql -U langfuse`.
+> Postgres/Redis/MinIO are deliberately **not** exposed on the host: their
+> ports are commonly occupied by local services in other projects (a foreign
+> MinIO on host `:9000` is exactly what used to prevent this stack's MinIO
+> from starting). ClickHouse publishes HTTP `:8123` and native `:9004` (not
+> `:9000`) for host-side tools. In-network clients always use
+> `clickhouse:9000` / `minio:9000`. To debug databases directly:
+> `docker compose exec postgres psql -U langfuse`,
+> `docker compose exec clickhouse clickhouse-client`,
+> `docker compose exec minio mc alias set local http://localhost:9000 minio <password>`.
 
 **Data flow**
 
@@ -229,6 +235,40 @@ docker compose exec postgres-warm psql -U warm -d warm_store \
 # or, to wipe and re-provision everything:
 docker compose down -v
 ```
+
+### Re-applying the ClickHouse schema (existing volumes)
+
+The ClickHouse entrypoint hook (`/docker-entrypoint-initdb.d/`) also runs
+**only on an empty data dir**. Existing `clickhouse_data` volumes never get
+the `observability` DB, tables, or the `observability_user` account from it.
+The supported re-apply path is the one-shot service (idempotent
+`IF NOT EXISTS` / `CREATE USER IF NOT EXISTS`):
+
+```bash
+docker compose run --rm clickhouse-init
+# verify
+docker compose exec clickhouse clickhouse-client \
+  --user clickhouse --password clickhouse \
+  --query "SELECT name FROM system.tables WHERE database='observability'"
+docker compose exec clickhouse clickhouse-client \
+  --user clickhouse --password clickhouse \
+  --query "SELECT name FROM system.users"
+```
+
+Credential layout: compose in-network services use `clickhouse`/`clickhouse`
+(image env). Host-run SDK tools (HotStore, drift, phoenix) default to
+`observability_user`/`observability_password`, defined via
+`storage/observability_user.xml` mounted into
+`/etc/clickhouse-server/users.d/` (the compose-provisioned `clickhouse`
+account has no `CREATE USER` grant, so the app user is config-defined, not
+SQL-created). `clickhouse-init` runs `SYSTEM RELOAD CONFIG` so the user is
+live without a server restart.
+
+Known ClickHouse constraint: `Nullable(Array(...))` is illegal, so
+`spans_hot` has **no** `response_embedding` column (1C). Embeddings persist
+in Redis only until reintroduced as `Array(Float32) DEFAULT []` (1A) or moved
+out of ClickHouse (1B). Drift detection and the Phoenix export degrade
+(logged warning / empty result) while the column is absent.
 
 ## 8. Useful commands
 

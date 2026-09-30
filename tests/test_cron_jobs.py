@@ -38,6 +38,7 @@ from agent_obs.storage.maintenance import (
     JOB_MIGRATE_TRACES,
     JOB_CALIBRATE_DRIFT_THRESHOLD,
     JOB_DRIFT_DETECTION,
+    JOB_EXPORT_EMBEDDINGS,
     AuditArchiveResult,
     EvalWarmResult,
     TraceWarmResult,
@@ -1092,12 +1093,13 @@ class TestHotStoreTieredQueries:
 
     def test_spans_select_returns_full_shape(self, store, clickhouse):
         now = datetime.now(timezone.utc)
+        # 13 columns: spans_hot has no response_embedding column.
         clickhouse.execute.return_value = [
             (
                 "trace-1", "span-1", "", "agent-1", "tenant-1",
                 "llm.call", "llm.call", now - timedelta(days=15), now - timedelta(days=15, seconds=-2),
                 "ok", '{"llm.input_chars": 100, "llm.input_sha256": "abc123"}', "[]",
-                0.01, None,
+                0.01,
             )
         ]
         spans = store.get_spans_older_than(now)
@@ -1202,10 +1204,11 @@ class TestSchedulerJobTable:
             JOB_MIGRATE_TRACES,
             JOB_DRIFT_DETECTION,
             JOB_CALIBRATE_DRIFT_THRESHOLD,
+            JOB_EXPORT_EMBEDDINGS,
         }
 
     def test_job_count_is_explicit(self):
-        assert len(scheduler.build_jobs()) == 7
+        assert len(scheduler.build_jobs()) == 8
 
     def test_drift_calibration_is_monthly(self):
         """PC26: calibration is monthly, never on the 15-minute detection cadence."""

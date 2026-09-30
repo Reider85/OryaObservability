@@ -398,6 +398,11 @@ class VaultClient:
             
             return original
 
+        except AuditWriteError:
+            # Domain error from the audit sink — do not wrap as Vault connectivity.
+            raise
+        except MFARequiredError:
+            raise
         except KeyError as e:
             # Re-raise KeyError as-is (for expired or not found)
             raise e

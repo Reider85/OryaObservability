@@ -1,56 +1,69 @@
 #!/bin/bash
-
-# ClickHouse initialization script for observability database
-# This script creates the observability database and runs the DDL
-# It waits for ClickHouse to be ready before executing
+# ClickHouse initialization for the observability database.
+#
+# Runs in two contexts:
+#   1. /docker-entrypoint-initdb.d/init.sh — stock CH entrypoint; only on a
+#      FRESH data dir. Existing volumes never re-run it.
+#   2. one-shot `clickhouse-init` compose service — always runnable against a
+#      live server, including existing volumes:
+#        docker compose run --rm clickhouse-init
+#
+# Connects with the compose-provisioned admin account (CLICKHOUSE_USER /
+# CLICKHOUSE_PASSWORD, default clickhouse/clickhouse). That account can
+# CREATE DATABASE/TABLE but has no CREATE USER grant — observability_user is
+# therefore defined via users.d XML (observability_user.xml), not SQL.
+# This script: RELOAD CONFIG → CREATE DATABASE → apply DDL → verify.
 
 set -e
 
-# Wait for ClickHouse to be ready
-echo "Waiting for ClickHouse to be ready..."
-until clickhouse-client --host localhost --port 8123 --query "SELECT 1" >/dev/null 2>&1; do
+DDL_PATH="${DDL_PATH:-/docker-entrypoint-initdb.d/clickhouse_ddl.sql}"
+CH_HOST="${CLICKHOUSE_HOST:-localhost}"
+CH_PORT="${CLICKHOUSE_PORT:-9000}"
+CH_USER="${CLICKHOUSE_USER:-clickhouse}"
+CH_PASSWORD="${CLICKHOUSE_PASSWORD:-clickhouse}"
+
+client() {
+    clickhouse-client \
+        --host "${CH_HOST}" \
+        --port "${CH_PORT}" \
+        --user "${CH_USER}" \
+        --password "${CH_PASSWORD}" \
+        "$@"
+}
+
+echo "Waiting for ClickHouse at ${CH_HOST}:${CH_PORT} as ${CH_USER}..."
+until client --query "SELECT 1" >/dev/null 2>&1; do
     echo "ClickHouse is unavailable - sleeping"
     sleep 2
 done
-
 echo "ClickHouse is ready"
 
-# Create the observability database
+# Pick up observability_user.xml from users.d on a running server.
+echo "Reloading ClickHouse config (users.d)..."
+client --query "SYSTEM RELOAD CONFIG" || true
+
 echo "Creating observability database..."
-clickhouse-client --host localhost --port 8123 --query "CREATE DATABASE IF NOT EXISTS observability"
+client --query "CREATE DATABASE IF NOT EXISTS observability"
 
-# Create observability user with limited privileges
-echo "Creating observability user..."
-clickhouse-client --host localhost --port 8123 --query "
-CREATE USER IF NOT EXISTS observability_user 
-IDENTIFIED BY 'observability_password'
-"
+echo "Running DDL from ${DDL_PATH}..."
+client --database=observability --multiquery < "${DDL_PATH}"
 
-# Grant privileges to observability_user
-echo "Granting privileges to observability_user..."
-clickhouse-client --host localhost --port 8123 --query "
-GRANT SELECT, INSERT, UPDATE, DELETE ON observability.* TO observability_user
-"
-
-# Set default database for observability_user
-echo "Setting default database for observability_user..."
-clickhouse-client --host localhost --port 8123 --query "
-ALTER USER observability_user SET default_database = observability
-"
-
-# Run the DDL script
-echo "Running DDL script..."
-clickhouse-client --host localhost --port 8123 --database=observability --multiquery < /docker-entrypoint-initdb.d/clickhouse_ddl.sql
-
-# Verify tables were created
 echo "Verifying tables..."
-clickhouse-client --host localhost --port 8123 --database=observability --query "
-SELECT 
+client --database=observability --query "
+SELECT
     name,
     engine,
     total_rows
-FROM system.tables 
+FROM system.tables
 WHERE database = 'observability'
+ORDER BY name
+"
+
+echo "Verifying users..."
+client --query "
+SELECT name
+FROM system.users
+WHERE name IN ('clickhouse', 'observability_user')
 ORDER BY name
 "
 
