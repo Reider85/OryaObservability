@@ -54,7 +54,11 @@ from prometheus_client import start_http_server
 
 from agent_obs.guardrail.audit import SAMPLER_RATES
 from agent_obs.metrics import tail_sampler_current_rate, tail_sampler_traces_sampled_total
-from scripts.sampler.policy_engine import PolicyDecision, PolicyEngine
+from scripts.sampler.policy_engine import (
+    PolicyDecision,
+    PolicyEngine,
+    build_policy_engine_from_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -490,6 +494,21 @@ def run_policy_engine_loop(
         rate_file.write(engine.current_rate, engine.current_reason)
 
 
+def build_engine_for_main(args: argparse.Namespace) -> PolicyEngine:
+    """Construct the policy engine for the proxy entrypoint (PC31/PC32).
+
+    Routes through ``build_policy_engine_from_env`` so the ClickHouse audit
+    sink is attached; CLI flags override the env for the Prometheus URL and
+    tick interval. Constructing ``PolicyEngine()`` bare here was the live bug
+    where sampler rate changes never reached ``audit_events_hot``: the env
+    builder existed and was tested, but the entrypoint never called it.
+    """
+    return build_policy_engine_from_env(
+        prometheus_url=args.prometheus_url,
+        poll_interval=args.poll_interval,
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -541,9 +560,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if rate_file is not None:
         rate_file.write(sampler.current_rate, sampler.current_reason)
 
-    engine = PolicyEngine(
-        prometheus_url=args.prometheus_url, poll_interval=args.poll_interval
-    )
+    engine = build_engine_for_main(args)
 
     start_http_server(args.metrics_port)
     httpd = ThreadingHTTPServer(("0.0.0.0", args.http_port), make_handler(proxy))

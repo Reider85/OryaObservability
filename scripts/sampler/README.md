@@ -2,6 +2,9 @@
 
 Chooses the keep-rate for *normal* traces from the two load/error signals the
 SDK already exports (PC29), and applies it without restarting anything.
+PC31 adds the audit trail for every rate change; PC32 adds the observability
+surface for the sampler itself (current-rate metric, status endpoint,
+"Grafana" dashboard, stuck-at-cpu_high alert).
 
 ```
 SDK ──OTLP/HTTP──▶ sampler-proxy ──OTLP/HTTP──▶ Langfuse  (mode=proxy, default)
@@ -121,7 +124,77 @@ Exposed by the proxy on `:9095/metrics`:
 Labels carry *reasons*, not rates, so cardinality stays at 3×3 instead of growing
 with every float value.
 
-`GET :4321/sampler/status` returns the same state as JSON.
+**Deviation from the PC32 ticket text:** the ticket asked for
+`tail_sampler_current_rate{agent_id, policy_reason}`. The gauge ships with
+`policy_reason` only — the rate is process-global inside the proxy, so an
+`agent_id` label would be constant and only multiply cardinality. The metric
+name prefix `agent_obs_` already scopes the series to this SDK.
+
+## PC32 — sampler observability
+
+### Status endpoint
+
+```
+GET :4321/sampler/status
+```
+
+Returns the live policy as JSON (the port is the OTLP/HTTP receiver — the
+same handler serves both). `:9095` is `prometheus_client`'s `/metrics` only
+and cannot host custom routes.
+
+```json
+{
+  "current_rate": 0.3,
+  "policy_reason": "error_high",
+  "last_changed_at": 1759248000.123,
+  "last_change_reason": "error_high"
+}
+```
+
+`last_changed_at` is a unix timestamp (float seconds). `last_change_reason` is
+`"initial"` until the first policy-driven change.
+
+### Alert — SamplerRateStuckAtCpuHigh
+
+Defined in `infra/prometheus-rules.yml`, group `sampler-monitoring`:
+
+```
+agent_obs_tail_sampler_current_rate{policy_reason="cpu_high"} == 0.05
+  for: 30m  →  severity=warning
+```
+
+0.05 is only correct while the host is saturated. If `cpu_high` holds for
+half an hour, the fix is capacity, not staying silent at 5% sampling. The
+`tail_sampler` recording-rule group is intentionally left untouched (asserted
+by `tests/test_cron_jobs.py`).
+
+promtool unit tests: `tests/prometheus_rules_test.yml`.
+
+### Grafana — "Sampler Policy History"
+
+Provisioned, no manual import:
+
+- datasource: `infra/grafana/provisioning/datasources/prometheus.yml`
+- dashboard: `infra/grafana/dashboards/sampler_policy_history.json`
+- host URL: `http://localhost:3001/d/sampler-policy-history`
+  (3001 because Langfuse owns host `:3000`; override with `GRAFANA_PORT`)
+
+Panels: "Sampler rate over time" (one series per `policy_reason`, annotations
+on every change) and "Sampler rate changes" (from→to transition counter).
+Level 3 extends this with dropped_spans / cpu / error-rate correlation.
+
+### Audit history (PC31)
+
+Every rate change is also a row in `audit_events_hot`. Query it with:
+
+```
+GET /audit/sampler-rate-history?from=2026-09-20&to=2026-09-21
+```
+
+(FastAPI app in `agent_obs/eval/api.py`.) The proxy entrypoint builds its
+PolicyEngine through `build_policy_engine_from_env()` so the ClickHouse sink
+is attached — constructing `PolicyEngine()` bare was the live bug where audit
+rows never landed.
 
 ## Failure behaviour
 
@@ -184,9 +257,9 @@ Compose brings the service up with `docker compose up -d sampler-proxy`; see
 | `AGENT_OBS_SAMPLER_ERROR_THRESHOLD` | `0.05` | error_high trigger |
 | `PROMETHEUS_URL` | `http://localhost:9090` | Where to read the PC29 gauges |
 | `DOWNSTREAM_URL` | `http://langfuse:3000` | Langfuse, or the Collector |
-| `SAMPLER_PROXY_PORT_HTTP` | `4321` | OTLP/HTTP receiver |
+| `SAMPLER_PROXY_PORT_HTTP` | `4321` | OTLP/HTTP receiver + `/sampler/status` |
 | `SAMPLER_PROXY_PORT_GRPC` | `4320` | OTLP/gRPC receiver (needs `--grpc`) |
-| `SAMPLER_PROXY_METRICS_PORT` | `9095` | Prometheus metrics + `/sampler/status` |
+| `SAMPLER_PROXY_METRICS_PORT` | `9095` | Prometheus `/metrics` only |
 | `SAMPLER_RATE_FILE` | `/shared/sampler_rate.json` | `file` mode target |
 
 ## Pointing the SDK at the proxy

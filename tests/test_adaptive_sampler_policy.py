@@ -7,8 +7,13 @@ emitted on every rate change.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -30,9 +35,11 @@ from scripts.sampler.sampler_proxy import (
     AdaptiveSampler,
     RateFileWriter,
     SamplerProxy,
+    build_engine_for_main,
     extract_spans,
     group_spans_by_trace,
     is_interesting_span,
+    make_handler,
     start_grpc_receiver,
 )
 
@@ -424,6 +431,52 @@ class TestAdaptiveSamplerDecisions:
         assert status["current_rate"] == pytest.approx(0.30)
         assert status["policy_reason"] == "error_high"
         assert status["last_change_reason"] == "error_high"
+
+    def test_status_http_endpoint_serves_json(self):
+        """PC32: GET /sampler/status on the OTLP/HTTP port (:4321).
+
+        Only status() was covered before; this spins a real
+        ThreadingHTTPServer so the handler routing is exercised too.
+        """
+        sampler = AdaptiveSampler()
+        sampler.set_rate(0.30, "error_high")
+        proxy = SamplerProxy(
+            downstream_url="http://downstream.invalid",
+            public_key="pk",
+            secret_key="sk",
+            sampler=sampler,
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(proxy))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/sampler/status", timeout=2
+            ) as resp:
+                assert resp.status == 200
+                assert resp.headers.get_content_type() == "application/json"
+                body = json.loads(resp.read().decode("utf-8"))
+            assert set(body) == {
+                "current_rate",
+                "policy_reason",
+                "last_changed_at",
+                "last_change_reason",
+            }
+            assert body["current_rate"] == pytest.approx(0.30)
+            assert body["policy_reason"] == "error_high"
+            assert body["last_change_reason"] == "error_high"
+            assert isinstance(body["last_changed_at"], float)
+
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/definitely-not-a-route", timeout=2
+                )
+            assert exc_info.value.code == 404
+        finally:
+            server.shutdown()
+            server.server_close()
+            proxy.close()
 
 
 class TestPayloadSampling:
@@ -862,6 +915,48 @@ class TestEnvWiring:
             monkeypatch.delenv(key, raising=False)
         result = pe._build_hot_store_from_env()
         assert result is None or hasattr(result, "write_audit_event")
+
+    def test_proxy_entrypoint_wires_audit_sink_via_env_builder(self, monkeypatch):
+        """PC31/PC32: main() must not construct PolicyEngine bare.
+
+        build_engine_for_main routes through build_policy_engine_from_env so
+        the ClickHouse audit sink is attached; CLI flags still override the
+        Prometheus URL and poll interval.
+        """
+        import scripts.sampler.sampler_proxy as sp
+
+        store = object()
+        monkeypatch.setattr(
+            "scripts.sampler.policy_engine._build_hot_store_from_env",
+            lambda: store,
+        )
+        monkeypatch.delenv("AGENT_OBS_SAMPLER_AUDIT_ENABLED", raising=False)
+        args = argparse.Namespace(
+            prometheus_url="http://prom:9090", poll_interval=15.0
+        )
+        engine = sp.build_engine_for_main(args)
+        assert engine.hot_store is store
+        assert engine.enable_audit is True
+        assert engine.prometheus_url == "http://prom:9090"
+        assert engine.poll_interval == pytest.approx(15.0)
+
+    def test_build_engine_for_main_passes_cli_overrides(self, monkeypatch):
+        import scripts.sampler.sampler_proxy as sp
+
+        captured: dict = {}
+
+        def _fake(**overrides):
+            captured.update(overrides)
+            return object()
+
+        monkeypatch.setattr(sp, "build_policy_engine_from_env", _fake)
+        args = argparse.Namespace(prometheus_url="http://cli:9090", poll_interval=7.5)
+        result = sp.build_engine_for_main(args)
+        assert result is not None
+        assert captured["prometheus_url"] == "http://cli:9090"
+        assert captured["poll_interval"] == 7.5
+        # hot_store must come from the env builder, never from CLI kwargs.
+        assert "hot_store" not in captured
 
 
 class TestGrpcReceiver:

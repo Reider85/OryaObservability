@@ -1,0 +1,114 @@
+{
+  "uid": "sampler-policy-history",
+  "title": "Sampler Policy History",
+  "description": "PC32 (T2.7.4): current normal-trace sampling rate chosen by the adaptive policy engine, with reason annotations. Level 3 extends this with dropped_spans / cpu / error-rate correlation.",
+  "tags": ["agent-obs", "sampler", "pc32"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "name": "Policy reason changes",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "changes(agent_obs_tail_sampler_current_rate[2m]) > 0",
+        "titleFormat": "rate → {{policy_reason}}",
+        "target": {
+          "limit": 100,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Sampler rate over time",
+      "description": "agent_obs_tail_sampler_current_rate, one series per policy_reason (cpu_high=0.05, error_high=0.30, default=0.10). Annotations mark every rate change.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_obs_tail_sampler_current_rate",
+          "legendFormat": "{{policy_reason}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Sampler rate changes",
+      "description": "Increase of agent_obs_tail_sampler_rate_changes_total per hour, labelled by from_reason → to_reason. Correlate with dropped_spans_total during an incident.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": ["sum"],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(agent_obs_tail_sampler_rate_changes_total[1h])",
+          "legendFormat": "{{from_reason}} → {{to_reason}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "range": true
+        }
+      ]
+    }
+  ]
+}

@@ -350,10 +350,10 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.7.1 | Экспортировать метрики system_cpu_ratio, agent_error_rate_5m в sampler | **TODO** | `PC29` |
-| T2.7.2 | Реализовать policy: if cpu>0.8: rate=0.05; elif error_rate>0.05: rate=0.3; else: rate=0.1 | **TODO** | `PC30` |
-| T2.7.3 | Логировать изменения rate в audit trail | **TODO** | `PC31` |
-| T2.7.4 | Метрика tail_sampler_current_rate для мониторинга | **TODO** | `PC32` |
+| T2.7.1 | Экспортировать метрики system_cpu_ratio, agent_error_rate_5m в sampler | **DONE** | `PC29` |
+| T2.7.2 | Реализовать policy: if cpu>0.8: rate=0.05; elif error_rate>0.05: rate=0.3; else: rate=0.1 | **DONE** | `PC30` |
+| T2.7.3 | Логировать изменения rate в audit trail | **DONE** | `PC31` |
+| T2.7.4 | Метрика tail_sampler_current_rate для мониторинга | **DONE** | `PC32` |
 #### E2.8 — Compliance-catalog как побочный продукт PII-маскинга
 
 **ТРИЗ-обоснование.** Принцип 22 (превращение вреда в пользу): PII-маскирование даёт готовый GDPR Data Map, за который иначе пришлось бы платить консультантам.

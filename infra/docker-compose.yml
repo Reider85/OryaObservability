@@ -334,7 +334,9 @@ services:
       - sampler_shared:/shared
     ports:
       - "4321:4321"  # OTLP/HTTP — point LANGFUSE_HOST here in proxy mode
-      - "9095:9095"  # metrics + /sampler/status
+      # 9095 serves /metrics only (prometheus_client). GET /sampler/status
+      # is on the OTLP/HTTP port above (:4321).
+      - "9095:9095"
     healthcheck:
       test:
         - CMD
@@ -510,6 +512,34 @@ services:
       retries: 3
       start_period: 30s
 
+  # PC32 (T2.7.4): minimal "Sampler Policy History" dashboard. Prometheus is
+  # the only datasource; the dashboard is provisioned from
+  # infra/grafana/dashboards/ (no manual import). Host port 3001 — Langfuse
+  # already publishes host :3000.
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
 volumes:
   postgres_data:
   postgres_warm_data:
@@ -521,3 +551,4 @@ volumes:
   vault_data:
   phoenix_data:
   sampler_shared:
+  grafana_data:

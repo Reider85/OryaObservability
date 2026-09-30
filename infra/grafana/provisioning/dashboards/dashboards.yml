@@ -1,0 +1,13 @@
+# PC32: load dashboards from the read-only provisioning volume.
+apiVersion: 1
+
+providers:
+  - name: agent-obs
+    orgId: 1
+    folder: Agent Observability
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

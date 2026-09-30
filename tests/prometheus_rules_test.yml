@@ -1,8 +1,11 @@
-# promtool test rules for P21 recording rules.
+# promtool test rules for P21 recording rules + PC32 sampler alert.
 #
 # Run (inside the repo root):
-#   docker run --rm -v "%cd%/infra:/infra" -v "%cd%/tests:/tests" \
-#     prom/prometheus promtool test rules /tests/prometheus_rules_test.yml
+#   docker run --rm --entrypoint promtool -v "%cd%/infra:/infra" -v "%cd%/tests:/tests" \
+#     prom/prometheus test rules /tests/prometheus_rules_test.yml
+#
+# Recording-rule results carry __name__ on current Prometheus; expected labels
+# below include it deliberately.
 
 rule_files:
   - /infra/prometheus-rules.yml
@@ -22,7 +25,7 @@ tests:
       - expr: job:tail_sampler_kept_ratio:ratio
         eval_time: 1m
         exp_samples:
-          - labels: '{}'
+          - labels: '{__name__="job:tail_sampler_kept_ratio:ratio"}'
             value: 0.2
 
   # --- All kept -------------------------------------------------------------
@@ -37,7 +40,7 @@ tests:
       - expr: job:tail_sampler_kept_ratio:ratio
         eval_time: 1m
         exp_samples:
-          - labels: '{}'
+          - labels: '{__name__="job:tail_sampler_kept_ratio:ratio"}'
             value: 1
 
   # --- Keep reasons are distinguishable -------------------------------------
@@ -58,18 +61,18 @@ tests:
       - expr: job:tail_sampler_kept_ratio:ratio
         eval_time: 1m
         exp_samples:
-          - labels: '{}'
+          - labels: '{__name__="job:tail_sampler_kept_ratio:ratio"}'
             value: 0.2
       - expr: job:tail_sampler_kept_by_reason:ratio
         eval_time: 1m
         exp_samples:
-          - labels: '{reason="error-keep"}'
+          - labels: '{__name__="job:tail_sampler_kept_by_reason:ratio", reason="error-keep"}'
             value: 0.3
-          - labels: '{reason="cost-over-budget-keep"}'
+          - labels: '{__name__="job:tail_sampler_kept_by_reason:ratio", reason="cost-over-budget-keep"}'
             value: 0.2
-          - labels: '{reason="security-incident-keep"}'
+          - labels: '{__name__="job:tail_sampler_kept_by_reason:ratio", reason="security-incident-keep"}'
             value: 0.1
-          - labels: '{reason="normal-sample"}'
+          - labels: '{__name__="job:tail_sampler_kept_by_reason:ratio", reason="normal-sample"}'
             value: 0.4
 
   # --- Normal-sample-only case (10% keep rate) ------------------------------
@@ -84,12 +87,12 @@ tests:
       - expr: job:tail_sampler_kept_ratio:ratio
         eval_time: 1m
         exp_samples:
-          - labels: '{}'
+          - labels: '{__name__="job:tail_sampler_kept_ratio:ratio"}'
             value: 0.1
       - expr: job:tail_sampler_kept_by_reason:ratio
         eval_time: 1m
         exp_samples:
-          - labels: '{reason="normal-sample"}'
+          - labels: '{__name__="job:tail_sampler_kept_by_reason:ratio", reason="normal-sample"}'
             value: 1
 
   # --- PC21: cron scrape target is up --------------------------------------
@@ -204,7 +207,8 @@ tests:
               description: >-
                 Last successful run was 2d 3h 0m 0s ago (threshold 48h). Audit events are
                 past their 365-day retention window, or eval results are past their
-                14-day hot window, and the hot tier keeps growing past its ClickHouse TTL.
+                14-day hot window, or spans are past their 14-day hot window, and the hot
+                tier keeps growing past its ClickHouse TTL.
           - exp_labels:
               severity: warning
               job_name: cleanup_eval_results
@@ -213,7 +217,8 @@ tests:
               description: >-
                 Last successful run was 2d 3h 0m 0s ago (threshold 48h). Audit events are
                 past their 365-day retention window, or eval results are past their
-                14-day hot window, and the hot tier keeps growing past its ClickHouse TTL.
+                14-day hot window, or spans are past their 14-day hot window, and the hot
+                tier keeps growing past its ClickHouse TTL.
 
   # --- PC21: the staleness clock is driven by last_success, not run count ----
   - interval: 1m
@@ -221,8 +226,79 @@ tests:
     input_series:
       - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="cleanup_vault"}'
         # one success per hour, so the age never exceeds 1h
-        values: "0 3600 7200 10800 14400 18000 21600 25200 28800 32400+0x600"
+        values: "0 3600 7200 10800 14400 18000 21600 25200 28800+0x600"
     promql_expr_test:
       - expr: (time() - agent_obs_cron_last_success_timestamp_seconds{job_name="cleanup_vault"}) > 7200
         eval_time: 600m
         exp_samples: []
+
+  # --- PC32: sampler stuck at cpu_high 5% rate ------------------------------
+  # for: 30m means the alert latches one evaluation interval after the
+  # condition has held for the full half hour. Interval is 1m, so the first
+  # *firing* evaluation is at >= 30m.
+  - interval: 1m
+    name: cpu_high rate held below 30m stays pending (no page)
+    input_series:
+      - series: 'agent_obs_tail_sampler_current_rate{policy_reason="cpu_high"}'
+        values: "0.05+0x40"
+    promql_expr_test:
+      - expr: agent_obs_tail_sampler_current_rate{policy_reason="cpu_high"} == 0.05
+        eval_time: 25m
+        exp_samples:
+          - labels: '{__name__="agent_obs_tail_sampler_current_rate", policy_reason="cpu_high"}'
+            value: 0.05
+
+  - interval: 1m
+    name: cpu_high rate held past 30m fires SamplerRateStuckAtCpuHigh
+    input_series:
+      - series: 'agent_obs_tail_sampler_current_rate{policy_reason="cpu_high"}'
+        values: "0.05+0x60"
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: SamplerRateStuckAtCpuHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: sampler
+              policy_reason: cpu_high
+            exp_annotations:
+              summary: "tail sampler pinned at 5% (cpu_high) for over 30 minutes"
+              description: >-
+                agent_obs_tail_sampler_current_rate has been 0.05 with
+                policy_reason=cpu_high for more than 30 minutes. System CPU has
+                stayed above the policy threshold (default 0.8) the whole time, so
+                the sampler is keeping only 5% of normal traces. Scale the host or
+                investigate the load. Rate history: Grafana dashboard
+                "Sampler Policy History" (http://localhost:3001/d/sampler-policy-history);
+                audit rows via GET /audit/sampler-rate-history.
+
+  - interval: 1m
+    name: default rate never fires SamplerRateStuckAtCpuHigh
+    input_series:
+      - series: 'agent_obs_tail_sampler_current_rate{policy_reason="default"}'
+        values: "0.10+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SamplerRateStuckAtCpuHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: error_high 30% rate never fires SamplerRateStuckAtCpuHigh
+    input_series:
+      - series: 'agent_obs_tail_sampler_current_rate{policy_reason="error_high"}'
+        values: "0.30+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SamplerRateStuckAtCpuHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: cpu_high rate recovered away from 0.05 clears the alert
+    input_series:
+      # held at 0.05 for 20m, then the policy moves the rate up
+      - series: 'agent_obs_tail_sampler_current_rate{policy_reason="cpu_high"}'
+        values: "0.05+0x20 0.10+0x20"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: SamplerRateStuckAtCpuHigh
+        exp_alerts: []
