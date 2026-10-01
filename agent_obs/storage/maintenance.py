@@ -53,6 +53,7 @@ JOB_MIGRATE_TRACES = "migrate_traces_to_cold"
 JOB_DRIFT_DETECTION = "drift_detection"
 JOB_CALIBRATE_DRIFT_THRESHOLD = "calibrate_drift_threshold"
 JOB_EXPORT_EMBEDDINGS = "export_embeddings_to_phoenix"
+JOB_AGGREGATE_COMPLIANCE_CATALOG = "aggregate_compliance_catalog"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 365
 DEFAULT_EVAL_RETENTION_DAYS = 14

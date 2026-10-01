@@ -31,6 +31,7 @@ from agent_obs.storage.maintenance import (
     DEFAULT_AUDIT_RETENTION_DAYS,
     DEFAULT_EVAL_RETENTION_DAYS,
     DEFAULT_SPAN_RETENTION_DAYS,
+    JOB_AGGREGATE_COMPLIANCE_CATALOG,
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
@@ -1205,10 +1206,11 @@ class TestSchedulerJobTable:
             JOB_DRIFT_DETECTION,
             JOB_CALIBRATE_DRIFT_THRESHOLD,
             JOB_EXPORT_EMBEDDINGS,
+            JOB_AGGREGATE_COMPLIANCE_CATALOG,
         }
 
     def test_job_count_is_explicit(self):
-        assert len(scheduler.build_jobs()) == 8
+        assert len(scheduler.build_jobs()) == 9
 
     def test_drift_calibration_is_monthly(self):
         """PC26: calibration is monthly, never on the 15-minute detection cadence."""
@@ -1226,10 +1228,11 @@ class TestSchedulerJobTable:
         assert cadences[JOB_CLEANUP_AUDIT_EVENTS] == 86400
         assert cadences[JOB_CLEANUP_EVAL_RESULTS] == 86400
         assert cadences[JOB_MIGRATE_SPANS] == 86400
+        assert cadences[JOB_AGGREGATE_COMPLIANCE_CATALOG] == 86400
 
     def test_daily_jobs_are_staggered(self):
         specs = [job.spec for job in scheduler.build_jobs() if job.interval_seconds == 86400]
-        assert len(set(specs)) == 3, "daily jobs must not share a slot"
+        assert len(set(specs)) == 4, "daily jobs must not share a slot"
 
     def test_specs_are_valid(self):
         for job in scheduler.build_jobs():
@@ -1374,7 +1377,7 @@ class TestInfraCronConfig:
     def test_cron_alert_rules_exist(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
         alerts = {rule["alert"] for rule in group["rules"]}
-        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale"}
+        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale", "ComplianceCatalogAggregationStale", "ComplianceCatalogZeroActivity"}
 
     def test_staleness_thresholds_are_two_cycles(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
@@ -1542,9 +1545,11 @@ class TestEnvExample:
             "AGENT_OBS_CRON_AUDIT_SPEC",
             "AGENT_OBS_CRON_EVAL_SPEC",
             "AGENT_OBS_CRON_MIGRATION_SPEC",
+            "AGENT_OBS_CRON_COMPLIANCE_SPEC",
             "AGENT_OBS_CRON_AUDIT_RETENTION_DAYS",
             "AGENT_OBS_CRON_EVAL_RETENTION_DAYS",
             "AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS",
+            "AGENT_OBS_CRON_COMPLIANCE_RETENTION_DAYS",
             "AGENT_OBS_CRON_BATCH_SIZE",
             "AGENT_OBS_CRON_VAULT_DELETE_EXPIRED",
         ):

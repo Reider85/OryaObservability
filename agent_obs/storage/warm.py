@@ -356,6 +356,38 @@ class WarmStore:
             )
         return int(deleted) if deleted else 0
 
+    # PC34: Compliance catalog methods
+    async def get_all_compliance_catalog(self) -> list:
+        """Get all compliance catalog rows."""
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, agent_id, tool, field, pii_type, frequency, first_seen, last_seen "
+                "FROM compliance_catalog ORDER BY last_seen DESC"
+            )
+        return rows
+
+    async def delete_compliance_catalog_stale(self, stale_rows: list) -> int:
+        """Delete stale compliance catalog rows (older than retention days)."""
+        if not stale_rows:
+            return 0
+        
+        row_ids = [r["id"] for r in stale_rows]
+        
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            deleted = await conn.fetchval(
+                "DELETE FROM compliance_catalog WHERE id = ANY($1) RETURNING count(*)",
+                row_ids,
+            )
+        return int(deleted) if deleted else 0
+
+    async def refresh_compliance_views(self) -> None:
+        """Refresh compliance catalog views (no-op for CREATE OR REPLACE views)."""
+        # Views are CREATE OR REPLACE, so no explicit refresh needed
+        # This method is kept for consistency with other refresh patterns
+        pass
+
     async def close(self) -> None:
         """Close the connection pool."""
         if self._pool is not None:

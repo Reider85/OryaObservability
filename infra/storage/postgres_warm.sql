@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS compliance_catalog (
     field VARCHAR(255) NOT NULL,
     pii_type VARCHAR(50) NOT NULL, -- email, phone, inn, passport, payment, etc.
     frequency INTEGER DEFAULT 1, -- How many times this PII type has been masked
+    first_seen TIMESTAMP WITH TIME ZONE DEFAULT now(), -- When this PII type was first seen
     last_seen TIMESTAMP WITH TIME ZONE DEFAULT now(),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
@@ -161,6 +162,31 @@ BEGIN
     ORDER BY total_occurrences DESC;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Add first_seen column if not exists (populate from created_at)
+DO $$
+BEGIN
+    ALTER TABLE compliance_catalog ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
+    UPDATE compliance_catalog SET first_seen = created_at WHERE first_seen IS NULL;
+EXCEPTION WHEN duplicate_column THEN
+    NULL; -- already exists
+END $$;
+
+-- PC34: Views for compliance catalog aggregation
+CREATE OR REPLACE VIEW compliance_catalog_by_agent AS
+SELECT 
+    agent_id,
+    COUNT(*) as total_pii_count,
+    COUNT(DISTINCT pii_type) as distinct_pii_types
+FROM compliance_catalog 
+GROUP BY agent_id;
+
+CREATE OR REPLACE VIEW compliance_catalog_by_tool AS
+SELECT 
+    tool,
+    COUNT(*) as total_pii_count
+FROM compliance_catalog 
+GROUP BY tool;
 
 -- Table ownership/grants are handled by postgres_warm_init.sh, which the
 -- postgres entrypoint runs immediately after this file.

@@ -87,6 +87,30 @@ groups:
             (threshold 14d). Traces are past their 90-day warm window and not
             being moved to cold storage, which will eventually fill the warm tier.
 
+      - alert: ComplianceCatalogAggregationStale
+        expr: |
+          (time() - agent_obs_cron_last_success_timestamp_seconds{job_name="aggregate_compliance_catalog"}) > 172800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "aggregate_compliance_catalog has not succeeded for more than 2 daily cycles"
+          description: >-
+            Last successful run was {{ $value | humanizeDuration }} ago
+            (threshold 48h). Compliance catalog aggregation is stale, so stale
+            records are not being cleaned and views may be stale.
+
+      - alert: ComplianceCatalogZeroActivity
+        expr: increase(agent_obs_compliance_catalog_new_rows_24h[24h]) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "PII masking not working? Zero new catalog rows in 24h"
+          description: >-
+            No new compliance catalog rows in last 24 hours. Check guardrail
+            functionality and agent traffic. This may indicate broken PII masking.
+
   # PC25/PC26/PC27: Drift detection via KL-divergence on response embeddings.
   # The gauge agent_obs_drift_kl_score is emitted by the out-of-process cron
   # drift detection script (scripts/cron/drift_detection.py) every 15 minutes.

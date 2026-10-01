@@ -36,6 +36,7 @@ from agent_obs.storage.maintenance import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_EVAL_RETENTION_DAYS,
     DEFAULT_SPAN_RETENTION_DAYS,
+    JOB_AGGREGATE_COMPLIANCE_CATALOG,
     JOB_CALIBRATE_DRIFT_THRESHOLD,
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
@@ -56,6 +57,8 @@ from agent_obs.storage.maintenance import (
     run_cron_job,
     run_cron_job_async,
 )
+
+from agent_obs.compliance.aggregate import aggregate_compliance_catalog
 
 logging.basicConfig(
     level=os.environ.get("AGENT_OBS_LOG_LEVEL", "INFO"),
@@ -436,6 +439,21 @@ def _phoenix_export_job() -> Awaitable[Any]:
     return _runner()
 
 
+def _compliance_aggregation_job() -> Awaitable[Any]:
+    """PC34: daily compliance catalog aggregation.
+    
+    Updates last_seen, cleans stale records, refreshes views.
+    """
+    return _run_sync(
+        JOB_AGGREGATE_COMPLIANCE_CATALOG,
+        lambda: aggregate_compliance_catalog(
+            warm_store=build_warm_store(),
+            retention_days=int(os.environ.get("AGENT_OBS_CRON_COMPLIANCE_RETENTION_DAYS", 90)),
+            dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+        ),
+    )
+
+
 def build_jobs() -> list[CronJob]:
     """Return the configured job table.
 
@@ -491,6 +509,12 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_PHOENIX_SPEC", "*/5 * * * *"),  # Every 5 minutes
             _phoenix_export_job,
             300,  # 5 minutes
+        ),
+        CronJob(
+            JOB_AGGREGATE_COMPLIANCE_CATALOG,
+            os.environ.get("AGENT_OBS_CRON_COMPLIANCE_SPEC", "0 2 * * *"),  # 02:00 UTC daily
+            _compliance_aggregation_job,
+            86400,  # 24 hours
         ),
     ]
 
