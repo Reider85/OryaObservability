@@ -28,4 +28,6 @@ __all__ = [
     "PostgresCatalogWriter",
     "build_compliance_catalog",
     "parse_redacted_field",
+    "GDPRDataRow",
+    "export_data_map",
 ]
