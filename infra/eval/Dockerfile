@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir \
     torch
 
 # Copy agent_obs package
-COPY ../agent_obs/ /app/agent_obs/
+COPY ./agent_obs/ /app/agent_obs/
 
 # Copy requirements if available
 COPY ../pyproject.toml /app/

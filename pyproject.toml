@@ -40,6 +40,7 @@ dev = [
 api = [
     "fastapi>=0.111",
     "uvicorn>=0.30",
+    "pandas>=2.0",
 ]
 # PC21 tiered-retention cron jobs. Deliberately NOT runtime dependencies: the
 # SDK never writes to the warm or cold tier, only the out-of-process cron

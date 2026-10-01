@@ -1,0 +1,6 @@
+version: '3.8'
+
+services:
+  vault:
+    ports:
+      - "8201:8200"  # Remap to avoid collision with foreign llm-vault on 8200
