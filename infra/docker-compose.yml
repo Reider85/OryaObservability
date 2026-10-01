@@ -514,6 +514,30 @@ services:
       retries: 3
       start_period: 30s
 
+  # PC36: Compliance UI service for GDPR data map and compliance catalog
+  compliance-ui:
+    image: python:3.11-slim
+    restart: unless-stopped
+    environment:
+      - COMPLIANCE_UI_HOST=0.0.0.0
+      - COMPLIANCE_UI_PORT=8088
+      - COMPLIANCE_UI_USERNAME=${COMPLIANCE_UI_USERNAME:-admin}
+      - COMPLIANCE_UI_PASSWORD=${COMPLIANCE_UI_PASSWORD:-admin123}
+      - COMPLIANCE_UI_RELOAD=false
+    volumes:
+      - .:/app
+      - compliance_ui_cache:/tmp
+    ports:
+      - "8088:8088"
+    depends_on:
+      - postgres-warm
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/compliance/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
   # PC32 (T2.7.4): minimal "Sampler Policy History" dashboard. Prometheus is
   # the only datasource; the dashboard is provisioned from
   # infra/grafana/dashboards/ (no manual import). Host port 3001 — Langfuse
@@ -554,3 +578,4 @@ volumes:
   phoenix_data:
   sampler_shared:
   grafana_data:
+  compliance_ui_cache:

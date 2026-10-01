@@ -115,7 +115,7 @@ if (-not $NoWait) {
 
     $services = @('postgres', 'redis', 'clickhouse', 'minio', 'langfuse',
                    'vault', 'eval-redis', 'postgres-warm', 'eval-worker',
-                   'cron', 'alertmanager', 'prometheus')
+                   'cron', 'alertmanager', 'prometheus', 'compliance-ui')
     $allHealthy = $true
 
     foreach ($svc in $services) {
@@ -147,6 +147,7 @@ Write-Host "    Vault UI           : http://localhost:8200"  -ForegroundColor Wh
 Write-Host "    ClickHouse HTTP    : http://localhost:8123"  -ForegroundColor White
 Write-Host "    ClickHouse native  : localhost:9004"          -ForegroundColor White
 Write-Host "    MinIO              : in-network minio:9000 (not published to host)" -ForegroundColor White
+Write-Host "    Compliance UI      : http://localhost:8088"  -ForegroundColor White
 Write-Host "    Cron Metrics       : http://localhost:9777"  -ForegroundColor White
 Write-Host "    Alertmanager       : http://localhost:9093"  -ForegroundColor White
 Write-Host ""

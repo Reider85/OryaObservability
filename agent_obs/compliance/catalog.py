@@ -11,7 +11,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 
 from prometheus_client import Counter, Gauge
 
@@ -296,6 +296,47 @@ class ComplianceCatalog:
                 len(rows),
                 exc_info=True,
             )
+
+    def get_filtered_rows(
+        self,
+        agent_id: Optional[str] = None,
+        tool: Optional[str] = None,
+        pii_type: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> list[ComplianceRow]:
+        """Get compliance rows with optional filtering.
+        
+        Returns a list of ComplianceRow objects from the current buffer.
+        Note: This is in-memory only and doesn't include flushed data.
+        """
+        rows = []
+        
+        for (row_agent_id, row_tool, row_field, row_pii_type), frequency in self._buffer.items():
+            # Apply filters
+            if agent_id and row_agent_id != agent_id:
+                continue
+            if tool and row_tool != tool:
+                continue
+            if pii_type and row_pii_type != pii_type:
+                continue
+            # Date filtering is not implemented for in-memory buffer
+            if start_date or end_date:
+                # For now, include all rows when date filters are specified
+                # In a real implementation, you'd need timestamp data
+                pass
+            
+            rows.append(ComplianceRow(
+                agent_id=row_agent_id,
+                tool=row_tool,
+                field=row_field,
+                pii_type=row_pii_type,
+                frequency=frequency
+            ))
+        
+        # Sort by frequency (descending)
+        rows.sort(key=lambda x: x.frequency, reverse=True)
+        return rows
 
     async def close(self) -> None:
         """Stop the flush worker, drain the buffer, close the writer."""

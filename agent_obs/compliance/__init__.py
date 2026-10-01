@@ -15,12 +15,16 @@ from agent_obs.compliance.catalog import (
     build_compliance_catalog,
     parse_redacted_field,
 )
+from agent_obs.compliance.gdpr_export import (
+    GDPRDataRow,
+    export_data_map,
+)
 
 __all__ = [
     "ComplianceAggregationResult",
     "JOB_AGGREGATE_COMPLIANCE_CATALOG",
     "aggregate_compliance_catalog",
-    "register_compliance_aggregation_job",
+    "register_compliance_agpliance_job",
     "ComplianceCatalog",
     "ComplianceRow",
     "CatalogWriter",
@@ -30,4 +34,5 @@ __all__ = [
     "parse_redacted_field",
     "GDPRDataRow",
     "export_data_map",
+    "ui",
 ]
