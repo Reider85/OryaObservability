@@ -133,16 +133,21 @@ async def get_trace_eval_results(
     trace_id: str = Path(..., description="The trace ID to query for eval results")
 ) -> EvalResultResponse:
     """Get all evaluation results for a specific trace.
-    
-    Returns eval results from ClickHotse (primary) with Redis fallback.
+
+    Returns eval results from ClickHouse (primary) with Redis fallback.
     Returns empty list if no eval results found for the trace.
     """
     try:
-        # Create mock redis client for now (in production this would be configured)
+        from agent_obs.storage.hot import HotStore
+
+        # Create hot store (ClickHouse) — same pattern as the sampler
+        # rate-history endpoint. Redis fallback stays optional until a
+        # production Redis connection is wired up here.
+        hot_store = HotStore()
         redis_client = None
-        
+
         # Get eval results from ClickHouse with Redis fallback
-        eval_results = await get_eval_results(trace_id, redis_client=redis_client)
+        eval_results = await get_eval_results(trace_id, hot_store, redis_client=redis_client)
         
         # Convert to dict for JSON serialization
         eval_results_dict = [

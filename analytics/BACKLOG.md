@@ -287,11 +287,11 @@
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
 | T2.4.1 | Развёртывание Redis + RQ workers (отдельный процесс, не в агенте) | **TODO** | `PC03` |
-| T2.4.2 | RuleBasedEvaluator (regex, JSON-schema, blacklist) — синхронно | **TODO** | `PC09` |
-| T2.4.3 | LLMJudgeEvaluator с промптами для faithfulness, answer_relevancy, completeness | **TODO** | `PC10` |
-| T2.4.4 | EmbeddingEvaluator — cosine similarity до golden-ответа | **TODO** | `PC11` |
-| T2.4.5 | Late annotation: после завершения эвал-джобы, результат пишется в Hot store (ClickHouse) с trace_id ключом | **TODO** | `PC12` |
-| T2.4.6 | UI: показать eval-результат в trace-viewer в отдельной панели (если ещё не пришёл — показать «pending») | **TODO** | `PC13` |
+| T2.4.2 | RuleBasedEvaluator (regex, JSON-schema, blacklist) — синхронно; интеграция в SDK → `eval.rule_based` | **DONE** | `PC09` |
+| T2.4.3 | LLMJudgeEvaluator с промптами для faithfulness, answer_relevancy, completeness; `eval.pending` на root-span | **DONE** | `PC10` |
+| T2.4.4 | EmbeddingEvaluator — cosine similarity до golden-ответа | **DONE** | `PC11` |
+| T2.4.5 | Late annotation: после завершения эвал-джобы, результат пишется в Hot store (ClickHouse) с trace_id ключом | **DONE** | `PC12` |
+| T2.4.6 | UI: показать eval-результат в trace-viewer в отдельной панели (если ещё не пришёл — показать «pending») | **DONE** (mapping + Query API + docs; screenshot pending live stand) | `PC13` |
 #### E2.5 — Drift detector на embeddings
 
 **ТРИЗ-обоснование.** Стандарт 1.1.5 (замена вещества полем): ручная проверка → автоматический embedding-detection аномалий. Принцип 15 (динамичность): baseline-окно скользит, не фиксируется раз и навсегда.

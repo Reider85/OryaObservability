@@ -40,6 +40,56 @@ class TestEvalAPI:
                 "eval_results": []
             }
 
+    def test_get_trace_eval_results_passes_hot_store(
+        self, client: TestClient
+    ) -> None:
+        """Regression: endpoint must pass hot_store to get_eval_results.
+
+        The endpoint used to call ``get_eval_results(trace_id,
+        redis_client=...)`` without the required ``hot_store`` argument,
+        which raised ``TypeError`` in production.  The existing tests
+        mocked ``get_eval_results`` entirely, so the bad call signature
+        never surfaced.  Here only ``HotStore`` is mocked — the real
+        ``get_eval_results`` runs against it.
+        """
+        from agent_obs.eval.base import EvalResult
+        from agent_obs.observability import _now
+
+        mock_store = MagicMock()
+        mock_store.get_eval_results.return_value = [
+            EvalResult(
+                trace_id="trace-hot",
+                eval_id="eval-1",
+                eval_name="rule_based",
+                eval_version="1.0.0",
+                eval_timestamp=_now(),
+                eval_latency_seconds=0.01,
+                scores={"rules_passed": 4, "rules_failed": 0},
+            )
+        ]
+
+        with patch("agent_obs.storage.hot.HotStore", return_value=mock_store):
+            # agent_obs.eval.api.get_eval_results is intentionally NOT
+            # mocked — the real signature must accept this call.
+            response = client.get("/traces/trace-hot/evals")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["trace_id"] == "trace-hot"
+        assert len(data["eval_results"]) == 1
+        assert data["eval_results"][0]["eval_name"] == "rule_based"
+        mock_store.get_eval_results.assert_called_once_with("trace-hot")
+
+    def test_get_trace_eval_results_works_without_hot_store_arg(
+        self, client: TestClient
+    ) -> None:
+        """hot_store is optional in get_eval_results (degraded mode)."""
+        from agent_obs.eval.late_annotation import get_eval_results as real_get
+        import inspect
+
+        params = inspect.signature(real_get).parameters
+        assert params["hot_store"].default is None
+
     def test_get_trace_eval_results_with_results(self, client: TestClient) -> None:
         """Test getting eval results for trace with results."""
         # Mock the get_eval_results function to return sample results

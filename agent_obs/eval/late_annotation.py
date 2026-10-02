@@ -143,7 +143,7 @@ async def annotate_with_fallback(
 
 async def get_eval_results(
     trace_id: str,
-    hot_store: HotStore | None,
+    hot_store: HotStore | None = None,
     redis_client: Any | None = None,
 ) -> list[EvalResult]:
     """Retrieve eval results for a trace, checking Redis fallback if needed.

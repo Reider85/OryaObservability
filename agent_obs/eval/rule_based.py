@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -11,6 +13,82 @@ from typing import Any, Pattern
 import jsonschema
 from agent_obs.eval.base import BaseEvaluator, EvalResult
 from agent_obs.observability import Span
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EVAL_RULES_PATH = "configs/eval_rules.yaml"
+
+#: Repository root (agent_obs/eval/rule_based.py -> parents[2]).
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+
+def resolve_eval_rules_path(path: str = DEFAULT_EVAL_RULES_PATH) -> str:
+    """Anchor a relative eval-rules path to the repo root.
+
+    The agent process does not necessarily share a working directory with
+    the repository, so a bare ``configs/eval_rules.yaml`` would resolve
+    differently for each. Anchoring to the package location keeps every
+    consumer pointed at the same file.
+    """
+    if os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return path
+    return os.path.join(PROJECT_ROOT, path)
+
+
+def load_eval_rules(path: str = DEFAULT_EVAL_RULES_PATH) -> list[Rule]:
+    """Load rule definitions from a YAML config file.
+
+    Returns an empty list when the file is missing or malformed — a bad
+    config must never block span export (fail-open, like the guardrail's
+    classification path).
+    """
+    import yaml
+
+    resolved = resolve_eval_rules_path(path)
+    try:
+        with open(resolved, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("Failed to load eval rules from %s: %s", resolved, exc)
+        return []
+
+    raw_rules = document.get("rules") if isinstance(document, dict) else None
+    if not isinstance(raw_rules, list):
+        logger.warning("No 'rules' list in eval rules config %s", resolved)
+        return []
+
+    rules: list[Rule] = []
+    for entry in raw_rules:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            rules.append(
+                Rule(
+                    name=str(entry["name"]),
+                    field=str(entry["field"]),
+                    rule_type=str(entry["rule_type"]),
+                    params=dict(entry.get("params") or {}),
+                )
+            )
+        except KeyError as exc:
+            logger.warning(
+                "Skipping malformed eval rule in %s (missing %s)", resolved, exc
+            )
+    return rules
+
+
+def load_rule_based_evaluator(
+    path: str = DEFAULT_EVAL_RULES_PATH,
+) -> RuleBasedEvaluator | None:
+    """Build a RuleBasedEvaluator from a YAML config, or None if unusable."""
+    rules = load_eval_rules(path)
+    if not rules:
+        return None
+    return RuleBasedEvaluator(rules=rules)
 
 
 @dataclass

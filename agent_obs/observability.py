@@ -304,7 +304,7 @@ class ObservabilitySDK:
     ``config["guardrail_enabled"] = False``.
     """
 
-    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None, guardrail: "GuardrailEngine | None" = None):
+    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None, guardrail: "GuardrailEngine | None" = None, rule_based_evaluator: Any | None = None, llm_judge: Any | None = None):
         self._exporters = exporters
 
         # Priority: explicit enabled parameter > config > environment variable
@@ -350,6 +350,14 @@ class ObservabilitySDK:
                 "Guardrail active: PII masking before enqueue, "
                 "pre-call injection checks on llm_call/tool_call"
             )
+        # PC09/PC12: optional evaluators.  Supplied instances are active
+        # unless explicitly disabled by env/config (guardrail pattern); with
+        # no instance supplied the SDK stays eval-free unless
+        # AGENT_OBS_EVAL_RULES_ENABLED opts into loading configs/eval_rules.yaml.
+        self._rule_based_evaluator = self._setup_rule_based_evaluator(
+            rule_based_evaluator, config
+        )
+        self._llm_judge = self._setup_llm_judge(llm_judge, config)
         if self.enabled:
             if self._exporters:
                 self._worker_task = asyncio.create_task(self._export_worker())
@@ -415,6 +423,77 @@ class ObservabilitySDK:
         raw = os.environ.get(_GUARDRAIL_ENABLED_ENV, "true")
         return str(raw).strip().lower() in ("true", "1", "yes", "on")
 
+    @staticmethod
+    def _eval_flag(
+        config: dict | None, config_key: str, env_name: str, default: str
+    ) -> bool:
+        """Read an eval on/off switch (PC09/PC12).
+
+        Priority: ``config[config_key]`` > ``env_name`` env var > *default*.
+        """
+        if config is not None and config_key in config:
+            return bool(config[config_key])
+        raw = os.environ.get(env_name, default)
+        return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+    @classmethod
+    def _setup_rule_based_evaluator(
+        cls, evaluator: Any | None, config: dict | None
+    ) -> Any | None:
+        """Resolve the rule-based evaluator (PC09).
+
+        A supplied instance is active unless ``AGENT_OBS_EVAL_RULES_ENABLED``
+        disables it (guardrail pattern).  Without a supplied instance the
+        SDK stays eval-free unless the env flag opts in — then rules are
+        loaded from ``configs/eval_rules.yaml``.  A broken config degrades
+        to "no evaluator", never to a crash.
+        """
+        if evaluator is not None:
+            enabled = cls._eval_flag(
+                config, "eval_rules_enabled", "AGENT_OBS_EVAL_RULES_ENABLED", "true"
+            )
+            return evaluator if enabled else None
+
+        enabled = cls._eval_flag(
+            config, "eval_rules_enabled", "AGENT_OBS_EVAL_RULES_ENABLED", "false"
+        )
+        if not enabled:
+            return None
+        try:
+            from agent_obs.eval.rule_based import load_rule_based_evaluator
+
+            loaded = load_rule_based_evaluator()
+        except Exception:
+            logger.warning(
+                "Failed to load eval rules from configs/eval_rules.yaml; "
+                "rule-based eval disabled",
+                exc_info=True,
+            )
+            return None
+        if loaded is None:
+            logger.warning(
+                "AGENT_OBS_EVAL_RULES_ENABLED set but no usable rules in "
+                "configs/eval_rules.yaml; rule-based eval disabled"
+            )
+        else:
+            logger.info("Rule-based eval active (configs/eval_rules.yaml)")
+        return loaded
+
+    @classmethod
+    def _setup_llm_judge(cls, judge: Any | None, config: dict | None) -> Any | None:
+        """Resolve the LLM judge (PC10/PC12).
+
+        Unlike rule-based, there is no auto-load path: a judge needs a
+        client/queue configuration, so it only runs when supplied.  The
+        env flag can still disable a supplied instance.
+        """
+        if judge is None:
+            return None
+        enabled = cls._eval_flag(
+            config, "llm_judge_enabled", "AGENT_OBS_LLM_JUDGE_ENABLED", "true"
+        )
+        return judge if enabled else None
+
     def _build_context(
         self,
         agent_id: str,
@@ -442,6 +521,7 @@ class ObservabilitySDK:
         the caller.  If the buffer is full, the span is dropped and counted.
         """
         await self._apply_guardrail(span)
+        self._apply_rule_based_eval(span)
 
         # PC24: extract response embedding before the span enters the ring
         # buffer.  Embeddings go to ClickHouse through a separate queue so
@@ -570,6 +650,36 @@ class ObservabilitySDK:
             span.attributes["pii.total_entities"] = len(redacted_fields)
             entity_types = {f.split(".")[1] for f in redacted_fields}
             span.attributes["pii.entity_types"] = sorted(entity_types)
+
+    def _apply_rule_based_eval(self, span: Span) -> None:
+        """Run the rule-based evaluator on a span before export (PC09).
+
+        Runs after guardrail masking, so ``no_pii_in_output`` only flags PII
+        the guardrail missed — exactly the critical signal PC09 wants.  The
+        result is stored as a plain dict (``rules_passed`` / ``rules_failed``
+        / ``flags``), the shape ``otlp_mapping.enrich_eval_attributes``
+        consumes.
+
+        Fail-open: an evaluator error is logged and the span is exported
+        without the attribute — observability never blocks business logic.
+        """
+        evaluator = self._rule_based_evaluator
+        if evaluator is None:
+            return
+        try:
+            result = evaluator.evaluate(span, [])
+            span.attributes["eval.rule_based"] = {
+                "rules_passed": int(result.scores.get("rules_passed", 0)),
+                "rules_failed": int(result.scores.get("rules_failed", 0)),
+                "flags": list(result.flags),
+            }
+        except Exception:
+            logger.warning(
+                "Rule-based eval failed for span %s; exporting without "
+                "eval.rule_based",
+                span.context.span_id,
+                exc_info=True,
+            )
 
     async def _guard_call(
         self,
@@ -989,11 +1099,55 @@ class ObservabilitySDK:
                 finally:
                     span.end_time = _now()
                     _active_span_context.reset(token)
+                    await self._apply_llm_judge_pending(span)
                     await self._enqueue(span)
 
             return wrapper
 
         return decorator
+
+    async def _apply_llm_judge_pending(self, span: Span) -> None:
+        """Queue an LLM-judge job and stamp the root span (PC10/PC12).
+
+        The judge only runs when one was supplied to the SDK.  ``evaluate``
+        enqueues the job in RQ (no network call to the judge model) and
+        returns a pending placeholder — the real result arrives via late
+        annotation keyed by trace_id, so the closed span itself is never
+        modified afterwards.  Until then the span carries
+        ``eval.pending=True`` and ``eval.llm_judge.status`` so the
+        trace-viewer can render a PENDING badge (PC13).
+
+        Fail-open: any judge/queue error is logged; the span is exported
+        without eval attributes.
+        """
+        judge = self._llm_judge
+        if judge is None:
+            return
+        try:
+            # Children are already enqueued (and in last_spans) at this
+            # point; the root span itself is not yet, so add it explicitly
+            # to give the judge the full trace context.
+            trace_id = span.context.trace_id
+            full_trace = [
+                s for s in self.last_spans if s.context.trace_id == trace_id
+            ]
+            full_trace.append(span)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, judge.evaluate, span, full_trace
+            )
+            if getattr(result, "eval_name", "") == "llm_judge_pending":
+                span.attributes["eval.pending"] = True
+                span.attributes["eval.llm_judge.status"] = "pending"
+            elif getattr(result, "eval_name", "") == "llm_judge_skipped":
+                span.attributes["eval.llm_judge.status"] = "skipped"
+        except Exception:
+            logger.warning(
+                "LLM judge enqueue failed for trace %s; exporting without "
+                "eval.pending",
+                span.context.trace_id,
+                exc_info=True,
+            )
 
     def _atexit_handler(self) -> None:
         try:
