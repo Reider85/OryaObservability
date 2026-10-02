@@ -65,7 +65,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_CONTENT_RATE` | `10` | Percent of traces keeping full prompt/response text. |
 | `AGENT_OBS_GUARDRAIL_ENABLED` | `true` | Enable guardrail when engine is supplied. |
 | `AGENT_OBS_PII_DETECTORS` | `email,phone,inn,passport,payment` | Comma-separated PII detector types. |
-| `AGENT_OBS_PII_ML_ENABLED` | `false` | Enable Presidio ML-based PII detection. |
+| `AGENT_OBS_PII_ML_ENABLED` | `false` | Enable ML-based PII detection. Currently uses MockAnalyzer (keyword stub) for ФИО/addresses/medical conditions. Real Presidio integration deferred. |
 | `AGENT_OBS_INJECTION_MODEL` | `deepset/deberta-v3-base-prompt-injection` | HuggingFace model for injection classification. |
 | `AGENT_OBS_FAIL_ON_CONFIG` | `1` | 1 = fail fast on missing Langfuse config; 0 = degrade to stdout exporter. |
 | `TAIL_SAMPLER_COST_THRESHOLD` | `0.05` | USD threshold for keeping traces 100%. |
@@ -93,3 +93,4 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 - Tests in `tests/test_guardrail_engine.py` use a `PIIMatch` from `pii_detector.py` (local re-definition), not from `pii_types.py`. The two classes are structurally identical but not the same type — don't mix imports in tests without checking.
 - The injection classifier loads the HuggingFace model lazily on first `classify()` call. First call is slow (cold-start). In tests, always mock `InjectionClassifier` — never let it download real weights.
 - `tests/test_cron_jobs.py` and `tests/test_cron_cold_migration.py` hang at test execution (even on a clean tree, even for a single mocked test) on some Windows machines — pre-existing environment issue, not caused by local changes. Don't wait on them; verify related code via other test files.
+- ML PII detection (when `AGENT_OBS_PII_ML_ENABLED=true`) currently uses MockAnalyzer (keyword stub) with hardcoded ФИО/addresses/medical conditions. Real Presidio integration requires `presidio-analyzer` and `spacy` dependencies (currently declared but unused).
