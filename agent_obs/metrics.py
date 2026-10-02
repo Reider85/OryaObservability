@@ -119,6 +119,26 @@ cron_last_success_timestamp_seconds = Gauge(
     ["job_name"],
 )
 
+# --- PC22 Hot→Warm migration metrics ---
+migration_hot_to_warm_rows_total = Counter(
+    "agent_obs_migration_hot_to_warm_rows_total",
+    "Trace rows migrated from hot to warm tier",
+    ["job_name"],
+)
+
+migration_hot_to_warm_duration_seconds = Histogram(
+    "agent_obs_migration_hot_to_warm_duration_seconds",
+    "Hot-to-warm migration job wall-clock duration",
+    ["job_name"],
+    buckets=[1, 5, 15, 30, 60, 300, 900, 3600],
+)
+
+migration_hot_to_warm_errors_total = Counter(
+    "agent_obs_migration_hot_to_warm_errors_total",
+    "Errors during hot-to-warm migration",
+    ["job_name"],
+)
+
 # --- PC23 Warm→Cold migration metrics ---
 migration_warm_to_cold_files_total = Counter(
     "agent_obs_migration_warm_to_cold_files_total",

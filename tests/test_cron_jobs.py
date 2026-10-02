@@ -914,15 +914,16 @@ class TestMigrateSpansToWarm:
         warm_store.insert_traces.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_default_retention_is_7_days(self, hot_store, warm_store):
-        assert DEFAULT_SPAN_RETENTION_DAYS == 7
+    async def test_default_retention_is_14_days(self, hot_store, warm_store):
+        """PC22: spans older than 14 days are migrated to warm."""
+        assert DEFAULT_SPAN_RETENTION_DAYS == 14
         hot_store.get_spans_older_than.side_effect = [[], []]
 
         await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
 
         before = datetime.now(timezone.utc)
         cutoff = hot_store.get_spans_older_than.call_args[0][0]
-        assert (before - timedelta(days=14) - cutoff).total_seconds() < 5
+        assert abs((before - timedelta(days=14) - cutoff).total_seconds()) < 5
 
     @pytest.mark.asyncio
     async def test_eval_avg_is_empty_dict(self, hot_store, warm_store):
@@ -950,6 +951,45 @@ class TestMigrateSpansToWarm:
         rows = warm_store.insert_traces.call_args[0][0]
         assert rows[0]["error_count"] == 1
         assert rows[0]["span_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_metrics_increment_on_success(self, hot_store, warm_store):
+        """PC22: migration_hot_to_warm_rows_total / duration_seconds must move."""
+        from agent_obs.metrics import (
+            migration_hot_to_warm_duration_seconds,
+            migration_hot_to_warm_rows_total,
+        )
+
+        before_rows = migration_hot_to_warm_rows_total.labels(job_name=JOB_MIGRATE_SPANS)._value.get()
+        before_dur = migration_hot_to_warm_duration_seconds.labels(job_name=JOB_MIGRATE_SPANS)._sum.get()
+
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        assert migration_hot_to_warm_rows_total.labels(job_name=JOB_MIGRATE_SPANS)._value.get() > before_rows
+        assert migration_hot_to_warm_duration_seconds.labels(job_name=JOB_MIGRATE_SPANS)._sum.get() > before_dur
+
+    @pytest.mark.asyncio
+    async def test_errors_metric_increments_on_failure(self, hot_store, warm_store):
+        """PC22: migration_hot_to_warm_errors_total must count warm failures."""
+        from agent_obs.metrics import migration_hot_to_warm_errors_total
+
+        warm_store.insert_traces.side_effect = Exception("warm postgres down")
+        before = migration_hot_to_warm_errors_total.labels(job_name=JOB_MIGRATE_SPANS)._value.get()
+
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
+
+        assert migration_hot_to_warm_errors_total.labels(job_name=JOB_MIGRATE_SPANS)._value.get() > before
+
+    @pytest.mark.asyncio
+    async def test_dry_run_emits_duration_but_no_rows(self, hot_store, warm_store):
+        """Dry-run still observes duration; no rows are counted as migrated."""
+        from agent_obs.metrics import migration_hot_to_warm_rows_total
+
+        before = migration_hot_to_warm_rows_total.labels(job_name=JOB_MIGRATE_SPANS)._value.get()
+
+        await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store, dry_run=True)
+
+        assert migration_hot_to_warm_rows_total.labels(job_name=JOB_MIGRATE_SPANS)._value.get() == before
 
 
 class TestWarmStoreColumns:
@@ -1316,6 +1356,96 @@ class TestSchedulerJobTable:
         assert seen["delete_expired"] is False
 
 
+class TestMigrationRetry:
+    """PC22: migration is retried 3 times at 30-minute intervals."""
+
+    @pytest.fixture
+    def warm(self):
+        store = MagicMock()
+        store.close = AsyncMock()
+        return store
+
+    def _job(self, warm, monkeypatch, **env):
+        monkeypatch.setenv("AGENT_OBS_CRON_MIGRATION_RETRY_DELAY_SECONDS", "0")
+        for k, v in env.items():
+            monkeypatch.setenv(k, str(v))
+        with patch("scheduler.build_hot_store"), patch("scheduler.build_warm_store", return_value=warm):
+            job = next(j for j in scheduler.build_jobs() if j.name == JOB_MIGRATE_SPANS)
+            return job
+
+    @pytest.mark.asyncio
+    async def test_retries_three_times_then_gives_up(self, warm, monkeypatch):
+        monkeypatch.setenv("AGENT_OBS_CRON_MIGRATION_MAX_ATTEMPTS", "3")
+        monkeypatch.setenv("AGENT_OBS_CRON_MIGRATION_RETRY_DELAY_SECONDS", "0")
+        calls = []
+
+        async def failing(*args, **kwargs):
+            calls.append(1)
+            return None
+
+        with patch("scheduler.build_hot_store"), patch(
+            "scheduler.build_warm_store", return_value=warm
+        ), patch("scheduler.run_cron_job_async", side_effect=failing):
+            job = next(j for j in scheduler.build_jobs() if j.name == JOB_MIGRATE_SPANS)
+            result = await job.invoke()
+
+        assert result is None
+        assert len(calls) == 3
+        warm.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_success_on_second_attempt_short_circuits(self, warm, monkeypatch):
+        monkeypatch.setenv("AGENT_OBS_CRON_MIGRATION_MAX_ATTEMPTS", "3")
+        monkeypatch.setenv("AGENT_OBS_CRON_MIGRATION_RETRY_DELAY_SECONDS", "0")
+        calls = []
+
+        async def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                return None
+            return TraceWarmResult(traces_migrated=1)
+
+        with patch("scheduler.build_hot_store"), patch(
+            "scheduler.build_warm_store", return_value=warm
+        ), patch("scheduler.run_cron_job_async", side_effect=flaky):
+            job = next(j for j in scheduler.build_jobs() if j.name == JOB_MIGRATE_SPANS)
+            result = await job.invoke()
+
+        assert isinstance(result, TraceWarmResult)
+        assert len(calls) == 2
+        warm.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_delay_defaults_to_thirty_minutes(self, warm, monkeypatch):
+        """No env override -> sleep 1800s between attempts (PC22: каждые 30 минут)."""
+        monkeypatch.delenv("AGENT_OBS_CRON_MIGRATION_RETRY_DELAY_SECONDS", raising=False)
+        monkeypatch.delenv("AGENT_OBS_CRON_MIGRATION_MAX_ATTEMPTS", raising=False)
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        async def failing(*args, **kwargs):
+            return None
+
+        # NB: patch through the already-imported `scheduler` module object — a
+        # string target like "scripts.cron.scheduler.asyncio.sleep" would import
+        # scripts.cron.scheduler into sys.modules here, and the later compliance
+        # test (which relies on a *fresh* import inside its own patch context)
+        # would then bind the real functions instead of its mocks.
+        with patch("scheduler.build_hot_store"), patch(
+            "scheduler.build_warm_store", return_value=warm
+        ), patch("scheduler.run_cron_job_async", side_effect=failing), patch.object(
+            scheduler.asyncio, "sleep", side_effect=fake_sleep
+        ):
+            job = next(j for j in scheduler.build_jobs() if j.name == JOB_MIGRATE_SPANS)
+            result = await job.invoke()
+
+        assert result is None
+        # 3 attempts -> sleeps between attempt 1-2 and 2-3
+        assert sleeps == [1800, 1800]
+
+
 # ---------------------------------------------------------------------------
 # Infra wiring
 # ---------------------------------------------------------------------------
@@ -1332,7 +1462,7 @@ class TestInfraCronConfig:
         assert service["environment"]["AGENT_OBS_CRON_AUDIT_RETENTION_DAYS"] == "${AGENT_OBS_CRON_AUDIT_RETENTION_DAYS:-365}"
         assert service["environment"]["AGENT_OBS_CRON_EVAL_RETENTION_DAYS"] == "${AGENT_OBS_CRON_EVAL_RETENTION_DAYS:-14}"
         assert service["environment"]["AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS"] == "${AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS:-14}"
-        assert service["environment"]["AGENT_OBS_CRON_MIGRATION_SPEC"] == "${AGENT_OBS_CRON_MIGRATION_SPEC:-0 4 * * *}"
+        assert service["environment"]["AGENT_OBS_CRON_MIGRATION_SPEC"] == "${AGENT_OBS_CRON_MIGRATION_SPEC:-0 3 * * *}"
 
     def test_cron_uses_the_same_clickhouse_credentials_as_the_server(self, compose):
         """Regression: mismatched defaults made every job fail auth (Code 516).
@@ -1377,7 +1507,21 @@ class TestInfraCronConfig:
     def test_cron_alert_rules_exist(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
         alerts = {rule["alert"] for rule in group["rules"]}
-        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale", "ComplianceCatalogAggregationStale", "ComplianceCatalogZeroActivity"}
+        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale", "ComplianceCatalogAggregationStale", "ComplianceCatalogZeroActivity", "CronMigrationHotToWarmFailed"}
+
+    def test_daily_stale_includes_the_span_migration(self, rules):
+        """PC22: migrate_spans_to_warm must be covered by CronDailyJobStale."""
+        group = next(g for g in rules["groups"] if g["name"] == "cron")
+        rule = next(r for r in group["rules"] if r["alert"] == "CronDailyJobStale")
+        assert "migrate_spans_to_warm" in rule["expr"]
+
+    def test_migration_failure_alert_after_three_retries(self, rules):
+        """PC22: after 3 failed retries (3x30min) an alert must fire."""
+        group = next(g for g in rules["groups"] if g["name"] == "cron")
+        rule = next(r for r in group["rules"] if r["alert"] == "CronMigrationHotToWarmFailed")
+        assert "agent_obs_cron_errors_total" in rule["expr"]
+        assert "migrate_spans_to_warm" in rule["expr"]
+        assert ">= 3" in rule["expr"]
 
     def test_staleness_thresholds_are_two_cycles(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")

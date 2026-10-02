@@ -59,7 +59,7 @@ groups:
         expr: |
           (
             time() - agent_obs_cron_last_success_timestamp_seconds{
-              job_name=~"cleanup_audit_events|cleanup_eval_results"
+              job_name=~"cleanup_audit_events|cleanup_eval_results|migrate_spans_to_warm"
             }
           ) > 172800
         for: 5m
@@ -73,6 +73,21 @@ groups:
             window, or eval results are past their 14-day hot window, or spans
             are past their 14-day hot window, and the hot tier keeps growing past
             its ClickHouse TTL.
+
+      # PC22: after the 3 retries (3x30min) inside one cycle have all failed,
+      # page well before the 48h CronDailyJobStale threshold.
+      - alert: CronMigrationHotToWarmFailed
+        expr: increase(agent_obs_cron_errors_total{job_name="migrate_spans_to_warm"}[2h]) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "migrate_spans_to_warm failed 3 times within 2h"
+          description: >-
+            The hot-to-warm migration exhausted its 3 retries (PC22: every 30
+            minutes). Postgres warm is likely unreachable. Spans past their
+            14-day hot window are accumulating in ClickHouse and will be lost
+            once the hot TTL expires.
 
       - alert: CronWeeklyJobStale
         expr: |

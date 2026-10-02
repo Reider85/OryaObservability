@@ -18,7 +18,7 @@ import os
 import sys
 
 from agent_obs.storage.maintenance import (
-    DEFAULT_SPAN_RETENTION_DAYS,
+    DEFAULT_COLD_RETENTION_DAYS,
     JOB_MIGRATE_TRACES,
     TraceColdResult,
     build_cold_trace_store,
@@ -42,7 +42,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--retention-days",
         type=int,
         default=int(
-            os.environ.get("AGENT_OBS_CRON_COLD_RETENTION_DAYS", DEFAULT_SPAN_RETENTION_DAYS)
+            os.environ.get("AGENT_OBS_CRON_COLD_RETENTION_DAYS", DEFAULT_COLD_RETENTION_DAYS)
         ),
         help="Warm-tier retention for traces in days (default 90)",
     )

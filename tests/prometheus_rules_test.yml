@@ -175,25 +175,31 @@ tests:
         values: "0+0x600"
       - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="cleanup_eval_results"}'
         values: "0+0x600"
+      - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="migrate_spans_to_warm"}'
+        values: "0+0x600"
     promql_expr_test:
-      - expr: (time() - agent_obs_cron_last_success_timestamp_seconds{job_name=~"cleanup_audit_events|cleanup_eval_results"}) > 172800
+      - expr: (time() - agent_obs_cron_last_success_timestamp_seconds{job_name=~"cleanup_audit_events|cleanup_eval_results|migrate_spans_to_warm"}) > 172800
         eval_time: 8h
         exp_samples: []
 
   - interval: 1m
-    name: daily jobs past 2 cycles -> both alerts fire
+    name: daily jobs past 2 cycles -> all three alerts fire
     input_series:
       - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="cleanup_audit_events"}'
         values: "0+0x4000"
       - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="cleanup_eval_results"}'
         values: "0+0x4000"
+      - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="migrate_spans_to_warm"}'
+        values: "0+0x4000"
     promql_expr_test:
-      - expr: (time() - agent_obs_cron_last_success_timestamp_seconds{job_name=~"cleanup_audit_events|cleanup_eval_results"}) > 172800
+      - expr: (time() - agent_obs_cron_last_success_timestamp_seconds{job_name=~"cleanup_audit_events|cleanup_eval_results|migrate_spans_to_warm"}) > 172800
         eval_time: 51h
         exp_samples:
           - labels: '{job_name="cleanup_audit_events"}'
             value: 183600
           - labels: '{job_name="cleanup_eval_results"}'
+            value: 183600
+          - labels: '{job_name="migrate_spans_to_warm"}'
             value: 183600
     alert_rule_test:
       - eval_time: 51h
@@ -219,6 +225,39 @@ tests:
                 past their 365-day retention window, or eval results are past their
                 14-day hot window, or spans are past their 14-day hot window, and the hot
                 tier keeps growing past its ClickHouse TTL.
+          - exp_labels:
+              severity: warning
+              job_name: migrate_spans_to_warm
+            exp_annotations:
+              summary: "migrate_spans_to_warm has not succeeded for more than 2 daily cycles"
+              description: >-
+                Last successful run was 2d 3h 0m 0s ago (threshold 48h). Audit events are
+                past their 365-day retention window, or eval results are past their
+                14-day hot window, or spans are past their 14-day hot window, and the hot
+                tier keeps growing past its ClickHouse TTL.
+
+  # --- PC22: 3 failed hot->warm retries within 2h -> alert ------------------
+  # for: 5m with interval 1m: condition holds from ~minute 5, first firing
+  # evaluation at minute 10; eval_time 30m is well past that.
+  - interval: 1m
+    name: PC22 migration failed 3 times -> CronMigrationHotToWarmFailed fires
+    input_series:
+      - series: 'agent_obs_cron_errors_total{job_name="migrate_spans_to_warm"}'
+        values: "0+0x4 1 2 3+0x57"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CronMigrationHotToWarmFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job_name: migrate_spans_to_warm
+            exp_annotations:
+              summary: "migrate_spans_to_warm failed 3 times within 2h"
+              description: >-
+                The hot-to-warm migration exhausted its 3 retries (PC22: every 30
+                minutes). Postgres warm is likely unreachable. Spans past their
+                14-day hot window are accumulating in ClickHouse and will be lost
+                once the hot TTL expires.
 
   # --- PC21: the staleness clock is driven by last_success, not run count ----
   - interval: 1m

@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS spans_hot_local ON CLUSTER 'observability_cluster' (
 ENGINE = MergeTree()
 ORDER BY (tenant_id, agent_id, start_time)
 PARTITION BY toYYYYMMDD(start_time)
-TTL start_time + INTERVAL 14 DAY
-SETTINGS index_granularity = 8192;
+    TTL start_time + INTERVAL 21 DAY
+    SETTINGS index_granularity = 8192;
 
 -- Local table for eval_results_hot on shard 1
 CREATE TABLE IF NOT EXISTS eval_results_hot_local ON CLUSTER 'observability_cluster' (

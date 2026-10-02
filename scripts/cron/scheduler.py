@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable
 from agent_obs.storage.maintenance import (
     DEFAULT_AUDIT_RETENTION_DAYS,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_COLD_RETENTION_DAYS,
     DEFAULT_EVAL_RETENTION_DAYS,
     DEFAULT_SPAN_RETENTION_DAYS,
     JOB_AGGREGATE_COMPLIANCE_CATALOG,
@@ -79,7 +80,7 @@ FULL_DOM = set(FIELD_RANGES[2])
 # connections at the same instant.
 DAILY_AUDIT_SPEC = "17 3 * * *"
 DAILY_EVAL_SPEC = "47 3 * * *"
-DAILY_MIGRATION_SPEC = "0 4 * * *"
+DAILY_MIGRATION_SPEC = "0 3 * * *"
 WEEKLY_COLD_SPEC = "17 4 * * 0"  # Sunday 04:17 UTC, staggered off daily migration
 # PC26: threshold calibration runs once a month, just after the weekly cold
 # migration and well clear of the daily jobs' window.
@@ -293,22 +294,44 @@ def _eval_job() -> Awaitable[Any]:
 
 
 def _migration_job() -> Awaitable[Any]:
-    """Migrate spans older than 14d to warm tier; pool closed even on failure."""
+    """Migrate spans older than 14d to warm tier; pool closed even on failure.
+
+    PC22: if the warm (Postgres) backend is unavailable the run is deferred and
+    retried every 30 minutes, up to 3 attempts. After the final failure the
+    job reports failure (``cron_last_success_timestamp_seconds`` stays stale
+    and ``CronDailyJobStale`` / ``CronMigrationHotToWarmFailed`` fire).
+    """
     warm = build_warm_store()
+    max_attempts = _env_int("AGENT_OBS_CRON_MIGRATION_MAX_ATTEMPTS", 3)
+    retry_delay_seconds = _env_int("AGENT_OBS_CRON_MIGRATION_RETRY_DELAY_SECONDS", 1800)
 
     async def _runner() -> Any:
         try:
-            return await run_cron_job_async(
-                JOB_MIGRATE_SPANS,
-                migrate_spans_to_warm,
-                hot_store=build_hot_store(),
-                warm_store=warm,
-                retention_days=_env_int(
-                    "AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS", DEFAULT_SPAN_RETENTION_DAYS
-                ),
-                batch_size=_env_int("AGENT_OBS_CRON_BATCH_SIZE", DEFAULT_BATCH_SIZE),
-                dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+            for attempt in range(1, max_attempts + 1):
+                result = await run_cron_job_async(
+                    JOB_MIGRATE_SPANS,
+                    migrate_spans_to_warm,
+                    hot_store=build_hot_store(),
+                    warm_store=warm,
+                    retention_days=_env_int(
+                        "AGENT_OBS_CRON_MIGRATION_RETENTION_DAYS", DEFAULT_SPAN_RETENTION_DAYS
+                    ),
+                    batch_size=_env_int("AGENT_OBS_CRON_BATCH_SIZE", DEFAULT_BATCH_SIZE),
+                    dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+                )
+                if result is not None:
+                    return result
+                if attempt < max_attempts:
+                    logger.warning(
+                        "%s attempt %d/%d failed, retrying in %ds",
+                        JOB_MIGRATE_SPANS, attempt, max_attempts, retry_delay_seconds,
+                    )
+                    await asyncio.sleep(retry_delay_seconds)
+            logger.error(
+                "%s: all %d attempts failed (last retry after %ds)",
+                JOB_MIGRATE_SPANS, max_attempts, retry_delay_seconds,
             )
+            return None
         finally:
             await warm.close()
 
@@ -328,7 +351,7 @@ def _cold_migration_job() -> Awaitable[Any]:
                 warm_store=warm,
                 cold_store=cold,
                 retention_days=_env_int(
-                    "AGENT_OBS_CRON_COLD_RETENTION_DAYS", DEFAULT_SPAN_RETENTION_DAYS
+                    "AGENT_OBS_CRON_COLD_RETENTION_DAYS", DEFAULT_COLD_RETENTION_DAYS
                 ),
                 max_partition_rows=_env_int("AGENT_OBS_CRON_MAX_PARTITION_ROWS", 200_000),
                 dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),

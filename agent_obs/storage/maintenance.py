@@ -41,6 +41,13 @@ from agent_obs.metrics import (
     cron_last_success_timestamp_seconds,
     cron_rows_deleted_total,
     cron_runs_total,
+    migration_hot_to_warm_duration_seconds,
+    migration_hot_to_warm_errors_total,
+    migration_hot_to_warm_rows_total,
+    migration_warm_to_cold_bytes_total,
+    migration_warm_to_cold_duration_seconds,
+    migration_warm_to_cold_files_total,
+    migration_warm_to_cold_rows_total,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,7 +64,8 @@ JOB_AGGREGATE_COMPLIANCE_CATALOG = "aggregate_compliance_catalog"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 90
 DEFAULT_EVAL_RETENTION_DAYS = 7
-DEFAULT_SPAN_RETENTION_DAYS = 7
+DEFAULT_SPAN_RETENTION_DAYS = 14
+DEFAULT_COLD_RETENTION_DAYS = 90
 DEFAULT_BATCH_SIZE = 10_000
 DEFAULT_MAX_EVENTS = 1000
 VAULT_PREFIX = "pii/"
@@ -680,7 +688,11 @@ async def migrate_spans_to_warm(
 
     Ordering rule: **ship first, delete second.** If the warm upsert fails, the
     hot rows are left untouched and retried on the next cycle.
+
+    PC22 metrics: ``migration_hot_to_warm_rows_total``,
+    ``migration_hot_to_warm_duration_seconds``, ``migration_hot_to_warm_errors_total``.
     """
+    started = time.monotonic()
     result = TraceWarmResult()
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
@@ -714,6 +726,19 @@ async def migrate_spans_to_warm(
         if len(spans) < batch_size:
             break
 
+    migration_hot_to_warm_duration_seconds.labels(job_name=JOB_MIGRATE_SPANS).observe(
+        time.monotonic() - started
+    )
+    if not dry_run:
+        if result.traces_migrated:
+            migration_hot_to_warm_rows_total.labels(job_name=JOB_MIGRATE_SPANS).inc(
+                result.traces_migrated
+            )
+        if result.errors:
+            migration_hot_to_warm_errors_total.labels(job_name=JOB_MIGRATE_SPANS).inc(
+                result.errors
+            )
+
     logger.info(
         "migrate_spans_to_warm: scanned_spans=%d traces_migrated=%d traces_deleted=%d errors=%d",
         result.scanned_spans, result.traces_migrated, result.traces_deleted, result.errors,
@@ -724,7 +749,7 @@ async def migrate_spans_to_warm(
 async def migrate_traces_to_cold(
     warm_store: Any,
     cold_store: Any,
-    retention_days: int = DEFAULT_SPAN_RETENTION_DAYS,
+    retention_days: int = DEFAULT_COLD_RETENTION_DAYS,
     max_partition_rows: int = 200_000,
     dry_run: bool = False,
 ) -> TraceColdResult:
@@ -740,6 +765,7 @@ async def migrate_traces_to_cold(
     import pyarrow as pa
     from agent_obs.storage.cold import parq_key
 
+    started = time.monotonic()
     result = TraceColdResult()
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
@@ -878,6 +904,23 @@ async def migrate_traces_to_cold(
                 logger.error("migrate_traces_to_cold: delete of %s failed: %s", prefix, str(e))
                 result.errors += 1
 
+    migration_warm_to_cold_duration_seconds.labels(job_name=JOB_MIGRATE_TRACES).observe(
+        time.monotonic() - started
+    )
+    if not dry_run:
+        if result.files:
+            migration_warm_to_cold_files_total.labels(job_name=JOB_MIGRATE_TRACES).inc(
+                result.files
+            )
+        if result.rows:
+            migration_warm_to_cold_rows_total.labels(job_name=JOB_MIGRATE_TRACES).inc(
+                result.rows
+            )
+        if result.bytes_written:
+            migration_warm_to_cold_bytes_total.labels(job_name=JOB_MIGRATE_TRACES).inc(
+                result.bytes_written
+            )
+
     logger.info(
         "migrate_traces_to_cold: partitions=%d files=%d rows=%d bytes=%d deleted=%d errors=%d",
         result.partitions, result.files, result.rows, result.bytes_written,
@@ -923,6 +966,7 @@ __all__ = [
     "AUDIT_ARCHIVE_SCHEMA_FIELDS",
     "DEFAULT_AUDIT_RETENTION_DAYS",
     "DEFAULT_BATCH_SIZE",
+    "DEFAULT_COLD_RETENTION_DAYS",
     "DEFAULT_EVAL_RETENTION_DAYS",
     "DEFAULT_MAX_EVENTS",
     "DEFAULT_SPAN_RETENTION_DAYS",

@@ -270,7 +270,7 @@ class TestComplianceAggregationScheduler:
                 daily_specs.append(job.spec)
         
         # Compliance spec should be different from existing daily specs
-        existing_daily_specs = ["17 3 * * *", "47 3 * * *", "0 4 * * *"]  # From research
+        existing_daily_specs = ["17 3 * * *", "47 3 * * *", "0 3 * * *"]  # From research
         compliance_spec = "0 2 * * *"
         
         assert compliance_spec not in existing_daily_specs

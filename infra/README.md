@@ -202,6 +202,9 @@ docker compose exec cron python scripts/cron/scheduler.py --run-once
 | `agent_obs_cron_rows_deleted_total` | counter | `job_name` |
 | `agent_obs_cron_duration_seconds` | histogram | `job_name` |
 | `agent_obs_cron_last_success_timestamp_seconds` | gauge | `job_name` |
+| `agent_obs_migration_hot_to_warm_rows_total` | counter | `job_name` |
+| `agent_obs_migration_hot_to_warm_duration_seconds` | histogram | `job_name` |
+| `agent_obs_migration_hot_to_warm_errors_total` | counter | `job_name` |
 
 The last one only advances on a **successful** run, which is what makes the
 "missed run" detection possible across container restarts (a counter would reset
@@ -215,8 +218,12 @@ to zero on every restart).
 - `CronTargetDown` — `up{job="cron"} == 0` for 5 min (critical)
 - `CronHourlyJobStale` — `cleanup_vault` has not succeeded for more than
   2 cycles (2 h)
-- `CronDailyJobStale` — `cleanup_audit_events` / `cleanup_eval_results` have not
-  succeeded for more than 2 cycles (48 h)
+- `CronDailyJobStale` — `cleanup_audit_events` / `cleanup_eval_results` /
+  `migrate_spans_to_warm` have not succeeded for more than 2 cycles (48 h)
+- `CronMigrationHotToWarmFailed` — `migrate_spans_to_warm` failed 3 times
+  within 2 h (PC22: the 3×30 min retries inside one cycle all failed)
+- `CronWeeklyJobStale` — `migrate_traces_to_cold` has not succeeded for more
+  than 2 cycles (14 d)
 
 ```bash
 docker compose exec prometheus \

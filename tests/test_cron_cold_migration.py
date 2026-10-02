@@ -497,7 +497,15 @@ class TestInfraCronConfig:
     def test_cron_alert_rules_exist(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
         alerts = {rule["alert"] for rule in group["rules"]}
-        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale"}
+        assert alerts == {
+            "CronTargetDown",
+            "CronHourlyJobStale",
+            "CronDailyJobStale",
+            "CronWeeklyJobStale",
+            "ComplianceCatalogAggregationStale",
+            "ComplianceCatalogZeroActivity",
+            "CronMigrationHotToWarmFailed",
+        }
 
     def test_staleness_rules_read_the_success_gauge(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
