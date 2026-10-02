@@ -81,7 +81,7 @@ FULL_DOM = set(FIELD_RANGES[2])
 DAILY_AUDIT_SPEC = "17 3 * * *"
 DAILY_EVAL_SPEC = "47 3 * * *"
 DAILY_MIGRATION_SPEC = "0 3 * * *"
-WEEKLY_COLD_SPEC = "17 4 * * 0"  # Sunday 04:17 UTC, staggered off daily migration
+WEEKLY_COLD_SPEC = "0 4 * * 0"  # Sunday 04:00 UTC per PC23 spec
 # PC26: threshold calibration runs once a month, just after the weekly cold
 # migration and well clear of the daily jobs' window.
 MONTHLY_CALIBRATION_SPEC = "23 5 1 * *"  # 1st of the month, 05:23 UTC

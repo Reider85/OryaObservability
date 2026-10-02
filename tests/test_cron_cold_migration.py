@@ -4,6 +4,7 @@ Covers the cold migration job, the Parquet schema, the partitioning, the
 idempotency, the metrics, and the infra wiring (compose service, Prometheus rules).
 """
 
+import io
 import json
 import os
 import sys
@@ -120,13 +121,13 @@ class TestMigrateTracesToCold:
                 return [_trace_dict("t1", 91), _trace_dict("t2", 91), _trace_dict("t3", 91)]
             elif tenant_id == "tenant-1" and last_trace_id == "t3":
                 return [_trace_dict("t4", 91)]
-            elif tenant_id == "tenant-2":
+            elif tenant_id == "tenant-2" and last_trace_id == "":
                 return [_trace_dict("t5", 92), _trace_dict("t6", 92)]
             else:
                 return []
         
         async def delete_traces_side_effect(trace_ids):
-            return 4
+            return len(trace_ids)
         
         store.list_trace_partitions.side_effect = list_partitions_side_effect
         store.get_traces_for_partition.side_effect = get_traces_side_effect
@@ -149,7 +150,7 @@ class TestMigrateTracesToCold:
         assert result.files == 3
         assert result.rows == 6
         assert result.bytes_written == 3072  # 3 files * 1024 bytes
-        assert result.traces_deleted == 4
+        assert result.traces_deleted == 6  # 4 (tenant-1) + 2 (tenant-2)
         assert result.errors == 0
 
         # Verify prefix wipe before write
@@ -163,6 +164,8 @@ class TestMigrateTracesToCold:
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [
                 _trace_dict("t1", 91, agent_id="agent-a", eval_scores={"faithfulness": 0.8, "answer_relevancy": 0.9}, span_count=2, error_count=0),
                 _trace_dict("t2", 91, agent_id="agent-a", eval_scores={"faithfulness": 0.6, "answer_relevancy": 0.7}, span_count=1, error_count=0),
@@ -191,8 +194,9 @@ class TestMigrateTracesToCold:
         assert table.column("agent_id")[0].as_py() == "agent-a"
         assert table.column("traces_count")[0].as_py() == 2
         assert table.column("cost_usd_sum")[0].as_py() == pytest.approx(0.02)
-        assert table.column("eval_avg_faithfulness")[0].as_py() == pytest.approx(0.7)
-        assert table.column("eval_avg_relevancy")[0].as_py() == pytest.approx(0.8)
+        eval_a0 = table.column("eval_avg")[0].as_py()
+        assert eval_a0["faithfulness"] == pytest.approx(0.7)
+        assert eval_a0["relevancy"] == pytest.approx(0.8)
         assert table.column("users_count")[0].as_py() == 1
         assert table.column("error_rate")[0].as_py() == 0.0
 
@@ -200,8 +204,9 @@ class TestMigrateTracesToCold:
         assert table.column("agent_id")[1].as_py() == "agent-b"
         assert table.column("traces_count")[1].as_py() == 1
         assert table.column("cost_usd_sum")[1].as_py() == pytest.approx(0.01)
-        assert table.column("eval_avg_faithfulness")[1].as_py() == pytest.approx(0.9)
-        assert table.column("eval_avg_relevancy")[1].as_py() == pytest.approx(0.8)
+        eval_a1 = table.column("eval_avg")[1].as_py()
+        assert eval_a1["faithfulness"] == pytest.approx(0.9)
+        assert eval_a1["relevancy"] == pytest.approx(0.8)
         assert table.column("users_count")[1].as_py() == 1
         assert table.column("error_rate")[1].as_py() == pytest.approx(1/3)
 
@@ -211,6 +216,8 @@ class TestMigrateTracesToCold:
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [_trace_dict("t1", 91)]
         
         warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
@@ -227,7 +234,7 @@ class TestMigrateTracesToCold:
 
         await migrate_traces_to_cold(warm_store=warm_store, cold_store=cold_store)
 
-        # Verify schema
+        # Verify schema per PC23 spec
         table = tables_written[0]
         schema = table.schema
         assert schema.field("tenant_id").type == pa.string()
@@ -235,9 +242,13 @@ class TestMigrateTracesToCold:
         assert schema.field("day").type == pa.date32()
         assert schema.field("traces_count").type == pa.int32()
         assert schema.field("cost_usd_sum").type == pa.float64()
-        assert schema.field("eval_avg_faithfulness").type == pa.float64()
-        assert schema.field("eval_avg_relevancy").type == pa.float64()
-        assert schema.field("eval_avg_completeness").type == pa.float64()
+        assert schema.field("eval_avg").type == pa.struct(
+            [
+                ("faithfulness", pa.float64()),
+                ("relevancy", pa.float64()),
+                ("completeness", pa.float64()),
+            ]
+        )
         assert schema.field("users_count").type == pa.int32()
         assert schema.field("error_rate").type == pa.float64()
 
@@ -247,6 +258,8 @@ class TestMigrateTracesToCold:
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [_trace_dict("t1", 91)]
         
         warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
@@ -279,6 +292,8 @@ class TestMigrateTracesToCold:
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [_trace_dict("t1", 91)]
         
         warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
@@ -310,6 +325,8 @@ class TestMigrateTracesToCold:
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [_trace_dict("t1", 91)]
         
         warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
@@ -331,6 +348,8 @@ class TestMigrateTracesToCold:
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [_trace_dict("t1", 91)]
         
         warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
@@ -358,11 +377,34 @@ class TestMigrateTracesToCold:
         # (mocked to return empty, so no actual calls made)
 
     @pytest.mark.asyncio
+    async def test_empty_run_still_observes_duration(self, warm_store, cold_store):
+        """PC23: duration must be observed even when no partitions qualify,
+        so the histogram child exists in /metrics after any job run."""
+        async def list_partitions_empty(cutoff):
+            return []
+
+        warm_store.list_trace_partitions.side_effect = list_partitions_empty
+        before = migration_warm_to_cold_duration_seconds.labels(
+            job_name=JOB_MIGRATE_TRACES
+        )._sum.get()
+
+        result = await migrate_traces_to_cold(warm_store=warm_store, cold_store=cold_store)
+
+        after = migration_warm_to_cold_duration_seconds.labels(
+            job_name=JOB_MIGRATE_TRACES
+        )._sum.get()
+        assert after > before
+        assert result.partitions == 0
+        cold_store.write_parquet.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_metrics_increment(self, warm_store, cold_store):
         async def list_partitions_side_effect(cutoff):
             return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
         
         async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+            if last_trace_id:
+                return []  # keyset pagination: single page
             return [_trace_dict("t1", 91)]
         
         warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
@@ -383,47 +425,69 @@ class TestMigrateTracesToCold:
         assert migration_warm_to_cold_bytes_total.labels(job_name=JOB_MIGRATE_TRACES)._value.get() > before_bytes
         assert migration_warm_to_cold_duration_seconds.labels(job_name=JOB_MIGRATE_TRACES)._sum.get() > before_duration
 
-    @moto.mock_aws
     @pytest.mark.asyncio
     async def test_moto_round_trip(self):
-        # Setup mock S3
+        # moto is applied as a context manager below — the @moto.mock_aws
+        # decorator form wraps the coroutine into a sync function, which
+        # pytest-asyncio then refuses to run.
+        #
+        # Endpoint: moto only intercepts *.amazonaws.com URLs. The production
+        # default http://localhost:9000 bypasses the stub and would hit the
+        # real network, so S3_ENDPOINT is pointed at an AWS-shaped host.
         import boto3
         from moto import mock_aws
 
         with mock_aws():
-            s3_client = boto3.client("s3", endpoint_url="http://localhost:9000")
-            s3_client.create_bucket(Bucket="cold-traces")
-            
-            warm_store = MagicMock()
-            async def list_partitions_side_effect(cutoff):
-                return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
-            
-            async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
-                return [_trace_dict("t1", 91)]
-            
-            warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
-            warm_store.get_traces_for_partition.side_effect = get_traces_side_effect
-            warm_store.delete_traces.return_value = 1
+            with patch.dict(
+                os.environ,
+                {
+                    "S3_ENDPOINT": "http://s3.amazonaws.com",
+                    "S3_ACCESS_KEY": "testing",
+                    "S3_SECRET_KEY": "testing",
+                },
+            ):
+                s3_client = boto3.client("s3", region_name="us-east-1")
+                s3_client.create_bucket(Bucket="cold-traces")
 
-            cold_store = build_cold_trace_store()
+                warm_store = MagicMock()
+                async def list_partitions_side_effect(cutoff):
+                    return [("tenant-1", (datetime.now(timezone.utc) - timedelta(days=91)).date())]
 
-            # Run migration
-            await migrate_traces_to_cold(warm_store=warm_store, cold_store=cold_store)
+                async def get_traces_side_effect(tenant_id, day, last_trace_id, max_rows):
+                    if last_trace_id:
+                        return []  # keyset pagination: single page
+                    return [_trace_dict("t1", 91)]
 
-            # Verify object was written
-            objects = s3_client.list_objects_v2(Bucket="cold-traces")
-            assert len(objects.get("Contents", [])) == 1
-            key = objects["Contents"][0]["Key"]
-            
-            # Read back with pyarrow
-            response = s3_client.get_object(Bucket="cold-traces", Key=key)
-            table = pq.read_table(response["Body"])
-            
-            # Verify content
-            assert table.num_rows == 1
-            assert table.column("tenant_id")[0].as_py() == "tenant-1"
-            assert table.column("agent_id")[0].as_py() == "agent-1"
-            assert table.column("traces_count")[0].as_py() == 1
+                warm_store.list_trace_partitions.side_effect = list_partitions_side_effect
+                warm_store.get_traces_for_partition.side_effect = get_traces_side_effect
+                warm_store.delete_traces = AsyncMock(return_value=1)
+
+                cold_store = build_cold_trace_store()
+
+                # Run migration
+                await migrate_traces_to_cold(warm_store=warm_store, cold_store=cold_store)
+
+                # Verify object was written
+                objects = s3_client.list_objects_v2(Bucket="cold-traces")
+                assert len(objects.get("Contents", [])) == 1
+                key = objects["Contents"][0]["Key"]
+
+                # Read back with pyarrow (StreamingBody has no seek())
+                response = s3_client.get_object(Bucket="cold-traces", Key=key)
+                table = pq.read_table(io.BytesIO(response["Body"].read()))
+
+                # Verify content
+                assert table.num_rows == 1
+                assert table.column("tenant_id")[0].as_py() == "tenant-1"
+                assert table.column("agent_id")[0].as_py() == "agent-1"
+                assert table.column("traces_count")[0].as_py() == 1
+                assert table.schema.field("eval_avg").type == pa.struct(
+                    [
+                        ("faithfulness", pa.float64()),
+                        ("relevancy", pa.float64()),
+                        ("completeness", pa.float64()),
+                    ]
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +551,7 @@ class TestInfraCronConfig:
         assert "AGENT_OBS_CRON_COLD_SPEC" in env
         assert "AGENT_OBS_CRON_COLD_RETENTION_DAYS" in env
         assert "AGENT_OBS_CRON_MAX_PARTITION_ROWS" in env
-        assert env["AGENT_OBS_CRON_COLD_SPEC"] == "${AGENT_OBS_CRON_COLD_SPEC:-17 4 * * 0}"
+        assert env["AGENT_OBS_CRON_COLD_SPEC"] == "${AGENT_OBS_CRON_COLD_SPEC:-0 4 * * 0}"
         assert env["AGENT_OBS_CRON_COLD_RETENTION_DAYS"] == "${AGENT_OBS_CRON_COLD_RETENTION_DAYS:-90}"
 
     def test_cron_service_has_five_jobs_registered(self, compose):
@@ -542,11 +606,11 @@ class TestColdMigrationIntegration:
 
     def test_weekly_spec_is_valid(self):
         # Test the cron spec format directly
-        spec = "17 4 * * 0"  # Sunday 04:17
+        spec = "0 4 * * 0"  # Sunday 04:00 per PC23
         # Basic validation - just check the format
         parts = spec.split()
         assert len(parts) == 5
-        assert parts[0] == "17"  # minute
+        assert parts[0] == "0"   # minute
         assert parts[1] == "4"   # hour
         assert parts[2] == "*"   # day of month
         assert parts[3] == "*"   # month

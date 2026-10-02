@@ -773,6 +773,10 @@ async def migrate_traces_to_cold(
     partitions = await warm_store.list_trace_partitions(cutoff)
     if not partitions:
         logger.info("migrate_traces_to_cold: no partitions older than %d days", retention_days)
+        # Observe duration even on the empty path so the histogram child exists.
+        migration_warm_to_cold_duration_seconds.labels(job_name=JOB_MIGRATE_TRACES).observe(
+            time.monotonic() - started
+        )
         return result
 
     result.partitions = len(partitions)
@@ -802,7 +806,8 @@ async def migrate_traces_to_cold(
                         "day": day,
                         "traces_count": 0,
                         "cost_usd_sum": 0.0,
-                        "eval_avg": {},
+                        "eval_sums": {},
+                        "eval_counts": {},
                         "users_count": 0,
                         "user_hashes": set(),
                         "error_count": 0,
@@ -813,7 +818,8 @@ async def migrate_traces_to_cold(
                 agg["cost_usd_sum"] += row.get("cost_usd_total", 0.0)
                 if row.get("eval_avg"):
                     for key, val in row["eval_avg"].items():
-                        agg["eval_avg"][key] = agg["eval_avg"].get(key, 0.0) + val
+                        agg["eval_sums"][key] = agg["eval_sums"].get(key, 0.0) + val
+                        agg["eval_counts"][key] = agg["eval_counts"].get(key, 0) + 1
                 user_hash = row.get("user_hash", "")
                 if user_hash:
                     agg["user_hashes"].add(user_hash)
@@ -823,16 +829,35 @@ async def migrate_traces_to_cold(
                 last_trace_id = row["trace_id"]
                 partition_rows += 1
 
-            # Build Parquet table for this chunk
+            # Build Parquet table for this chunk.
+            # PC23 schema: eval_avg is a nested struct<faithfulness, relevancy,
+            # completeness>, traces_count/users_count are int32.
+            eval_avg_type = pa.struct(
+                [
+                    ("faithfulness", pa.float64()),
+                    ("relevancy", pa.float64()),
+                    ("completeness", pa.float64()),
+                ]
+            )
+            table_schema = pa.schema(
+                [
+                    pa.field("tenant_id", pa.string()),
+                    pa.field("agent_id", pa.string()),
+                    pa.field("day", pa.date32()),
+                    pa.field("traces_count", pa.int32()),
+                    pa.field("cost_usd_sum", pa.float64()),
+                    pa.field("eval_avg", eval_avg_type),
+                    pa.field("users_count", pa.int32()),
+                    pa.field("error_rate", pa.float64()),
+                ]
+            )
             table_data = {
                 "tenant_id": [],
                 "agent_id": [],
                 "day": [],
                 "traces_count": [],
                 "cost_usd_sum": [],
-                "eval_avg_faithfulness": [],
-                "eval_avg_relevancy": [],
-                "eval_avg_completeness": [],
+                "eval_avg": [],
                 "users_count": [],
                 "error_rate": [],
             }
@@ -842,18 +867,36 @@ async def migrate_traces_to_cold(
                 table_data["day"].append(agg["day"])
                 table_data["traces_count"].append(agg["traces_count"])
                 table_data["cost_usd_sum"].append(agg["cost_usd_sum"])
-                
-                # eval_avg struct with mapping: answer_relevancy -> relevancy
-                eval_avg = agg["eval_avg"]
-                table_data["eval_avg_faithfulness"].append(eval_avg.get("faithfulness", 0.0))
-                table_data["eval_avg_relevancy"].append(eval_avg.get("answer_relevancy", eval_avg.get("relevancy", 0.0)))
-                table_data["eval_avg_completeness"].append(eval_avg.get("completeness", 0.0))
-                
+
+                # eval_avg struct: per-key mean, not sum. answer_relevancy is
+                # the raw eval key; relevancy is the schema name.
+                eval_sums = agg["eval_sums"]
+                eval_counts = agg["eval_counts"]
+
+                def _mean(*keys: str) -> float:
+                    for key in keys:
+                        count = eval_counts.get(key, 0)
+                        if count:
+                            return eval_sums.get(key, 0.0) / count
+                    return 0.0
+
+                table_data["eval_avg"].append(
+                    {
+                        "faithfulness": _mean("faithfulness"),
+                        "relevancy": _mean("answer_relevancy", "relevancy"),
+                        "completeness": _mean("completeness"),
+                    }
+                )
+
                 table_data["users_count"].append(len(agg["user_hashes"]))
-                error_rate = agg["error_count"] / agg["span_count"] if agg["span_count"] > 0 else 0.0
+                error_rate = (
+                    agg["error_count"] / agg["span_count"]
+                    if agg["span_count"] > 0
+                    else 0.0
+                )
                 table_data["error_rate"].append(error_rate)
 
-            table = pa.table(table_data)
+            table = pa.table(table_data, schema=table_schema)
 
             # Write to S3
             prefix = f"tenant_id={tenant_id}/year={day.year}/month={day.month}/day={day.day}"
@@ -875,10 +918,6 @@ async def migrate_traces_to_cold(
                     logger.error("migrate_traces_to_cold: upload of %s failed, keeping warm rows: %s", prefix, str(e))
                     result.errors += 1
                     break
-
-            # Exit loop if this chunk was smaller than the limit (no more rows)
-            if len(rows) < max_partition_rows:
-                break
 
         # Delete all traces from this partition if successful
         if not dry_run and result.errors == 0:
@@ -907,19 +946,20 @@ async def migrate_traces_to_cold(
     migration_warm_to_cold_duration_seconds.labels(job_name=JOB_MIGRATE_TRACES).observe(
         time.monotonic() - started
     )
+    # Register the counter children unconditionally so they always appear in
+    # /metrics (value 0 until a real migration increments them). Previously
+    # .labels() was only called inside the truthy guards, so an empty run left
+    # the metric families defined but with no exposed children at all.
+    files_metric = migration_warm_to_cold_files_total.labels(job_name=JOB_MIGRATE_TRACES)
+    rows_metric = migration_warm_to_cold_rows_total.labels(job_name=JOB_MIGRATE_TRACES)
+    bytes_metric = migration_warm_to_cold_bytes_total.labels(job_name=JOB_MIGRATE_TRACES)
     if not dry_run:
         if result.files:
-            migration_warm_to_cold_files_total.labels(job_name=JOB_MIGRATE_TRACES).inc(
-                result.files
-            )
+            files_metric.inc(result.files)
         if result.rows:
-            migration_warm_to_cold_rows_total.labels(job_name=JOB_MIGRATE_TRACES).inc(
-                result.rows
-            )
+            rows_metric.inc(result.rows)
         if result.bytes_written:
-            migration_warm_to_cold_bytes_total.labels(job_name=JOB_MIGRATE_TRACES).inc(
-                result.bytes_written
-            )
+            bytes_metric.inc(result.bytes_written)
 
     logger.info(
         "migrate_traces_to_cold: partitions=%d files=%d rows=%d bytes=%d deleted=%d errors=%d",
