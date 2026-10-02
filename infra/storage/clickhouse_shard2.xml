@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <clickhouse_remote_servers>
+        <observability_cluster>
+            <shard>
+                <replica>
+                    <host>clickhouse</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>clickhouse2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </observability_cluster>
+    </clickhouse_remote_servers>
+
+    <http_server>
+        <listen_host>0.0.0.0</listen_host>
+        <listen_port>8123</listen_port>
+        <send_timeout>5</send_timeout>
+        <receive_timeout>5</receive_timeout>
+    </http_server>
+
+    <tcp_port>9000</tcp_port>
+
+    <interserver_http_port>9009</interserver_http_port>
+
+    <path>/var/lib/clickhouse</path>
+    <user_files_path>/var/lib/clickhouse/user_files</user_files_path>
+    <access_log>/var/log/clickhouse-server/access.log</access_log>
+    <error_log>/var/log/clickhouse-server/error.log</error_log>
+    <log_level>info</log_level>
+
+    <users>
+        <clickhouse>
+            <password>clickhouse</password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+        </clickhouse>
+        <observability_user>
+            <password>observability_password</password>
+            <profile>default</profile>
+            <quota>default</quota>
+        </observability_user>
+    </users>
+</clickhouse>

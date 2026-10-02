@@ -666,8 +666,8 @@ class TestArchiveAuditEvents:
         cold_store.write_parquet.assert_not_called()
         hot_store.delete_audit_events.assert_not_called()
 
-    def test_default_retention_is_365_days(self):
-        assert DEFAULT_AUDIT_RETENTION_DAYS == 365
+    def test_default_retention_is_90_days(self):
+        assert DEFAULT_AUDIT_RETENTION_DAYS == 90
 
     def test_retention_cutoff_reaches_the_query(self, hot_store, cold_store):
         hot_store.get_audit_events_older_than.side_effect = [[], []]
@@ -786,8 +786,8 @@ class TestMigrateEvalResults:
         warm_store.insert_eval_results.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_default_retention_is_14_days(self, hot_store, warm_store):
-        assert DEFAULT_EVAL_RETENTION_DAYS == 14
+    async def test_default_retention_is_7_days(self, hot_store, warm_store):
+        assert DEFAULT_EVAL_RETENTION_DAYS == 7
         hot_store.get_eval_results_older_than.side_effect = [[], []]
 
         await migrate_eval_results_to_warm(hot_store=hot_store, warm_store=warm_store)
@@ -914,8 +914,8 @@ class TestMigrateSpansToWarm:
         warm_store.insert_traces.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_default_retention_is_14_days(self, hot_store, warm_store):
-        assert DEFAULT_SPAN_RETENTION_DAYS == 14
+    async def test_default_retention_is_7_days(self, hot_store, warm_store):
+        assert DEFAULT_SPAN_RETENTION_DAYS == 7
         hot_store.get_spans_older_than.side_effect = [[], []]
 
         await migrate_spans_to_warm(hot_store=hot_store, warm_store=warm_store)
@@ -1094,7 +1094,7 @@ class TestHotStoreTieredQueries:
 
     def test_spans_select_returns_full_shape(self, store, clickhouse):
         now = datetime.now(timezone.utc)
-        # 13 columns: spans_hot has no response_embedding column.
+        # 14 columns: spans_hot includes response_embedding column.
         clickhouse.execute.return_value = [
             (
                 "trace-1", "span-1", "", "agent-1", "tenant-1",
@@ -1409,19 +1409,19 @@ class TestInfraCronConfig:
         # conflict target must be backed by a real unique constraint
         assert "PRIMARY KEY (trace_id, eval_id, eval_name, eval_timestamp)" in body
 
-    def test_audit_bucket_lifecycle_is_one_year(self):
-        """§3.4 ARCHITECT.md requires >= 1 year; PC21 archives into this bucket."""
+    def test_audit_bucket_lifecycle_is_90_days(self):
+        """PC01 requires 90 days for audit-events lifecycle; cold-traces remains 1 year."""
         lifecycle = json.loads(
             (REPO_ROOT / "infra" / "storage" / "s3_lifecycle.json").read_text(encoding="utf-8")
         )
         rules_by_id = {r["ID"]: r for r in lifecycle["Rules"]}
-        assert rules_by_id["audit-events-lifecycle"]["Expiration"]["Days"] == 365
+        assert rules_by_id["audit-events-lifecycle"]["Expiration"]["Days"] == 90
         assert rules_by_id["cold-traces-lifecycle"]["Expiration"]["Days"] == 365
 
     def test_minio_init_applies_the_same_expiry(self):
         script = (REPO_ROOT / "infra" / "storage" / "minio_init.sh").read_text(encoding="utf-8")
         audit_block = script.split("audit-events", 1)[1]
-        assert '"365"' in audit_block
+        assert '"90"' in audit_block
 
     def test_minio_init_uses_flags_mc_ilm_add_actually_accepts(self):
         """Regression: `mc ilm add` rejects unknown flags instead of ignoring them.
@@ -1523,8 +1523,8 @@ class TestInfraCronConfig:
         """PC22: spans_hot TTL must outlast the span migration trigger."""
         assert self._ddl_ttl_days("start_time") > DEFAULT_SPAN_RETENTION_DAYS
 
-    def test_cold_bucket_keeps_archived_audit_for_a_year(self):
-        """§3.4 ARCHITECT.md: the archived object must survive >= 1 year, which
+    def test_cold_bucket_keeps_archived_audit_for_90_days(self):
+        """PC01: the archived object must survive 90 days, which
         is measured from upload, i.e. after the hot TTL has expired."""
         ttl_days = self._ddl_ttl_days("timestamp")
         assert ttl_days > DEFAULT_AUDIT_RETENTION_DAYS
@@ -1532,7 +1532,7 @@ class TestInfraCronConfig:
             (REPO_ROOT / "infra" / "storage" / "s3_lifecycle.json").read_text(encoding="utf-8")
         )
         rules = {r["ID"]: r for r in lifecycle["Rules"]}
-        assert rules["audit-events-lifecycle"]["Expiration"]["Days"] >= 365
+        assert rules["audit-events-lifecycle"]["Expiration"]["Days"] >= 90
 
 
 class TestEnvExample:

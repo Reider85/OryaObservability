@@ -17,8 +17,11 @@
 set -e
 
 DDL_PATH="${DDL_PATH:-/docker-entrypoint-initdb.d/clickhouse_ddl.sql}"
+CLUSTER_CONFIG="${CLUSTER_CONFIG:-/init/cluster.xml}"
 CH_HOST="${CLICKHOUSE_HOST:-localhost}"
 CH_PORT="${CLICKHOUSE_PORT:-9000}"
+CH_HOST2="${CLICKHOUSE_HOST2:-clickhouse2}"
+CH_PORT2="${CLICKHOUSE_PORT2:-9000}"
 CH_USER="${CLICKHOUSE_USER:-clickhouse}"
 CH_PASSWORD="${CLICKHOUSE_PASSWORD:-clickhouse}"
 
@@ -31,25 +34,63 @@ client() {
         "$@"
 }
 
+client2() {
+    clickhouse-client \
+        --host "${CH_HOST2}" \
+        --port "${CH_PORT2}" \
+        --user "${CH_USER}" \
+        --password "${CH_PASSWORD}" \
+        "$@"
+}
+
 echo "Waiting for ClickHouse at ${CH_HOST}:${CH_PORT} as ${CH_USER}..."
 until client --query "SELECT 1" >/dev/null 2>&1; do
-    echo "ClickHouse is unavailable - sleeping"
+    echo "ClickHouse shard 1 is unavailable - sleeping"
     sleep 2
 done
-echo "ClickHouse is ready"
+echo "ClickHouse shard 1 is ready"
+
+echo "Waiting for ClickHouse at ${CH_HOST2}:${CH_PORT2} as ${CH_USER}..."
+until client2 --query "SELECT 1" >/dev/null 2>&1; do
+    echo "ClickHouse shard 2 is unavailable - sleeping"
+    sleep 2
+done
+echo "ClickHouse shard 2 is ready"
 
 # Pick up observability_user.xml from users.d on a running server.
-echo "Reloading ClickHouse config (users.d)..."
+echo "Reloading ClickHouse config (users.d) on both shards..."
 client --query "SYSTEM RELOAD CONFIG" || true
+client2 --query "SYSTEM RELOAD CONFIG" || true
 
-echo "Creating observability database..."
+echo "Creating observability database on both shards..."
 client --query "CREATE DATABASE IF NOT EXISTS observability"
+client2 --query "CREATE DATABASE IF NOT EXISTS observability"
 
-echo "Running DDL from ${DDL_PATH}..."
+echo "Setting up cluster configuration..."
+if [ -f "${CLUSTER_CONFIG}" ]; then
+    cp "${CLUSTER_CONFIG}" /etc/clickhouse-server/config.d/cluster.xml
+    client --query "SYSTEM RELOAD CONFIG"
+    client2 --query "SYSTEM RELOAD CONFIG"
+    echo "Cluster configuration loaded"
+fi
+
+echo "Running DDL from ${DDL_PATH} on both shards..."
 client --database=observability --multiquery < "${DDL_PATH}"
+client2 --database=observability --multiquery < "${DDL_PATH}"
 
-echo "Verifying tables..."
+echo "Verifying tables on shard 1..."
 client --database=observability --query "
+SELECT
+    name,
+    engine,
+    total_rows
+FROM system.tables
+WHERE database = 'observability'
+ORDER BY name
+"
+
+echo "Verifying tables on shard 2..."
+client2 --database=observability --query "
 SELECT
     name,
     engine,
@@ -67,4 +108,4 @@ WHERE name IN ('clickhouse', 'observability_user')
 ORDER BY name
 "
 
-echo "ClickHouse initialization completed successfully"
+echo "ClickHouse sharded initialization completed successfully"

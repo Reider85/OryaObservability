@@ -121,10 +121,10 @@ class TestEmbeddingQueueFull:
 # ---------------------------------------------------------------------------
 
 class TestFlushEmbeddingBatch:
-    """1C: spans_hot has no response_embedding column, so embeddings go to
-    the Redis TTL store only. ClickHouse writes return with1A/1B."""
+    """PC24: embeddings are written to ClickHouse spans_hot.response_embedding
+    column, with Redis fallback on failure."""
 
-    async def test_flush_uses_redis_only(self, sdk):
+    async def test_flush_uses_clickhouse_then_redis_fallback(self, sdk):
         batch = [
             ("trace-1", "span-1", [0.1, 0.2]),
             ("trace-2", "span-2", [0.3, 0.4]),
@@ -135,10 +135,14 @@ class TestFlushEmbeddingBatch:
              patch.object(sdk, "_embedding_redis_fallback", new_callable=AsyncMock) as mock_fallback:
             mock_stored.inc = MagicMock()
             mock_batch_size.observe = MagicMock()
+            
+            # Make ClickHouse write raise an exception to trigger Redis fallback
+            mock_hot_cls.return_value._get_client.return_value.execute.side_effect = Exception("ClickHouse failed")
 
             await sdk._flush_embedding_batch(batch)
 
-            mock_hot_cls.assert_not_called()
+            # Now writes to ClickHouse first, then Redis fallback on failure
+            mock_hot_cls.assert_called_once()
             mock_fallback.assert_called_once_with(batch)
             mock_stored.inc.assert_called_once_with(2)
             mock_batch_size.observe.assert_called_once_with(2)

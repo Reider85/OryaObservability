@@ -161,9 +161,8 @@ class HotStore:
     def write_spans_batch(self, spans: list[dict]) -> None:
         """Write a batch of span dicts to spans_hot table.
 
-        1C: spans_hot has no ``response_embedding`` column (Nullable(Array)
-        is illegal in ClickHouse). Extra keys on the span dicts (including
-        ``response_embedding``) are ignored.
+        Includes response_embedding Array(Float32) for drift detection (PC24).
+        In sharded setup, writes to Distributed table which routes to appropriate shard.
         """
         if not spans:
             return
@@ -185,6 +184,7 @@ class HotStore:
                     json.dumps(span.get("attributes", {})),
                     json.dumps(span.get("events", [])),
                     span.get("cost_usd", 0.0),
+                    span.get("response_embedding", []),
                 )
             )
         client.execute(
@@ -192,7 +192,7 @@ class HotStore:
             INSERT INTO spans_hot
             (trace_id, span_id, parent_span_id, agent_id, tenant_id, name,
              span_type, start_time, end_time, status, attributes, events,
-             cost_usd)
+             cost_usd, response_embedding)
             VALUES
             """,
             rows,
@@ -205,7 +205,7 @@ class HotStore:
             """
             SELECT trace_id, span_id, parent_span_id, agent_id, tenant_id, name,
                    span_type, start_time, end_time, status, attributes, events,
-                   cost_usd
+                   cost_usd, response_embedding
             FROM spans_hot
             WHERE trace_id = %s
             ORDER BY start_time ASC

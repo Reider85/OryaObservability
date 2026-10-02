@@ -126,8 +126,10 @@ services:
       - clickhouse_data:/var/lib/clickhouse
       - clickhouse_logs:/var/log/clickhouse-server
       # Mount name must match clickhouse_init.sh's default DDL_PATH.
-      - ./storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_ddl_sharded.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Cluster config for shard 1
+      - ./storage/clickhouse_cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
       # App user for HotStore/drift/phoenix. Defined via XML because the
       # compose-provisioned `clickhouse` account has no CREATE USER grant.
       - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
@@ -155,18 +157,58 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      clickhouse2:
+        condition: service_healthy
     environment:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_HOST2: clickhouse2
+      CLICKHOUSE_PORT2: "9000"
       # Admin account for DDL (same as the clickhouse service env). The app
       # user observability_user comes from users.d XML, not from SQL here.
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
       DDL_PATH: /init/clickhouse_ddl.sql
     volumes:
-      - ./storage/clickhouse_ddl.sql:/init/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_ddl_sharded.sql:/init/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/init/clickhouse_init.sh:ro
+      - ./storage/clickhouse_cluster.xml:/init/cluster.xml:ro
     entrypoint: ["/bin/bash", "/init/clickhouse_init.sh"]
+
+  # Second ClickHouse shard for sharding by tenant_id (PC01)
+  clickhouse2:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: observability
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_SHARD_NUM: 2
+    volumes:
+      - clickhouse_data2:/var/lib/clickhouse
+      - clickhouse_logs2:/var/log/clickhouse-server
+      # Mount local DDL and config for shard 2
+      - ./storage/clickhouse_ddl_sharded.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Cluster and shard configs
+      - ./storage/clickhouse_cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./storage/clickhouse_shard2.xml:/etc/clickhouse-server/config.d/shard2.xml:ro
+      # App user for HotStore/drift/phoenix. Defined via XML because the
+      # compose-provisioned `clickhouse` account has no CREATE USER grant.
+      - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "8124:8123"  # HTTP — host tools / DoD verification (separate from shard 1)
+      # Native TCP on a free host port. Host :9000 is commonly occupied by an
+      # unrelated MinIO/ClickHouse (other projects); publishing it here makes
+      # this container fail to start. In-network clients use clickhouse:9000.
+      - "9005:9000"
 
   minio:
     image: quay.io/minio/minio:latest
@@ -202,6 +244,8 @@ services:
       redis:
         condition: service_healthy
       clickhouse:
+        condition: service_healthy
+      clickhouse2:
         condition: service_healthy
       minio:
         condition: service_healthy
@@ -431,6 +475,8 @@ services:
     restart: unless-stopped
     depends_on:
       clickhouse:
+        condition: service_healthy
+      clickhouse2:
         condition: service_healthy
       postgres-warm:
         condition: service_healthy

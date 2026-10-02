@@ -1,0 +1,43 @@
+{
+  "acceptance_config": {
+    "infrastructure": {
+      "prometheus_url": "http://localhost:9091",
+      "langfuse_url": "http://localhost:3000",
+      "clickhouse_host": "localhost",
+      "clickhouse_port": 8123,
+      "postgres_host": "localhost",
+      "postgres_port": 5432,
+      "vault_url": "http://localhost:8201",
+      "redis_host": "localhost",
+      "redis_port": 6379
+    },
+    "test_data": {
+      "pii_patterns": [
+        "test@example.com",
+        "+1234567890",
+        "123-45-6789",
+        "AB123456",
+        "4111111111111111"
+      ],
+      "injection_examples": 200,
+      "pii_test_entities": 1000,
+      "trace_samples": 100
+    },
+    "thresholds": {
+      "c1_slo_coverage": 100,
+      "c2_mttr_minutes": 30,
+      "c3_pii_matches": 0,
+      "c4_drift_minutes": 15,
+      "c5_data_map_minutes": 5,
+      "c6_guardrail_ms": 5,
+      "c7_pii_recall_percent": 95,
+      "c8_injection_f1": 0.90,
+      "c9_eval_latency_ms": 0,
+      "c10_eval_annotation_seconds": 30,
+      "c11_hot_query_seconds": 1,
+      "c12_storage_cost_dollar_per_gb": 0.5,
+      "c13_overhead_reduction_percent": 50,
+      "c14_ideality": 1.5
+    }
+  }
+}

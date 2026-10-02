@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <remote_servers>
+        <observability_cluster>
+            <shard>
+                <replica>
+                    <host>clickhouse</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>clickhouse2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </observability_cluster>
+    </remote_servers>
+
+    <zookeeper>
+        <node>
+            <host>zookeeper</host>
+            <port>2181</port>
+        </node>
+    </zookeeper>
+
+    <network>
+        <send_timeout>5</send_timeout>
+        <receive_timeout>5</receive_timeout>
+        <send_queue_max_size>10000</send_queue_max_size>
+        <receive_queue_max_size>10000</receive_queue_max_size>
+        <max_connections>100</max_connections>
+        <keep_alive_timeout>3</keep_alive_timeout>
+    </network>
+
+    <logger>
+        <level>info</level>
+        <console>true</console>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+    </logger>
+</clickhouse>

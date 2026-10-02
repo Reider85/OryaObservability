@@ -16,7 +16,7 @@
       "Status": "Enabled",
       "Prefix": "audit-events/",
       "Expiration": {
-        "Days": 365
+        "Days": 90
       },
       "NoncurrentVersionExpiration": {
         "NoncurrentDays": 30

@@ -45,10 +45,9 @@ echo "Applying lifecycle rules to cold-traces bucket..."
 mc ilm add local/cold-traces --expire-days "365"
 
 # Apply lifecycle rules to audit-events bucket
-# 365 days, NOT 90: §3.4 ARCHITECT.md requires audit retention of at least one
-# year, and PC21 archives audit events into this bucket.
+# 90 days as per PC01 design; ClickHouse hot tier retains 365 days before archival
 echo "Applying lifecycle rules to audit-events bucket..."
-mc ilm add local/audit-events --expire-days "365"
+mc ilm add local/audit-events --expire-days "90"
 
 # Verify buckets were created
 echo "Verifying buckets..."

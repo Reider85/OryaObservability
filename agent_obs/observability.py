@@ -799,11 +799,8 @@ class ObservabilitySDK:
     ) -> None:
         """Persist a batch of (trace_id, span_id, embedding) tuples.
 
-        1C: ``spans_hot`` has no ``response_embedding`` column —
-        Nullable(Array) is illegal in ClickHouse — so embeddings go to the
-        Redis TTL store only. ClickHouse persistence returns when the column
-        is reintroduced as ``Array(Float32) DEFAULT []`` (1A) or embeddings
-        move out of ClickHouse entirely (1B).
+        Writes to ClickHouse spans_hot.response_embedding first, then falls back
+        to Redis if ClickHouse is unavailable (PC24).
         """
         from agent_obs.metrics import (
             embeddings_batch_size,
@@ -814,8 +811,39 @@ class ObservabilitySDK:
             return
 
         embeddings_batch_size.observe(len(batch))
-        await self._embedding_redis_fallback(batch)
+        
+        try:
+            # Try ClickHouse first
+            await self._embedding_clickhouse_write(batch)
+        except Exception as e:
+            logger.warning("ClickHouse write failed, falling back to Redis: %s", e)
+            await self._embedding_redis_fallback(batch)
+        
         embeddings_stored_total.inc(len(batch))
+
+    async def _embedding_clickhouse_write(
+        self, batch: list[tuple[str, str, list[float]]]
+    ) -> None:
+        """Write embeddings to ClickHouse spans_hot.response_embedding column.
+        
+        In sharded setup, writes to Distributed table which routes to appropriate shard.
+        """
+        from agent_obs.storage.hot import HotStore
+        
+        hot_store = HotStore()
+        client = hot_store._get_client()
+        
+        rows = []
+        for trace_id, span_id, embedding in batch:
+            rows.append((trace_id, span_id, embedding))
+        
+        client.execute(
+            """
+            INSERT INTO spans_hot (trace_id, span_id, response_embedding)
+            VALUES
+            """,
+            rows,
+        )
 
     async def _embedding_redis_fallback(
         self, batch: list[tuple[str, str, list[float]]]
