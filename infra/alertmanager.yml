@@ -21,17 +21,16 @@ route:
     # group_interval here provides the 30-min dedup window.
     - matchers:
         - component="drift-detector"
-      receiver: default
+      receiver: slack
       group_by: [alertname, agent_id]
       group_wait: 30s
       group_interval: 30m
       repeat_interval: 2h
 
-    # A missed cron cycle is a warning; a job that has been failing repeatedly
-    # is escalated so it does not get lost in the noise of a single blip.
+    # PC27: critical alerts go to Slack for on-call response.
     - matchers:
         - severity="critical"
-      receiver: default
+      receiver: slack
       group_wait: 10s
       repeat_interval: 1h
 
@@ -45,8 +44,26 @@ inhibit_rules:
 
 receivers:
   - name: default
-    # No notification channel configured. Example for a real deployment:
-    #
-    # webhook_configs:
-    #   - url: http://slack-gateway:8080/hooks/observability
-    #     send_resolved: true
+    # No notification channel configured. Until SLACK_WEBHOOK_URL is set in
+    # infra/.env, alerts here are silently dropped (cron staleness alerts only).
+
+  - name: slack
+    slack_configs:
+      - api_url: "${SLACK_WEBHOOK_URL}"
+        channel: "${SLACK_CHANNEL:-#test-drift}"
+        title: "{{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})"
+        text: >-
+          {{ range .Alerts }}
+          Agent: {{ .Labels.agent_id }}
+          KL: {{ .Annotations.description }}
+          Baseline window: {{ .Labels.baseline_window_start }} - {{ .Labels.baseline_window_end }}
+          {{ end }}
+        send_resolved: true
+
+  # PC27: PagerDuty stub for Level 3 escalation (critical only).
+  # Uncomment and replace PAGERDUTY_SERVICE_KEY when needed:
+  #
+  # - name: pagerduty
+  #   pagerduty_configs:
+  #     - service_key: "${PAGERDUTY_SERVICE_KEY}"
+  #       severity: critical

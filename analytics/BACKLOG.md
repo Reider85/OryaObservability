@@ -311,7 +311,7 @@
 | T2.5.1 | Хранить embeddings ответов в Hot store (ClickHouse column response_embedding Array(Float32)) | **TODO** | `PC24` |
 | T2.5.2 | Cron-джоб: каждые 15 минут вычислять KL-дивергенцию последнего часа vs baseline (7д минус последний час) | **TODO** | `PC25` |
 | T2.5.3 | Подобрать порог: p99 KL за последние 30 дней = alert threshold | **TODO** | `PC26` |
-| T2.5.4 | Alert в Alertmanager с лейблами agent_id, kl_divergence, baseline_window | **TODO** | `PC27` |
+| T2.5.4 | Alert в Alertmanager с лейблами agent_id, kl_divergence, baseline_window | **DONE** | `PC27` |
 | T2.5.5 | Интеграция с Phoenix UMAP-визуализатором для root-cause | **TODO** | `PC28` |
 #### E2.6 — Hot/Warm/Cold tiering storage
 

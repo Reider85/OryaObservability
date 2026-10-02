@@ -341,3 +341,84 @@ tests:
       - eval_time: 45m
         alertname: SamplerRateStuckAtCpuHigh
         exp_alerts: []
+
+  # --- PC27: DriftDetected fires when KL exceeds threshold --------------------
+  - interval: 1m
+    name: KL below threshold does not fire DriftDetected
+    input_series:
+      - series: 'agent_obs_drift_kl_score{agent_id="agent-a",baseline_window_start="2026-10-02T12:00:00Z",baseline_window_end="2026-10-02T13:00:00Z"}'
+        values: "0.05+0x20"
+      - series: 'agent_obs_drift_threshold_value{agent_id="agent-a"}'
+        values: "0.1+0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DriftDetected
+        exp_alerts: []
+
+  - interval: 1m
+    name: KL above threshold fires DriftDetected with baseline labels
+    input_series:
+      - series: 'agent_obs_drift_kl_score{agent_id="agent-a",baseline_window_start="2026-10-02T12:00:00Z",baseline_window_end="2026-10-02T13:00:00Z"}'
+        values: "0.25+0x20"
+      - series: 'agent_obs_drift_threshold_value{agent_id="agent-a"}'
+        values: "0.1+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: drift-detector
+              agent_id: agent-a
+              baseline_window_start: "2026-10-02T12:00:00Z"
+              baseline_window_end: "2026-10-02T13:00:00Z"
+            exp_annotations:
+              summary: "Drift detected for agent agent-a"
+              description: >-
+                KL-divergence 0.25 exceeds calibrated threshold for
+                agent agent-a. Baseline window:
+                2026-10-02T12:00:00Z - 2026-10-02T13:00:00Z.
+                Investigate via Phoenix UMAP:
+                http://phoenix:6006/datasets/latest/embeddings?agent=agent-a
+
+  - interval: 1m
+    name: DriftDetected fires for one agent but not another
+    input_series:
+      - series: 'agent_obs_drift_kl_score{agent_id="agent-a",baseline_window_start="2026-10-02T12:00:00Z",baseline_window_end="2026-10-02T13:00:00Z"}'
+        values: "0.25+0x20"
+      - series: 'agent_obs_drift_kl_score{agent_id="agent-b",baseline_window_start="2026-10-02T12:00:00Z",baseline_window_end="2026-10-02T13:00:00Z"}'
+        values: "0.05+0x20"
+      - series: 'agent_obs_drift_threshold_value{agent_id="agent-a"}'
+        values: "0.1+0x20"
+      - series: 'agent_obs_drift_threshold_value{agent_id="agent-b"}'
+        values: "0.1+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DriftDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: drift-detector
+              agent_id: agent-a
+              baseline_window_start: "2026-10-02T12:00:00Z"
+              baseline_window_end: "2026-10-02T13:00:00Z"
+            exp_annotations:
+              summary: "Drift detected for agent agent-a"
+              description: >-
+                KL-divergence 0.25 exceeds calibrated threshold for
+                agent agent-a. Baseline window:
+                2026-10-02T12:00:00Z - 2026-10-02T13:00:00Z.
+                Investigate via Phoenix UMAP:
+                http://phoenix:6006/datasets/latest/embeddings?agent=agent-a
+
+  - interval: 1m
+    name: KL below threshold clears DriftDetected alert
+    input_series:
+      - series: 'agent_obs_drift_kl_score{agent_id="agent-a",baseline_window_start="2026-10-02T12:00:00Z",baseline_window_end="2026-10-02T13:00:00Z"}'
+        values: "0.25+0x10 0.05+0x10"
+      - series: 'agent_obs_drift_threshold_value{agent_id="agent-a"}'
+        values: "0.1+0x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DriftDetected
+        exp_alerts: []

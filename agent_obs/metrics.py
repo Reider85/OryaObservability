@@ -177,6 +177,11 @@ embeddings_storage_failed_total = Counter(
     "Embedding writes to ClickHouse that failed",
 )
 
+embeddings_redis_fallback_total = Counter(
+    "agent_obs_embeddings_redis_fallback_total",
+    "Embedding batches written to Redis fallback after ClickHouse failure",
+)
+
 embeddings_batch_size = Histogram(
     "agent_obs_embeddings_batch_size",
     "Number of embeddings in each ClickHouse batch write",
@@ -188,7 +193,7 @@ embeddings_batch_size = Histogram(
 drift_kl_score = Gauge(
     "agent_obs_drift_kl_score",
     "Current KL-divergence score for drift detection",
-    ["agent_id"],
+    ["agent_id", "baseline_window_start", "baseline_window_end"],
 )
 
 drift_runs_total = Counter(

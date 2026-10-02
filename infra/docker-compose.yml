@@ -112,9 +112,10 @@ services:
 
   clickhouse:
     # Pinned: 26.9 verified live against this DDL (JSON columns, UUID,
-    # DateTime64, TTL INTERVAL). Note Nullable(Array(...)) is illegal in
-    # ClickHouse generally — spans_hot therefore has no response_embedding
-    # column (see clickhouse_ddl.sql 1C comment).
+    # DateTime64, TTL INTERVAL). PC24: embeddings stored in span_embeddings
+    # sidecar table (see clickhouse_ddl.sql); spans_hot.response_embedding kept
+    # for compatibility. Run docker compose run --rm clickhouse-init to heal
+    # existing volumes with ALTER migrations.
     image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
     user: "101:101"
@@ -545,8 +546,17 @@ services:
   alertmanager:
     image: prom/alertmanager:latest
     restart: unless-stopped
+    environment:
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-https://hooks.slack.com/services/placeholder}
+      SLACK_CHANNEL: "${SLACK_CHANNEL:-#test-drift}"
     volumes:
-      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml.tmpl:ro
+    command:
+      - sh
+      - -c
+      - |
+        envsubst '${SLACK_WEBHOOK_URL} ${SLACK_CHANNEL}' < /etc/alertmanager/alertmanager.yml.tmpl > /tmp/alertmanager.yml
+        exec alertmanager --config.file=/tmp/alertmanager.yml --storage.path=/alertmanager
     ports:
       - "9093:9093"
 

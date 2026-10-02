@@ -109,6 +109,14 @@ class TestDriftDetectedRule:
         assert "KL" in desc
         assert "agent_id" in desc
 
+    def test_annotations_contain_baseline_window(self, drift_detected_rule):
+        """Description must include baseline window start and end."""
+        annotations = drift_detected_rule.get("annotations", {})
+        desc = annotations.get("description", "")
+        assert "baseline window" in desc.lower()
+        assert "baseline_window_start" in desc
+        assert "baseline_window_end" in desc
+
     def test_annotations_contain_phoenix_link(self, drift_detected_rule):
         """Description must include a Phoenix UMAP link for root-cause analysis."""
         annotations = drift_detected_rule.get("annotations", {})
@@ -155,6 +163,10 @@ class TestAlertmanagerDriftRoute:
         """Drift route uses a real receiver (not the null sink)."""
         assert drift_route.get("receiver") != "null"
 
+    def test_receiver_is_slack(self, drift_route):
+        """Drift route uses the Slack receiver."""
+        assert drift_route.get("receiver") == "slack"
+
     def test_matcher_uses_component_label(self, drift_route):
         """Route matches on component=drift-detector label from Prometheus rule."""
         matchers = drift_route.get("matchers", [])
@@ -179,6 +191,17 @@ class TestCrossFileConsistency:
         names = [r["name"] for r in receivers]
         assert "default" in names
 
+    def test_alertmanager_has_slack_receiver(self, alertmanager):
+        """Alertmanager has a Slack receiver configured."""
+        receivers = alertmanager.get("receivers", [])
+        names = [r["name"] for r in receivers]
+        assert "slack" in names
+        # Check that Slack receiver has slack_configs
+        slack_receiver = next((r for r in receivers if r["name"] == "slack"), None)
+        assert slack_receiver is not None
+        assert "slack_configs" in slack_receiver
+        assert len(slack_receiver["slack_configs"]) > 0
+
     def test_rules_file_is_valid_yaml(self, rules):
         """prometheus-rules.yml parses as valid YAML."""
         assert "groups" in rules
@@ -188,6 +211,13 @@ class TestCrossFileConsistency:
         """alertmanager.yml parses as valid YAML."""
         assert "route" in alertmanager
         assert "receivers" in alertmanager
+
+    def test_drift_kl_score_has_baseline_labels(self):
+        """The drift_kl_score gauge includes baseline window labels."""
+        from agent_obs.metrics import drift_kl_score
+        assert "baseline_window_start" in drift_kl_score._labelnames
+        assert "baseline_window_end" in drift_kl_score._labelnames
+        assert len(drift_kl_score._labelnames) == 3
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -65,6 +66,8 @@ class DriftDetector:
         self.kl_threshold = DEFAULT_KL_THRESHOLD if kl_threshold is None else kl_threshold
         self._pinned_threshold = kl_threshold
         self.threshold_store = ThresholdStore(thresholds_path)
+        # Track previous baseline labels to prevent series accumulation
+        self._kl_series_labels: dict[str, tuple[str, str]] = {}
 
     def effective_threshold(self, agent_id: str) -> float:
         """Threshold actually applied to ``agent_id`` on this run.
@@ -163,8 +166,24 @@ class DriftDetector:
                 agent_id=agent_id,
             )
             
-            # Emit metrics
-            drift_kl_score.labels(agent_id=agent_id).set(kl_score)
+            # Emit metrics with baseline window labels and cleanup
+            baseline_window_start = time.time() - (self.baseline_hours * 3600)
+            baseline_window_end = time.time() - (self.last_window_hours * 3600)
+            start_iso = datetime.datetime.fromtimestamp(baseline_window_start, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_iso = datetime.datetime.fromtimestamp(baseline_window_end, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            
+            # Drop the previous per-agent series so timestamp labels don't accumulate
+            prev = self._kl_series_labels.get(agent_id)
+            if prev is not None:
+                try:
+                    drift_kl_score.remove(agent_id, prev[0], prev[1])
+                except KeyError:
+                    # Series not found (already removed or never emitted)
+                    pass
+            
+            drift_kl_score.labels(agent_id=agent_id, baseline_window_start=start_iso, baseline_window_end=end_iso).set(kl_score)
+            self._kl_series_labels[agent_id] = (start_iso, end_iso)
+            
             drift_runs_total.labels(agent_id=agent_id).inc()
             
             if is_drift:
@@ -206,10 +225,10 @@ class DriftDetector:
         baseline_end = time.time() - (self.last_window_hours * 3600)
         
         query = """
-        SELECT response_embedding
-        FROM spans_hot
+        SELECT embedding
+        FROM span_embeddings
         WHERE agent_id = %(agent_id)s
-        AND response_embedding IS NOT NULL
+        AND length(embedding) > 0
         AND created_at >= toDateTime64(%(baseline_start)s, 3)
         AND created_at < toDateTime64(%(baseline_end)s, 3)
         ORDER BY created_at ASC
@@ -222,10 +241,10 @@ class DriftDetector:
                 "baseline_end": baseline_end
             })
         except Exception as e:
-            # 1C: spans_hot has no response_embedding column (Nullable(Array)
-            # is illegal in ClickHouse). Degrade instead of failing the run.
+            # PC24: span_embeddings table unavailable (e.g., column missing or
+            # ClickHouse connection issue). Degrade instead of failing the run.
             logger.warning(
-                "spans_hot.response_embedding unavailable (%s); "
+                "span_embeddings unavailable (%s); "
                 "no baseline embeddings for agent=%s",
                 e,
                 agent_id,
@@ -234,7 +253,7 @@ class DriftDetector:
         embeddings = []
 
         for row in results:
-            if row and row[0]:  # response_embedding exists
+            if row and row[0]:  # embedding exists
                 embedding = row[0]
                 if isinstance(embedding, list) and len(embedding) > 0:
                     embeddings.append(embedding)
@@ -253,10 +272,10 @@ class DriftDetector:
         last_window_start = time.time() - (self.last_window_hours * 3600)
 
         query = """
-        SELECT response_embedding
-        FROM spans_hot
+        SELECT embedding
+        FROM span_embeddings
         WHERE agent_id = %(agent_id)s
-        AND response_embedding IS NOT NULL
+        AND length(embedding) > 0
         AND created_at >= toDateTime64(%(last_window_start)s, 3)
         ORDER BY created_at ASC
         """
@@ -268,7 +287,7 @@ class DriftDetector:
             })
         except Exception as e:
             logger.warning(
-                "spans_hot.response_embedding unavailable (%s); "
+                "span_embeddings unavailable (%s); "
                 "no last-window embeddings for agent=%s",
                 e,
                 agent_id,
@@ -277,7 +296,7 @@ class DriftDetector:
         embeddings = []
 
         for row in results:
-            if row and row[0]:  # response_embedding exists
+            if row and row[0]:  # embedding exists
                 embedding = row[0]
                 if isinstance(embedding, list) and len(embedding) > 0:
                     embeddings.append(embedding)
