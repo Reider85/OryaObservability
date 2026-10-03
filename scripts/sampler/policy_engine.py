@@ -97,6 +97,8 @@ class PolicyDecision:
     prev_reason: str
     cpu_ratio: float
     error_rate_5m: float
+    agent_id: str
+    triggering_agent_id: str
     changed: bool
 
     @property
@@ -146,6 +148,9 @@ class PolicyEngine:
         hot_store=None,
         enable_audit: bool = True,
         client: Optional[httpx.AsyncClient] = None,
+        agent_id: str = "*",
+        phoenix_enabled: bool = False,
+        phoenix_otlp_url: str = "http://localhost:4319/v1/traces",
     ) -> None:
         self.prometheus_url = prometheus_url.rstrip("/")
         self.poll_interval = poll_interval
@@ -154,6 +159,10 @@ class PolicyEngine:
         self.hot_store = hot_store
         self.enable_audit = enable_audit
         self._client = client
+        self.agent_id = agent_id
+        self.phoenix_enabled = phoenix_enabled
+        self.phoenix_otlp_url = phoenix_otlp_url
+        self.triggering_agent_id = "*"
 
         self.current_rate: float = SAMPLER_RATES["default"]
         self.current_reason: str = "default"
@@ -174,8 +183,8 @@ class PolicyEngine:
             await self._client.aclose()
             self._client = None
 
-    async def _query(self, query: str) -> list[float]:
-        """Run one Prometheus instant query, returning the sample values.
+    async def _query(self, query: str) -> list[tuple[str, float]]:
+        """Run one Prometheus instant query, returning (agent_id, value) tuples.
 
         An empty list means "no series" — a pilot-agent that has not reported
         yet.  Transport and parse errors propagate to the caller, which treats
@@ -191,40 +200,59 @@ class PolicyEngine:
             raise RuntimeError(
                 f"prometheus query {query!r} failed: {payload.get('error')}"
             )
-        values: list[float] = []
+        values: list[tuple[str, float]] = []
         for series in payload.get("data", {}).get("result", []):
             raw = series.get("value", [None, None])[1]
             if raw is None:
                 continue
             try:
-                values.append(float(raw))
+                value = float(raw)
+                # Extract agent_id from metric labels if present
+                agent_id = series.get("metric", {}).get("agent_id", "*")
+                values.append((agent_id, value))
             except (TypeError, ValueError):
                 continue
         return values
 
-    async def read_signals(self) -> tuple[float, float]:
-        """Fetch ``(cpu_ratio, error_rate_5m)`` from Prometheus.
+    async def read_signals(self) -> tuple[float, float, str]:
+        """Fetch ``(cpu_ratio, error_rate_5m, triggering_agent_id)`` from Prometheus.
 
         Missing series resolve to 0.0, which routes the policy to its default
         rate.  A scrape failure is logged and also treated as 0.0 — fail-safe,
         because guessing a *high* rate from absent data would silently triple
         storage spend, while guessing low would hide errors.
+        
+        triggering_agent_id is the agent with the highest error rate, or "*" if no agents.
         """
         try:
-            cpu_values = await self._query(CPU_QUERY)
+            cpu_series = await self._query(CPU_QUERY)
         except Exception as exc:
             logger.warning("Prometheus CPU scrape failed: %s", exc)
-            cpu_values = []
+            cpu_series = []
         try:
-            error_values = await self._query(ERROR_RATE_QUERY)
+            error_series = await self._query(ERROR_RATE_QUERY)
         except Exception as exc:
             logger.warning("Prometheus error-rate scrape failed: %s", exc)
-            error_values = []
+            error_series = []
 
-        cpu_ratio = max(cpu_values) if cpu_values else 0.0
+        cpu_ratio = max([v for _, v in cpu_series]) if cpu_series else 0.0
         # max over agents: one unhealthy agent must be able to lift the rate.
-        error_rate = max(error_values) if error_values else 0.0
-        return cpu_ratio, error_rate
+        error_rate = max([v for _, v in error_series]) if error_series else 0.0
+        
+        # Find triggering agent (agent with max error rate)
+        triggering_agent_id = "*"
+        if error_series:
+            try:
+                # Find the agent with max error rate
+                max_error_value = max([v for _, v in error_series])
+                for agent_id, value in error_series:
+                    if value == max_error_value:
+                        triggering_agent_id = agent_id
+                        break
+            except Exception:
+                triggering_agent_id = "*"
+        
+        return cpu_ratio, error_rate, triggering_agent_id
 
     # --- evaluation --------------------------------------------------------
 
@@ -252,6 +280,8 @@ class PolicyEngine:
             prev_reason=prev_reason,
             cpu_ratio=cpu_ratio,
             error_rate_5m=error_rate_5m,
+            agent_id=self.agent_id,
+            triggering_agent_id=self.triggering_agent_id,
             changed=changed,
         )
 
@@ -284,6 +314,8 @@ class PolicyEngine:
             new_reason=decision.reason,
             system_cpu_ratio=decision.cpu_ratio,
             agent_error_rate_5m=decision.error_rate_5m,
+            agent_id=decision.agent_id,
+            triggering_agent_id=decision.triggering_agent_id,
         )
 
     def record_audit(self, decision: PolicyDecision) -> None:
@@ -303,6 +335,41 @@ class PolicyEngine:
                 outcome="audit_failed"
             ).inc()
 
+    async def _send_phoenix_annotation(self, decision: PolicyDecision) -> None:
+        """Send Phoenix annotation for rate change (fire-and-forget).
+        
+        Uses asyncio.to_thread to avoid blocking the event loop. Phoenix failure
+        does not block rate changes (fail-open design).
+        """
+        try:
+            from scripts.sampler.phoenix_annotations import annotate_rate_change
+            
+            # Build event dict from decision
+            event_dict = {
+                "audit_id": f"phoenix-{int(time.time())}",
+                "timestamp": time.time(),
+                "prev_rate": decision.prev_rate,
+                "new_rate": decision.rate,
+                "prev_reason": decision.prev_reason,
+                "new_reason": decision.reason,
+                "system_cpu_ratio": decision.cpu_ratio,
+                "agent_error_rate_5m": decision.error_rate_5m,
+                "agent_id": decision.agent_id,
+                "triggering_agent_id": decision.triggering_agent_id,
+                "reason": decision.reason_text,
+            }
+            
+            # Fire-and-forge Phoenix annotation
+            await asyncio.to_thread(
+                annotate_rate_change,
+                event_dict,
+                client=self._client,
+                otlp_url=self.phoenix_otlp_url,
+            )
+            
+        except Exception as exc:
+            logger.warning("Phoenix annotation failed: %s", exc)
+
     # --- main loop ---------------------------------------------------------
 
     async def run_once(
@@ -312,12 +379,18 @@ class PolicyEngine:
 
         Returns the decision when the rate moved, else None.
         """
-        cpu_ratio, error_rate = await self.read_signals()
+        cpu_ratio, error_rate, triggering_agent_id = await self.read_signals()
+        self.triggering_agent_id = triggering_agent_id  # Store for PolicyDecision
         decision = self.evaluate(cpu_ratio, error_rate)
         if not decision.changed:
             return None
         # Off-loop write: HotStore is a blocking clickhouse-driver client.
         await asyncio.to_thread(self.record_audit, decision)
+        
+        # Send Phoenix annotation if enabled
+        if self.phoenix_enabled:
+            await self._send_phoenix_annotation(decision)
+        
         if rate_callback is not None:
             await rate_callback(decision)
         return decision
@@ -360,6 +433,10 @@ def build_policy_engine_from_env(**overrides) -> PolicyEngine:
     """
     poll = float(os.environ.get("AGENT_OBS_SAMPLER_POLL_INTERVAL", "30"))
     prom_url = os.environ.get("PROMETHEUS_URL", DEFAULT_PROMETHEUS_URL)
+    agent_id = os.environ.get("AGENT_OBS_SAMPLER_AGENT_ID", "*")
+    phoenix_enabled = os.environ.get("AGENT_OBS_SAMPLER_PHOENIX_ENABLED", "0").lower() not in ("0", "false", "no")
+    phoenix_otlp_url = os.environ.get("AGENT_OBS_SAMPLER_PHOENIX_OTLP_URL", "http://localhost:4319/v1/traces")
+    
     params = {
         "prometheus_url": prom_url,
         "poll_interval": poll,
@@ -373,6 +450,9 @@ def build_policy_engine_from_env(**overrides) -> PolicyEngine:
             "AGENT_OBS_SAMPLER_AUDIT_ENABLED", "1"
         ).lower()
         not in ("0", "false", "no"),
+        "agent_id": agent_id,
+        "phoenix_enabled": phoenix_enabled,
+        "phoenix_otlp_url": phoenix_otlp_url,
     }
     if params["enable_audit"]:
         # Guarded at the call site on purpose: the proxy must start even when

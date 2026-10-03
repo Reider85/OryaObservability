@@ -277,3 +277,11 @@ tail_sampler_traces_sampled_total = Counter(
     "Traces kept by the sampler proxy",
     ["decision"],
 )
+
+# --- PC31 Phoenix annotation metrics ------------------------------------
+
+tail_sampler_phoenix_annotations_total = Counter(
+    "agent_obs_tail_sampler_phoenix_annotations_total",
+    "Phoenix annotations sent for sampler rate changes",
+    ["outcome"],
+)

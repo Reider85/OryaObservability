@@ -196,6 +196,30 @@ PolicyEngine through `build_policy_engine_from_env()` so the ClickHouse sink
 is attached — constructing `PolicyEngine()` bare was the live bug where audit
 rows never landed.
 
+#### Agent ID tracking
+
+Each audit event includes:
+- `agent_id`: Fixed ID from `AGENT_OBS_SAMPLER_AGENT_ID` (defaults to "*")
+- `triggering_agent_id`: Agent that triggered the rate change (from Prometheus labels, or "*")
+
+#### Phoenix annotations (PC31)
+
+When `AGENT_OBS_SAMPLER_PHOENIX_ENABLED=1`, rate changes are also sent as
+OTLP spans to Phoenix for timeline annotations:
+
+```
+AGENT_OBS_SAMPLER_PHOENIX_OTLP_URL=http://localhost:4319/v1/traces
+```
+
+This enables correlation between sampler rate changes and dropped spans in
+the Phoenix UI. Annotations are fire-and-forget — Phoenix failure does not
+block rate changes.
+
+Environment variables:
+- `AGENT_OBS_SAMPLER_AGENT_ID`: Fixed agent ID for this sampler (default: "*")
+- `AGENT_OBS_SAMPLER_PHOENIX_ENABLED`: Enable Phoenix annotations (0/1, default: 0)
+- `AGENT_OBS_SAMPLER_PHOENIX_OTLP_URL`: Phoenix OTLP endpoint (default: http://localhost:4319/v1/traces)
+
 ## Failure behaviour
 
 | Condition | Behaviour |

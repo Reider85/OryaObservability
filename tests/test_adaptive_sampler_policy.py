@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import threading
+import unittest.mock
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -105,9 +107,20 @@ def _prom_client(cpu=None, error=None, status_code: int = 200):
                 200, json={"status": "success", "data": {"result": []}}
             )
         values = value if isinstance(value, list) else [value]
-        result = [
-            {"metric": {}, "value": [time_now(), str(v)]} for v in values
-        ]
+        result = []
+        for i, v in enumerate(values):
+            # Include agent_id label for error_rate queries
+            if query == ERROR_RATE_QUERY:
+                agent_id = f"agent-{i}" if len(values) > 1 else "default-agent"
+                result.append({
+                    "metric": {"agent_id": agent_id},
+                    "value": [time_now(), str(v)]
+                })
+            else:
+                result.append({
+                    "metric": {},
+                    "value": [time_now(), str(v)]
+                })
         return httpx.Response(
             200, json={"status": "success", "data": {"resultType": "vector", "result": result}}
         )
@@ -299,6 +312,62 @@ class TestPolicyEngineEvaluation:
         assert decision.rate == pytest.approx(0.10)
         assert engine.current_reason == "default"
 
+    def test_policy_decision_includes_agent_id_fields(self):
+        """Test that PolicyDecision includes agent_id and triggering_agent_id fields."""
+        engine = PolicyEngine(agent_id="test-agent")
+        decision = engine.evaluate(cpu_ratio=0.92, error_rate_5m=0.01)
+        
+        assert hasattr(decision, 'agent_id')
+        assert hasattr(decision, 'triggering_agent_id')
+        assert decision.agent_id == "test-agent"
+        # triggering_agent_id should be set from read_signals
+        assert decision.triggering_agent_id == "*"  # Default when no Prometheus data
+
+    async def test_read_signals_returns_triggering_agent_id(self):
+        """Test that read_signals returns triggering_agent_id from Prometheus labels."""
+        engine = PolicyEngine(agent_id="test-agent")
+        cpu_ratio, error_rate, triggering_agent_id = await engine.read_signals()
+        
+        assert cpu_ratio == 0.0
+        assert error_rate == 0.0
+        assert triggering_agent_id == "*"  # Default when no error series
+
+    async def test_read_signals_returns_max_error_agent_id(self):
+        """Test that read_signals returns the agent with max error rate as triggering_agent_id."""
+        engine = PolicyEngine(agent_id="test-agent")
+        # Mock client with multiple agents, different error rates
+        async def _mock_query(query: str):
+            if query == CPU_QUERY:
+                return [("agent-1", 0.1), ("agent-2", 0.2)]
+            elif query == ERROR_RATE_QUERY:
+                return [("agent-1", 0.01), ("agent-2", 0.09)]
+            return []
+        
+        engine._query = _mock_query
+        cpu_ratio, error_rate, triggering_agent_id = await engine.read_signals()
+        
+        assert cpu_ratio == 0.2
+        assert error_rate == 0.09
+        assert triggering_agent_id == "agent-2"  # Agent with max error rate
+
+    def test_build_policy_engine_from_env_reads_agent_id(self):
+        """Test that build_policy_engine_from_env reads AGENT_OBS_SAMPLER_AGENT_ID."""
+        with unittest.mock.patch.dict(os.environ, {"AGENT_OBS_SAMPLER_AGENT_ID": "env-agent"}):
+            engine = build_policy_engine_from_env()
+            assert engine.agent_id == "env-agent"
+
+    def test_build_policy_engine_from_env_reads_phoenix_config(self):
+        """Test that build_policy_engine_from_env reads Phoenix config."""
+        with unittest.mock.patch.dict(os.environ, {
+            "AGENT_OBS_SAMPLER_AGENT_ID": "env-agent",
+            "AGENT_OBS_SAMPLER_PHOENIX_ENABLED": "1",
+            "AGENT_OBS_SAMPLER_PHOENIX_OTLP_URL": "http://test:4318"
+        }):
+            engine = build_policy_engine_from_env()
+            assert engine.agent_id == "env-agent"
+            assert engine.phoenix_enabled is True
+            assert engine.phoenix_otlp_url == "http://test:4318"
+
     async def test_run_once_publishes_only_on_change(self):
         engine = PolicyEngine(client=_prom_client(cpu=0.9, error=0.0))
         published: list[PolicyDecision] = []
@@ -330,11 +399,11 @@ class TestPolicyEngineEvaluation:
         tick has to still be evaluated and able to move the rate."""
         calls = {"n": 0}
 
-        async def flaky() -> tuple[float, float]:
+        async def flaky() -> tuple[float, float, str]:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("prometheus down")
-            return 0.95, 0.0
+            return 0.95, 0.0, "*"
 
         engine = PolicyEngine(client=_prom_client(), poll_interval=0.05)
         engine.read_signals = flaky  # type: ignore[assignment]

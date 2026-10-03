@@ -320,6 +320,8 @@ class SamplerRateChangeAuditEvent:
     new_reason: str
     system_cpu_ratio: float
     agent_error_rate_5m: float
+    agent_id: str = "*"  # agent_id from env AGENT_OBS_SAMPLER_AGENT_ID
+    triggering_agent_id: str = "*"  # triggering agent from Prometheus (if available)
     trace_id: str = ""  # always "" — a rate change is not trace-scoped
     action: str = "sampler.rate_change"
     ip_address: str = "unknown"
@@ -336,6 +338,8 @@ class SamplerRateChangeAuditEvent:
         system_cpu_ratio: float,
         agent_error_rate_5m: float,
         actor_id: str = "policy-engine",
+        agent_id: str = "*",
+        triggering_agent_id: str = "*",
     ) -> "SamplerRateChangeAuditEvent":
         """Create an audit event for one sampling-rate transition.
 
@@ -376,6 +380,8 @@ class SamplerRateChangeAuditEvent:
             new_reason=new_reason,
             system_cpu_ratio=system_cpu_ratio,
             agent_error_rate_5m=agent_error_rate_5m,
+            agent_id=agent_id,
+            triggering_agent_id=triggering_agent_id,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -397,6 +403,8 @@ class SamplerRateChangeAuditEvent:
             "new_reason": self.new_reason,
             "system_cpu_ratio": self.system_cpu_ratio,
             "agent_error_rate_5m": self.agent_error_rate_5m,
+            "agent_id": self.agent_id,
+            "triggering_agent_id": self.triggering_agent_id,
         }
 
     def to_clickhouse_row(self) -> tuple:
@@ -414,6 +422,8 @@ class SamplerRateChangeAuditEvent:
                 "new_reason": self.new_reason,
                 "system_cpu_ratio": self.system_cpu_ratio,
                 "agent_error_rate_5m": self.agent_error_rate_5m,
+                "agent_id": self.agent_id,
+                "triggering_agent_id": self.triggering_agent_id,
             }
         )
         return (

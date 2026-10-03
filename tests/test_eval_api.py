@@ -236,6 +236,8 @@ class TestSamplerRateHistoryAPI:
                 "new_reason": "cpu_high",
                 "system_cpu_ratio": 0.92,
                 "agent_error_rate_5m": 0.01,
+                "agent_id": "agent-1",
+                "triggering_agent_id": "trigger-1",
             },
             {
                 "audit_id": "sra-2",
@@ -254,6 +256,8 @@ class TestSamplerRateHistoryAPI:
                 "new_reason": "error_high",
                 "system_cpu_ratio": 0.10,
                 "agent_error_rate_5m": 0.07,
+                "agent_id": "agent-2",
+                "triggering_agent_id": "trigger-2",
             },
             {
                 "audit_id": "sra-3",
@@ -272,6 +276,8 @@ class TestSamplerRateHistoryAPI:
                 "new_reason": "default",
                 "system_cpu_ratio": 0.20,
                 "agent_error_rate_5m": 0.01,
+                "agent_id": "agent-3",
+                "triggering_agent_id": "trigger-3",
             },
         ]
 
@@ -301,12 +307,18 @@ class TestSamplerRateHistoryAPI:
         assert first["new_rate"] == pytest.approx(0.05)
         assert first["new_reason"] == "cpu_high"
         assert first["action"] == "sampler.rate_change"
+        assert first["agent_id"] == "agent-1"
+        assert first["triggering_agent_id"] == "trigger-1"
         second = data["events"][1]
         assert second["new_rate"] == pytest.approx(0.30)
         assert second["new_reason"] == "error_high"
+        assert second["agent_id"] == "agent-2"
+        assert second["triggering_agent_id"] == "trigger-2"
         third = data["events"][2]
         assert third["new_rate"] == pytest.approx(0.10)
         assert third["new_reason"] == "default"
+        assert third["agent_id"] == "agent-3"
+        assert third["triggering_agent_id"] == "trigger-3"
 
     def test_passes_parsed_range_to_hot_store(self, client: TestClient) -> None:
         """Bare dates are parsed: from=midnight, to=end of day, UTC."""

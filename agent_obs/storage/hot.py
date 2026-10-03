@@ -387,6 +387,8 @@ class HotStore:
                     "new_reason": resource.get("new_reason"),
                     "system_cpu_ratio": resource.get("system_cpu_ratio"),
                     "agent_error_rate_5m": resource.get("agent_error_rate_5m"),
+                    "agent_id": resource.get("agent_id", "*"),
+                    "triggering_agent_id": resource.get("triggering_agent_id", "*"),
                 }
             )
             events.append(event)

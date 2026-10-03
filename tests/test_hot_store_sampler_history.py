@@ -36,6 +36,8 @@ def _audit_row(
             "new_reason": "cpu_high",
             "system_cpu_ratio": 0.92,
             "agent_error_rate_5m": 0.01,
+            "agent_id": "test-agent",
+            "triggering_agent_id": "trigger-agent",
         }
     return (
         audit_id,
@@ -183,6 +185,61 @@ class TestResourceFlattening:
         assert event["new_reason"] == "cpu_high"
         assert event["system_cpu_ratio"] == pytest.approx(0.92)
         assert event["agent_error_rate_5m"] == pytest.approx(0.01)
+        assert event["agent_id"] == "test-agent"
+        assert event["triggering_agent_id"] == "trigger-agent"
+
+    def test_flattens_agent_id_fields(self, store, clickhouse):
+        """Test that agent_id and triggering_agent_id are properly flattened."""
+        clickhouse.execute.return_value = [
+            _audit_row(
+                resource={
+                    "type": "sampler_policy",
+                    "id": "normal-trace",
+                    "prev_rate": 0.10,
+                    "new_rate": 0.05,
+                    "prev_reason": "default",
+                    "new_reason": "cpu_high",
+                    "system_cpu_ratio": 0.92,
+                    "agent_error_rate_5m": 0.01,
+                    "agent_id": "custom-agent",
+                    "triggering_agent_id": "triggering-custom",
+                }
+            )
+        ]
+        events = store.get_sampler_rate_history(
+            datetime(2026, 9, 20, tzinfo=timezone.utc),
+            datetime(2026, 9, 21, tzinfo=timezone.utc),
+        )
+        assert len(events) == 1
+        event = events[0]
+        assert event["agent_id"] == "custom-agent"
+        assert event["triggering_agent_id"] == "triggering-custom"
+
+    def test_missing_agent_id_fields_default_to_star(self, store, clickhouse):
+        """Test that missing agent_id fields default to '*'."""
+        clickhouse.execute.return_value = [
+            _audit_row(
+                resource={
+                    "type": "sampler_policy",
+                    "id": "normal-trace",
+                    "prev_rate": 0.10,
+                    "new_rate": 0.05,
+                    "prev_reason": "default",
+                    "new_reason": "cpu_high",
+                    "system_cpu_ratio": 0.92,
+                    "agent_error_rate_5m": 0.01,
+                    # No agent_id or triggering_agent_id fields
+                }
+            )
+        ]
+        events = store.get_sampler_rate_history(
+            datetime(2026, 9, 20, tzinfo=timezone.utc),
+            datetime(2026, 9, 21, tzinfo=timezone.utc),
+        )
+        assert len(events) == 1
+        event = events[0]
+        assert event["agent_id"] == "*"
+        assert event["triggering_agent_id"] == "*"
 
     def test_keeps_base_audit_fields(self, store, clickhouse):
         clickhouse.execute.return_value = [_audit_row()]
@@ -259,6 +316,8 @@ class TestEndToEndAuditEventToQuery:
             new_reason="cpu_high",
             system_cpu_ratio=0.92,
             agent_error_rate_5m=0.01,
+            agent_id="test-agent",
+            triggering_agent_id="trigger-agent",
         )
         # Simulate what write_audit_event inserts: the ClickHouse row tuple.
         clickhouse.execute.return_value = [event.to_clickhouse_row()]
@@ -275,6 +334,8 @@ class TestEndToEndAuditEventToQuery:
         assert read["new_rate"] == pytest.approx(0.05)
         assert read["new_reason"] == "cpu_high"
         assert read["system_cpu_ratio"] == pytest.approx(0.92)
+        assert read["agent_id"] == "test-agent"
+        assert read["triggering_agent_id"] == "trigger-agent"
         # Flattened dict matches the event's own to_dict for the rate fields.
         original = event.to_dict()
         for key in (
@@ -284,5 +345,7 @@ class TestEndToEndAuditEventToQuery:
             "new_reason",
             "system_cpu_ratio",
             "agent_error_rate_5m",
+            "agent_id",
+            "triggering_agent_id",
         ):
-            assert read[key] == pytest.approx(original[key])
+            assert read[key] == original[key]
