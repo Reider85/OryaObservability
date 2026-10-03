@@ -147,6 +147,40 @@ SELECT
     created_at
 FROM eval_results_hot;
 
+-- PC34: Compliance catalog hot table for tiered retention (sharded)
+-- INVARIANT: TTL must outlast the weekly migration trigger (14d retention + 7d window = 21d)
+CREATE TABLE IF NOT EXISTS compliance_catalog_hot_local ON CLUSTER 'observability_cluster' (
+    agent_id String,
+    tool String,
+    field String,
+    pii_type String,
+    frequency UInt64,
+    first_seen DateTime64(3),
+    last_seen DateTime64(3),
+    updated_at DateTime64(3) DEFAULT now()
+)
+ENGINE = ReplacingMergeTree()
+ORDER BY (agent_id, tool, field, pii_type)
+TTL last_seen + INTERVAL 21 DAY
+SETTINGS index_granularity = 8192;
+
+-- PC34: Distributed compliance catalog hot table
+CREATE TABLE IF NOT EXISTS compliance_catalog_hot ON CLUSTER 'observability_cluster' AS compliance_catalog_hot_local
+ENGINE = Distributed('observability_cluster', 'observability', 'compliance_catalog_hot_local', tenant_id);
+
+-- PC34: View for easier querying of hot compliance catalog
+CREATE VIEW IF NOT EXISTS compliance_catalog_hot_view AS
+SELECT 
+    agent_id,
+    tool,
+    field,
+    pii_type,
+    frequency,
+    first_seen,
+    last_seen,
+    updated_at
+FROM compliance_catalog_hot;
+
 -- PC25: Drift history table for KL-divergence analysis
 CREATE TABLE IF NOT EXISTS drift_history ON CLUSTER 'observability_cluster' (
     id UUID DEFAULT generateUUIDv4(),

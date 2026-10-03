@@ -388,6 +388,68 @@ class WarmStore:
         # This method is kept for consistency with other refresh patterns
         pass
 
+    async def update_compliance_last_seen_from_hot(self, hot_rows: list[dict]) -> int:
+        """Update compliance catalog last_seen from hot tier data.
+        
+        For each matching key, sets last_seen = GREATEST(warm.last_seen, hot.last_seen).
+        Also updates first_seen = LEAST(warm.first_seen, hot.first_seen) and 
+        frequency = GREATEST(warm.frequency, hot.frequency) for safety.
+        
+        Args:
+            hot_rows: List of compliance catalog rows from hot tier
+            
+        Returns:
+            Number of rows updated
+        """
+        if not hot_rows:
+            return 0
+            
+        pool = await self.connect()
+        updated_count = 0
+        
+        # Process in batches for performance
+        batch_size = 100
+        for i in range(0, len(hot_rows), batch_size):
+            batch = hot_rows[i:i + batch_size]
+            
+            # Build values for batch update
+            values = []
+            for row in batch:
+                values.append((
+                    row["agent_id"],
+                    row["tool"],
+                    row["field"],
+                    row["pii_type"],
+                    row["frequency"],
+                    row["first_seen"],
+                    row["last_seen"],
+                ))
+            
+            async with pool.acquire() as conn:
+                # Update last_seen, first_seen, and frequency from hot tier
+                updated = await conn.fetchval(
+                    """
+                    INSERT INTO compliance_catalog
+                        (agent_id, tool, field, pii_type, frequency, first_seen, last_seen)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (agent_id, tool, field, pii_type)
+                    DO UPDATE SET
+                        last_seen = GREATEST(compliance_catalog.last_seen, EXCLUDED.last_seen),
+                        first_seen = LEAST(compliance_catalog.first_seen, EXCLUDED.first_seen),
+                        frequency = GREATEST(compliance_catalog.frequency, EXCLUDED.frequency),
+                        updated_at = now()
+                    RETURNING count(*)
+                    """,
+                    *values
+                )
+                updated_count += int(updated) if updated else 0
+        
+        logger.debug(
+            "Compliance catalog last_seen updated from hot tier: rows=%d",
+            updated_count
+        )
+        return updated_count
+
     async def close(self) -> None:
         """Close the connection pool."""
         if self._pool is not None:

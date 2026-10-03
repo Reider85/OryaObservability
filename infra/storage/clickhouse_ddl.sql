@@ -161,6 +161,36 @@ FROM eval_results_hot;
 -- Grant permissions to observability user (will be created in init script)
 -- This will be executed by the init script after creating the user
 
+-- PC34: Compliance catalog hot table for tiered retention
+-- INVARIANT: TTL must outlast the weekly migration trigger (14d retention + 7d window = 21d)
+CREATE TABLE IF NOT EXISTS compliance_catalog_hot (
+    agent_id String,
+    tool String,
+    field String,
+    pii_type String,
+    frequency UInt64,
+    first_seen DateTime64(3),
+    last_seen DateTime64(3),
+    updated_at DateTime64(3) DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (agent_id, tool, field, pii_type)
+TTL last_seen + INTERVAL 21 DAY
+SETTINGS index_granularity = 8192;
+
+-- PC34: View for easier querying of hot compliance catalog
+CREATE VIEW IF NOT EXISTS compliance_catalog_hot_view AS
+SELECT 
+    agent_id,
+    tool,
+    field,
+    pii_type,
+    frequency,
+    first_seen,
+    last_seen,
+    updated_at
+FROM compliance_catalog_hot;
+
 -- PC25: Drift history table for KL-divergence analysis
 CREATE TABLE IF NOT EXISTS drift_history (
     id UUID DEFAULT generateUUIDv4(),

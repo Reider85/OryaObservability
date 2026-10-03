@@ -1508,7 +1508,7 @@ class TestInfraCronConfig:
     def test_cron_alert_rules_exist(self, rules):
         group = next(g for g in rules["groups"] if g["name"] == "cron")
         alerts = {rule["alert"] for rule in group["rules"]}
-        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale", "ComplianceCatalogAggregationStale", "ComplianceCatalogZeroActivity", "CronMigrationHotToWarmFailed"}
+        assert alerts == {"CronTargetDown", "CronHourlyJobStale", "CronDailyJobStale", "CronWeeklyJobStale", "ComplianceCatalogAggregationStale", "ComplianceCatalogZeroActivity", "CronMigrationHotToWarmFailed", "ComplianceCatalogMigrationStale"}
 
     def test_daily_stale_includes_the_span_migration(self, rules):
         """PC22: migrate_spans_to_warm must be covered by CronDailyJobStale."""

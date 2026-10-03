@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional, Protocol
 
 from prometheus_client import Counter, Gauge
@@ -144,6 +145,50 @@ class NullCatalogWriter:
 
     async def close(self) -> None:
         return None
+
+
+class HotCatalogWriter:
+    """Batch-UPSERT writer for the ``compliance_catalog_hot`` ClickHouse table.
+
+    Writes to ClickHouse hot tier for tiered retention (PC34). Uses
+    ReplacingMergeTree for deduplication by (agent_id, tool, field, pii_type).
+    """
+
+    def __init__(self) -> None:
+        self._hot_store: Any | None = None
+
+    async def _get_hot_store(self) -> Any:
+        """Lazy initialization of HotStore."""
+        if self._hot_store is None:
+            from agent_obs.storage.hot import HotStore
+            self._hot_store = HotStore()
+        return self._hot_store
+
+    async def upsert(self, rows: list[ComplianceRow]) -> None:
+        """Insert or update compliance rows in ClickHouse hot tier."""
+        if not rows:
+            return
+            
+        hot_store = await self._get_hot_store()
+        hot_rows = [
+            {
+                "agent_id": r.agent_id,
+                "tool": r.tool,
+                "field": r.field,
+                "pii_type": r.pii_type,
+                "frequency": r.frequency,
+                "first_seen": datetime.now(timezone.utc),
+                "last_seen": datetime.now(timezone.utc),
+            }
+            for r in rows
+        ]
+        await hot_store.upsert_compliance_catalog(hot_rows)
+
+    async def close(self) -> None:
+        """Close the HotStore connection."""
+        if self._hot_store is not None:
+            await self._hot_store.close()
+            self._hot_store = None
 
 
 class PostgresCatalogWriter:
@@ -338,6 +383,176 @@ class ComplianceCatalog:
         rows.sort(key=lambda x: x.frequency, reverse=True)
         return rows
 
+    async def query_compliance_catalog(
+        self,
+        agent_id: Optional[str] = None,
+        tool: Optional[str] = None,
+        pii_type: Optional[str] = None,
+        last_seen_min: Optional[datetime] = None,
+        last_seen_max: Optional[datetime] = None,
+    ) -> list[ComplianceRow]:
+        """Query compliance catalog from both hot and warm tiers.
+        
+        Args:
+            agent_id: Filter by agent_id (optional)
+            tool: Filter by tool (optional)
+            pii_type: Filter by pii_type (optional)
+            last_seen_min: Filter by last_seen >= this date (optional)
+            last_seen_max: Filter by last_seen <= this date (optional)
+            
+        Returns:
+            List of ComplianceRow objects from both tiers, merged and deduplicated
+        """
+        results: list[ComplianceRow] = []
+        
+        # Check if we have a composite writer (hot + warm)
+        if isinstance(self._writer, CompositeCatalogWriter):
+            # Query both hot and warm tiers
+            hot_results = await self._query_hot_tier(agent_id, tool, pii_type, last_seen_min, last_seen_max)
+            warm_results = await self._query_warm_tier(agent_id, tool, pii_type, last_seen_min, last_seen_max)
+            
+            # Merge results, preferring higher frequency values for duplicates
+            all_results = hot_results + warm_results
+            results = self._merge_and_deduplicate_compliance_rows(all_results)
+            
+        elif isinstance(self._writer, HotCatalogWriter):
+            # Query hot tier only
+            results = await self._query_hot_tier(agent_id, tool, pii_type, last_seen_min, last_seen_max)
+            
+        elif isinstance(self._writer, PostgresCatalogWriter):
+            # Query warm tier only
+            results = await self._query_warm_tier(agent_id, tool, pii_type, last_seen_min, last_seen_max)
+            
+        else:
+            # For other writers (like NullCatalogWriter), return empty list
+            # or you could optionally query the in-memory buffer
+            pass
+        
+        # Apply final sorting
+        results.sort(key=lambda x: x.frequency, reverse=True)
+        return results
+    
+    async def _query_hot_tier(
+        self,
+        agent_id: Optional[str] = None,
+        tool: Optional[str] = None,
+        pii_type: Optional[str] = None,
+        last_seen_min: Optional[datetime] = None,
+        last_seen_max: Optional[datetime] = None,
+    ) -> list[ComplianceRow]:
+        """Query compliance catalog from hot tier (ClickHouse)."""
+        try:
+            from agent_obs.storage.hot import HotStore
+            hot_store = HotStore()
+            
+            # Get all compliance catalog rows from hot tier
+            hot_rows = await hot_store.get_compliance_catalog_all()
+            
+            # Convert to ComplianceRow objects and apply filters
+            compliance_rows = []
+            for row in hot_rows:
+                # Apply filters
+                if agent_id and row.get("agent_id") != agent_id:
+                    continue
+                if tool and row.get("tool") != tool:
+                    continue
+                if pii_type and row.get("pii_type") != pii_type:
+                    continue
+                
+                # Handle date filters
+                if last_seen_min:
+                    last_seen = row.get("last_seen")
+                    if last_seen and last_seen < last_seen_min:
+                        continue
+                if last_seen_max:
+                    last_seen = row.get("last_seen")
+                    if last_seen and last_seen > last_seen_max:
+                        continue
+                
+                compliance_rows.append(ComplianceRow(
+                    agent_id=row.get("agent_id", ""),
+                    tool=row.get("tool", ""),
+                    field=row.get("field", ""),
+                    pii_type=row.get("pii_type", ""),
+                    frequency=row.get("frequency", 0)
+                ))
+            
+            await hot_store.close()
+            return compliance_rows
+            
+        except Exception as e:
+            logger.warning("Failed to query hot tier compliance catalog: %s", str(e))
+            return []
+    
+    async def _query_warm_tier(
+        self,
+        agent_id: Optional[str] = None,
+        tool: Optional[str] = None,
+        pii_type: Optional[str] = None,
+        last_seen_min: Optional[datetime] = None,
+        last_seen_max: Optional[datetime] = None,
+    ) -> list[ComplianceRow]:
+        """Query compliance catalog from warm tier (PostgreSQL)."""
+        try:
+            from agent_obs.storage.warm import WarmStore
+            warm_store = WarmStore()
+            
+            # Get all compliance catalog rows from warm tier
+            warm_rows = await warm_store.get_all_compliance_catalog()
+            
+            # Convert to ComplianceRow objects and apply filters
+            compliance_rows = []
+            for row in warm_rows:
+                # Apply filters
+                if agent_id and row.get("agent_id") != agent_id:
+                    continue
+                if tool and row.get("tool") != tool:
+                    continue
+                if pii_type and row.get("pii_type") != pii_type:
+                    continue
+                
+                # Handle date filters
+                if last_seen_min:
+                    last_seen = row.get("last_seen")
+                    if last_seen and last_seen < last_seen_min:
+                        continue
+                if last_seen_max:
+                    last_seen = row.get("last_seen")
+                    if last_seen and last_seen > last_seen_max:
+                        continue
+                
+                compliance_rows.append(ComplianceRow(
+                    agent_id=row.get("agent_id", ""),
+                    tool=row.get("tool", ""),
+                    field=row.get("field", ""),
+                    pii_type=row.get("pii_type", ""),
+                    frequency=row.get("frequency", 0)
+                ))
+            
+            await warm_store.close()
+            return compliance_rows
+            
+        except Exception as e:
+            logger.warning("Failed to query warm tier compliance catalog: %s", str(e))
+            return []
+    
+    def _merge_and_deduplicate_compliance_rows(self, rows: list[ComplianceRow]) -> list[ComplianceRow]:
+        """Merge compliance rows from different tiers, keeping highest frequency for duplicates."""
+        # Use (agent_id, tool, field, pii_type) as unique key
+        merged: dict[tuple[str, str, str, str], ComplianceRow] = {}
+        
+        for row in rows:
+            key = (row.agent_id, row.tool, row.field, row.pii_type)
+            
+            if key in merged:
+                # Keep the row with higher frequency
+                if row.frequency > merged[key].frequency:
+                    merged[key] = row
+            else:
+                merged[key] = row
+        
+        return list(merged.values())
+
     async def close(self) -> None:
         """Stop the flush worker, drain the buffer, close the writer."""
         self._shutdown.set()
@@ -387,34 +602,89 @@ class ComplianceCatalog:
 # ---------------------------------------------------------------------------
 
 
+# Environment config for tiered compliance catalog writing
+ENV_COMPLIANCE_TIER = "AGENT_OBS_COMPLIANCE_TIER"  # dual | warm_only | hot_only
+
+
 def build_compliance_catalog(*, flush_interval: float = 60.0) -> ComplianceCatalog:
     """Construct a ``ComplianceCatalog`` based on env configuration.
 
-    ``AGENT_OBS_COMPLIANCE_PG``:
-
+    ``AGENT_OBS_COMPLIANCE_PG`` controls Postgres warm tier (existing behavior):
     - ``on`` / ``1`` / ``true``  → ``PostgresCatalogWriter`` (asyncpg + DSN,
       default warm-tier DSN when ``COMPLIANCE_PG_DSN`` is unset).
     - ``off`` / ``0`` / ``false`` → ``NullCatalogWriter``.
     - unset / ``auto``           → Postgres if asyncpg is importable **and**
-      ``COMPLIANCE_PG_DSN`` is set; otherwise ``NullCatalogWriter``.
+      ``COMPLIANCE_PG_DSN`` is set; otherwise ``NullWriter``.
+
+    ``AGENT_OBS_COMPLIANCE_TIER`` controls ClickHouse hot tier (PC34):
+    - ``dual`` (default) → Postgres + ClickHouse writers
+    - ``warm_only`` → Postgres only (existing behavior)
+    - ``hot_only`` → ClickHouse only (for tiered retention)
     """
-    mode = os.environ.get(ENV_COMPLIANCE_PG, "auto").strip().lower()
-
-    if mode in ("off", "0", "false", "no"):
-        writer: CatalogWriter = NullCatalogWriter()
-    elif mode in ("on", "1", "true", "yes"):
-        writer = PostgresCatalogWriter()
-    else:  # auto
-        dsn = os.environ.get(ENV_COMPLIANCE_PG_DSN)
+    # Determine writers based on environment
+    tier_mode = os.environ.get(ENV_COMPLIANCE_TIER, "dual").strip().lower()
+    pg_mode = os.environ.get(ENV_COMPLIANCE_PG, "auto").strip().lower()
+    
+    writers: list[CatalogWriter] = []
+    
+    # Always add ClickHot writer if tier mode allows
+    if tier_mode in ("dual", "hot_only"):
         try:
-            import asyncpg  # noqa: F401
+            writers.append(HotCatalogWriter())
+        except Exception as e:
+            logger.warning("HotCatalogWriter unavailable: %s", str(e))
+            if tier_mode == "hot_only":
+                raise RuntimeError("Hot tier required but not available") from e
+    
+    # Add Postgres writer if PG mode allows and tier mode allows it
+    if pg_mode not in ("off", "0", "false", "no") and tier_mode in ("dual", "warm_only"):
+        if pg_mode in ("on", "1", "true", "yes"):
+            writer = PostgresCatalogWriter()
+        else:  # auto
+            dsn = os.environ.get(ENV_COMPLIANCE_PG_DSN)
+            try:
+                import asyncpg  # noqa: F401
+                has_asyncpg = True
+            except ImportError:
+                has_asyncpg = False
+            if has_asyncpg and dsn:
+                writer = PostgresCatalogWriter(dsn=dsn)
+            else:
+                writer = NullCatalogWriter()
+        writers.append(writer)
+    
+    if not writers:
+        raise RuntimeError(
+            "No compliance catalog writers available. "
+            "Check AGENT_OBS_COMPLIANCE_TIER and AGENT_OBS_COMPLIANCE_PG settings."
+        )
+    
+    # For multiple writers, create a composite writer
+    if len(writers) == 1:
+        return ComplianceCatalog(writers[0], flush_interval=flush_interval)
+    else:
+        return ComplianceCatalog(CompositeCatalogWriter(writers), flush_interval=flush_interval)
 
-            has_asyncpg = True
-        except ImportError:
-            has_asyncpg = False
-        if has_asyncpg and dsn:
-            writer = PostgresCatalogWriter(dsn=dsn)
-        else:
-            writer = NullCatalogWriter()
 
-    return ComplianceCatalog(writer, flush_interval=flush_interval)
+class CompositeCatalogWriter:
+    """Composite writer that writes to multiple catalog tiers."""
+    
+    def __init__(self, writers: list[CatalogWriter]) -> None:
+        self._writers = writers
+    
+    async def upsert(self, rows: list[ComplianceRow]) -> None:
+        """Write to all configured writers."""
+        for writer in self._writers:
+            try:
+                await writer.upsert(rows)
+            except Exception as e:
+                logger.warning("Compliance catalog writer failed: %s", str(e))
+                # Continue with other writers (don't fail the entire batch)
+    
+    async def close(self) -> None:
+        """Close all writers."""
+        for writer in self._writers:
+            try:
+                await writer.close()
+            except Exception as e:
+                logger.warning("Compliance catalog writer close failed: %s", str(e))

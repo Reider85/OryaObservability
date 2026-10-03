@@ -35,6 +35,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+# Avoid circular import - these are imported in scheduler.py when needed
+# from agent_obs.compliance.aggregate import aggregate_compliance_catalog
+# from agent_obs.compliance.migrate_hot_to_warm import (
+#     ComplianceHotToWarmResult,
+#     JOB_MIGREGATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
+#     migrate_compliance_catalog_hot_to_warm,
+#     register_compliance_hot_to_warm_migration_job,
+# )
+
 from agent_obs.metrics import (
     cron_duration_seconds,
     cron_errors_total,
@@ -61,6 +70,7 @@ JOB_DRIFT_DETECTION = "drift_detection"
 JOB_CALIBRATE_DRIFT_THRESHOLD = "calibrate_drift_threshold"
 JOB_EXPORT_EMBEDDINGS = "export_embeddings_to_phoenix"
 JOB_AGGREGATE_COMPLIANCE_CATALOG = "aggregate_compliance_catalog"
+JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM = "migrate_compliance_catalog_hot_to_warm"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 90
 DEFAULT_EVAL_RETENTION_DAYS = 7

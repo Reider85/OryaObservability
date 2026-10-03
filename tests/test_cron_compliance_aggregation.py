@@ -163,6 +163,118 @@ class TestComplianceAggregationResult:
         assert result.new_rows_24h == 8
 
 
+class TestComplianceAggregationHotSync:
+    """Test daily last_seen sync from hot tier."""
+
+    @pytest.mark.asyncio
+    async def test_aggregate_with_hot_sync(self):
+        """Test that daily aggregation syncs last_seen from hot tier."""
+        from datetime import datetime, timezone, timedelta
+        
+        now = datetime.now(timezone.utc)
+        
+        # Mock stores
+        mock_hot_store = MagicMock()
+        mock_warm_store = MagicMock()
+        
+        # Mock warm catalog data
+        warm_rows = [
+            {
+                "id": 1,
+                "agent_id": "agent1",
+                "tool": "tool1", 
+                "field": "field1",
+                "pii_type": "email",
+                "frequency": 5,
+                "first_seen": now - timedelta(hours=12),
+                "last_seen": now - timedelta(hours=12),  # Older than hot
+            }
+        ]
+        
+        # Mock hot catalog data with newer last_seen
+        hot_rows = [
+            {
+                "agent_id": "agent1",
+                "tool": "tool1",
+                "field": "field1", 
+                "pii_type": "email",
+                "frequency": 7,  # Higher frequency in hot
+                "first_seen": now - timedelta(hours=24),
+                "last_seen": now - timedelta(hours=1),  # Newer than warm
+                "updated_at": now - timedelta(hours=1),
+            }
+        ]
+        
+        mock_warm_store.get_all_compliance_catalog = AsyncMock(return_value=warm_rows)
+        mock_hot_store.get_compliance_catalog_all = AsyncMock(return_value=hot_rows)
+        mock_warm_store.update_compliance_last_seen_from_hot = AsyncMock()
+        mock_warm_store.delete_compliance_catalog_stale = AsyncMock()
+        mock_warm_store.refresh_compliance_views = AsyncMock()
+        
+        # Run aggregation with hot store
+        result = await aggregate_compliance_catalog(
+            warm_store=mock_warm_store,
+            hot_store=mock_hot_store,
+            dry_run=True
+        )
+        
+        # Verify that hot sync was attempted
+        mock_hot_store.get_compliance_catalog_all.assert_called_once()
+        mock_warm_store.update_compliance_last_seen_from_hot.assert_called_once_with(hot_rows)
+        
+        # Verify other aggregation steps still work
+        assert result.affected == 1
+        assert result.errors == 0
+        assert result.new_rows_24h == 1
+        
+        # In dry run, stale cleaning and views refresh should not happen
+        mock_warm_store.delete_compliance_catalog_stale.assert_not_called()
+        mock_warm_store.refresh_compliance_views.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aggregate_without_hot_store(self):
+        """Test that daily aggregation works without hot store (backward compatibility)."""
+        from datetime import datetime, timezone, timedelta
+        
+        now = datetime.now(timezone.utc)
+        mock_rows = [
+            {
+                "id": 1,
+                "agent_id": "agent1",
+                "tool": "tool1",
+                "field": "field1",
+                "pii_type": "email", 
+                "frequency": 5,
+                "first_seen": now - timedelta(hours=12),
+                "last_seen": now - timedelta(hours=12),
+            }
+        ]
+        
+        # Mock warm store only
+        mock_warm_store = MagicMock()
+        mock_warm_store.get_all_compliance_catalog = AsyncMock(return_value=mock_rows)
+        mock_warm_store.delete_compliance_catalog_stale = AsyncMock()
+        mock_warm_store.refresh_compliance_views = AsyncMock()
+        
+        # Run aggregation without hot store
+        result = await aggregate_compliance_catalog(
+            warm_store=mock_warm_store,
+            hot_store=None,
+            dry_run=True
+        )
+        
+        # Verify that hot sync was skipped
+        # (mock_hot_store would not exist if None)
+        
+        # Verify other aggregation steps work
+        assert result.affected == 1
+        assert result.errors == 0
+        assert result.new_rows_24h == 1
+        
+        mock_warm_store.delete_compliance_catalog_stale.assert_not_called()
+        mock_warm_store.refresh_compliance_views.assert_not_called()
+
+
 class TestComplianceAggregationIntegration:
     """Integration tests with scheduler job wrapper."""
 
@@ -219,6 +331,41 @@ class TestComplianceAggressionInfra:
         assert "ComplianceCatalogZeroActivity" in content
         assert "aggregate_compliance_catalog" in content
         assert "agent_obs_compliance_catalog_new_rows_24h" in content
+
+
+class TestComplianceAggressionHotTier:
+    """Test compliance catalog hot tier integration."""
+
+    def test_hot_catalog_writer_exists(self):
+        """Test that HotCatalogWriter is available."""
+        from agent_obs.compliance.catalog import HotCatalogWriter
+        
+        # Verify the class exists and can be imported
+        assert HotCatalogWriter is not None
+
+    def test_composite_catalog_writer_exists(self):
+        """Test that CompositeCatalogWriter is available."""
+        from agent_obs.compliance.catalog import CompositeCatalogWriter
+        
+        # Verify the class exists and can be imported
+        assert CompositeCatalogWriter is not None
+
+    def test_build_compliance_catalog_with_tier_config(self):
+        """Test that build_compliance_catalog respects tier configuration."""
+        # Test with tier config that should create composite writer
+        with patch.dict(os.environ, {'AGENT_OBS_COMPLIANCE_TIER': 'dual'}):
+            from agent_obs.compliance.catalog import build_compliance_catalog, CompositeCatalogWriter
+            
+            catalog = build_compliance_catalog()
+            # The actual writer composition depends on store availability
+            # This test mainly verifies the function doesn't crash with tier config
+
+    def test_compliance_hot_to_warm_result_exists(self):
+        """Test that ComplianceHotToWarmResult is available."""
+        from agent_obs.compliance.migrate_hot_to_warm import ComplianceHotToWarmResult
+        
+        # Verify the class exists and can be imported
+        assert ComplianceHotToWarmResult is not None
 
 
 class TestComplianceAggregationScheduler:

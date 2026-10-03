@@ -607,6 +607,124 @@ class HotStore:
         logger.info("spans_hot purged: traces=%d", len(trace_ids))
         return len(trace_ids)
 
+    # --- PC34: Compliance catalog hot tier methods ---
+
+    def upsert_compliance_catalog(self, rows: list[dict]) -> None:
+        """Write compliance catalog rows to compliance_catalog_hot.
+        
+        Uses ReplacingMergeTree to deduplicate by (agent_id, tool, field, pii_type).
+        Updates frequency, first_seen, last_seen, and updated_at on duplicate.
+        """
+        if not rows:
+            return
+        client = self._get_client()
+        
+        # Prepare batch of rows for ClickHouse
+        clickhouse_rows = []
+        for row in rows:
+            clickhouse_rows.append((
+                row["agent_id"],
+                row["tool"],
+                row["field"],
+                row["pii_type"],
+                row["frequency"],
+                row["first_seen"],
+                row["last_seen"],
+            ))
+        
+        client.execute(
+            """
+            INSERT INTO compliance_catalog_hot
+            (agent_id, tool, field, pii_type, frequency, first_seen, last_seen)
+            VALUES
+            """,
+            clickhouse_rows,
+        )
+        logger.debug(
+            "Compliance catalog hot upserted: rows=%d",
+            len(rows),
+        )
+
+    def get_compliance_catalog_last_seen_cutoff(
+        self, 
+        cutoff: datetime, 
+        limit: int = 10_000
+    ) -> list[dict]:
+        """Read compliance catalog rows with last_seen >= cutoff for warm migration.
+        
+        Returns dicts ordered by last_seen ASC for migration progress tracking.
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT agent_id, tool, field, pii_type, frequency, first_seen, last_seen, updated_at
+            FROM compliance_catalog_hot
+            WHERE last_seen >= %(cutoff)s
+            ORDER BY last_seen ASC
+            LIMIT %(limit)s
+            """,
+            {"cutoff": cutoff, "limit": limit},
+        )
+        
+        results: list[dict] = []
+        for row in rows:
+            results.append({
+                "agent_id": row[0],
+                "tool": row[1],
+                "field": row[2],
+                "pii_type": row[3],
+                "frequency": row[4],
+                "first_seen": row[5],
+                "last_seen": row[6],
+                "updated_at": row[7],
+            })
+        return results
+
+    def get_compliance_catalog_all(self) -> list[dict]:
+        """Read all compliance catalog rows from hot tier.
+        
+        Returns all rows ordered by last_seen DESC for testing/analysis.
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT agent_id, tool, field, pii_type, frequency, first_seen, last_seen, updated_at
+            FROM compliance_catalog_hot
+            ORDER BY last_seen DESC
+            """
+        )
+        
+        results: list[dict] = []
+        for row in rows:
+            results.append({
+                "agent_id": row[0],
+                "tool": row[1],
+                "field": row[2],
+                "pii_type": row[3],
+                "frequency": row[4],
+                "first_seen": row[5],
+                "last_seen": row[6],
+                "updated_at": row[7],
+            })
+        return results
+
+    def delete_compliance_catalog_older_than(self, cutoff: datetime) -> int:
+        """Delete compliance catalog rows with last_seen < cutoff from hot tier.
+        
+        Only called after successful warm-tier upsert (ship-first-delete-second).
+        
+        Returns:
+            Number of rows actually deleted.
+        """
+        client = self._get_client()
+        deleted = client.fetchval(
+            "DELETE FROM compliance_catalog_hot WHERE last_seen < %(cutoff)s RETURNING count(*)",
+            {"cutoff": cutoff},
+        )
+        deleted_count = int(deleted) if deleted else 0
+        logger.info("compliance_catalog_hot purged: rows=%d", deleted_count)
+        return deleted_count
+
     def _execute_clickhouse(self, query: str, params: dict | None = None) -> list[tuple]:
         """Execute a ClickHouse query and return results.
         

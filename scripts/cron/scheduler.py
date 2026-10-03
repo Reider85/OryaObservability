@@ -60,6 +60,10 @@ from agent_obs.storage.maintenance import (
 )
 
 from agent_obs.compliance.aggregate import aggregate_compliance_catalog
+from agent_obs.compliance.migrate_hot_to_warm import (
+    ComplianceHotToWarmResult,
+    migrate_compliance_catalog_hot_to_warm,
+)
 
 logging.basicConfig(
     level=os.environ.get("AGENT_OBS_LOG_LEVEL", "INFO"),
@@ -538,6 +542,19 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_COMPLIANCE_SPEC", "0 2 * * *"),  # 02:00 UTC daily
             _compliance_aggregation_job,
             86400,  # 24 hours
+        ),
+        CronJob(
+            JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
+            os.environ.get("AGENT_OBS_CRON_COMPLIANCE_MIGRATION_SPEC", "0 5 * * 1"),  # Monday 05:00 UTC weekly
+            lambda: run_cron_job_async(
+                JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
+                lambda: migrate_compliance_catalog_hot_to_warm(
+                    hot_store=build_hot_store(),
+                    warm_store=build_warm_store(),
+                    dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+                ),
+            ),
+            604800,  # 7 days in seconds (weekly)
         ),
     ]
 

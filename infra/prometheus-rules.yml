@@ -126,6 +126,21 @@ groups:
             No new compliance catalog rows in last 24 hours. Check guardrail
             functionality and agent traffic. This may indicate broken PII masking.
 
+  # PC34: Weekly compliance catalog hot to warm migration
+  - name: compliance-migration
+    rules:
+      - alert: ComplianceCatalogMigrationStale
+        expr: time() - agent_obs_cron_last_success_timestamp_seconds{job_name="migrate_compliance_catalog_hot_to_warm"} > 1209600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compliance catalog hot to warm migration has not succeeded for more than 2 weekly cycles"
+          description: >-
+            The weekly compliance catalog migration job has not succeeded for more than 2 cycles.
+            This may indicate issues with ClickHouse or Postgres connectivity, or the job is taking
+            longer than expected. Check the job logs and storage infrastructure.
+
   # PC25/PC26/PC27: Drift detection via KL-divergence on response embeddings.
   # The gauge agent_obs_drift_kl_score is emitted by the out-of-process cron
   # drift detection script (scripts/cron/drift_detection.py) every 15 minutes.
