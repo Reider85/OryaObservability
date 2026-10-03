@@ -1134,7 +1134,8 @@ class TestHotStoreTieredQueries:
 
     def test_spans_select_returns_full_shape(self, store, clickhouse):
         now = datetime.now(timezone.utc)
-        # 14 columns: spans_hot includes response_embedding column.
+        # 14 columns: spans_hot includes response_embedding column (PC24 sidecar:
+        # primary embedding store is span_embeddings, but spans_hot kept for compatibility).
         clickhouse.execute.return_value = [
             (
                 "trace-1", "span-1", "", "agent-1", "tenant-1",

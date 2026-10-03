@@ -224,11 +224,11 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.1.1 | PIIDetector с регулярками для email/phone/INN/passport/payment | **TODO** | `PC04` |
-| T2.1.2 | Интеграция CRF-модели (Presidio) для медицинского PII и ФИО | **TODO** | `PC05` |
-| T2.1.3 | Интеграция deberta-v3-base-prompt-injection для injection-детекции | **TODO** | `PC06` |
-| T2.1.4 | GuardrailEngine.check_input(text) -> GuardrailVerdict с score, verdict (clean/flag/block) | **TODO** | `PC07` |
-| T2.1.5 | Встроить guardrail в _enqueue() SDK: PII-маскинг синхронно, до любой передачи | **TODO** | `PC08` |
+| T2.1.1 | PIIDetector с регулярками для email/phone/INN/passport/payment | **DONE** | `PC04` |
+| T2.1.2 | Интеграция CRF-модели (Presidio) для медицинского PII и ФИО | **DONE** | `PC05` |
+| T2.1.3 | Интеграция deberta-v3-base-prompt-injection для injection-детекции | **DONE** | `PC06` |
+| T2.1.4 | GuardrailEngine.check_input(text) -> GuardrailVerdict с score, verdict (clean/flag/block) | **DONE** | `PC07` |
+| T2.1.5 | Встроить guardrail в _enqueue() SDK: PII-маскинг синхронно, до любой передачи | **DONE** | `PC08` |
 #### E2.2 — Field-aware PII masking (по типу поля)
 
 **ТРИЗ-обоснование.** Принцип 3 (местное качество): разные части span'а выполняют разные функции — system_prompt это контракт, user_message это приватный ввод. Blanket-маскинг снижает debuggability без увеличения privacy.
@@ -245,10 +245,10 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.2.1 | FieldMasker с конфигом по типам полей (YAML: system_prompt=no_mask, user_message=full, tool_output=partial) | **TODO** | `PC14` |
-| T2.2.2 | Для tool_output: парсить известные tool-схемы (SQL колонки, REST JSON-path), маскировать только PII-поля | **TODO** | `PC15` |
-| T2.2.3 | Сохранять pii.redacted_fields = ['user_message.email.5f3a', ...] в атрибутах span'а | **TODO** | `PC16` |
-| T2.2.4 | Тест: debug-сессия восстанавливает контекст без PII на 90% (выборка 100 трейсов) | **TODO** | `PC17` |
+| T2.2.1 | FieldMasker с конфигом по типам полей (YAML: system_prompt=no_mask, user_message=full, tool_output=partial) | **DONE** | `PC14` |
+| T2.2.2 | Для tool_output: парсить известные tool-схемы (SQL колонки, REST JSON-path), маскировать только PII-поля | **DONE** | `PC15` |
+| T2.2.3 | Сохранять pii.redacted_fields = ['user_message.email.5f3a', ...] в атрибутах span'а | **DONE** | `PC16` |
+| T2.2.4 | Тест: debug-сессия восстанавливает контекст без PII на 90% (выборка 100 трейсов) | **DONE** | `PC17` |
 #### E2.3 — Vault для PII-восстановления через MFA
 
 **ТРИЗ-обоснование.** Принцип 26 (копирование): оригинал PII заменяется маской, оригинал хранится отдельно. Стандарт 5.1.1: masked в продакшен-логах, оригинал в vault'е.
@@ -265,10 +265,10 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.3.1 | Развёртывание HashiCorp Vault (или аналог) с auto-unseal | **TODO** | `PC02` |
-| T2.3.2 | VaultClient.store(mask, original, ttl=24h) и VaultClient.recover(mask, mfa_token) | **TODO** | `PC18` |
-| T2.3.3 | Интеграция TOTP MFA (pyotp) для recovery | **TODO** | `PC19` |
-| T2.3.4 | Логирование каждого recovery в audit trail (кто, когда, какой mask, по какой причине) | **TODO** | `PC20` |
+| T2.3.1 | Развёртывание HashiCorp Vault (или аналог) с auto-unseal | **DONE** | `PC02` |
+| T2.3.2 | VaultClient.store(mask, original, ttl=24h) и VaultClient.recover(mask, mfa_token) | **DONE** | `PC18` |
+| T2.3.3 | Интеграция TOTP MFA (pyotp) для recovery | **DONE** | `PC19` |
+| T2.3.4 | Логирование каждого recovery в audit trail (кто, когда, какой mask, по какой причине) | **DONE** | `PC20` |
 | T2.3.5 | Cron-джоб для очистки истёкших TTL | **DONE** | `PC21` |
 #### E2.4 — Async eval-pipeline с late annotation
 
@@ -308,11 +308,11 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.5.1 | Хранить embeddings ответов в Hot store (ClickHouse column response_embedding Array(Float32)) | **TODO** | `PC24` |
-| T2.5.2 | Cron-джоб: каждые 15 минут вычислять KL-дивергенцию последнего часа vs baseline (7д минус последний час) | **TODO** | `PC25` |
-| T2.5.3 | Подобрать порог: p99 KL за последние 30 дней = alert threshold | **TODO** | `PC26` |
+| T2.5.1 | Хранить embeddings ответов в Hot store (ClickHouse column response_embedding Array(Float32)) | **DONE** | `PC24` |
+| T2.5.2 | Cron-джоб: каждые 15 минут вычислять KL-дивергенцию последнего часа vs baseline (7д минус последний час) | **DONE** | `PC25` |
+| T2.5.3 | Подобрать порог: p99 KL за последние 30 дней = alert threshold | **DONE** | `PC26` |
 | T2.5.4 | Alert в Alertmanager с лейблами agent_id, kl_divergence, baseline_window | **DONE** | `PC27` |
-| T2.5.5 | Интеграция с Phoenix UMAP-визуализатором для root-cause | **TODO** | `PC28` |
+| T2.5.5 | Интеграция с Phoenix UMAP-визуализатором для root-cause | **DONE** | `PC28` |
 #### E2.6 — Hot/Warm/Cold tiering storage
 
 **ТРИЗ-обоснование.** Принцип 18 (механические колебания): tiered retention с колеблющейся детализацией — 14 дней full, 90 дней structure+metrics, 1 год агрегаты. Принцип 17 (переход в другое измерение): трейс как многомерная структура.
@@ -329,11 +329,11 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.6.1 | Развёртывание ClickHouse с шардированием по agent_id и tenant_id | **TODO** | `PC01` |
-| T2.6.2 | Развёртывание Postgres для Warm (join с user/tenant сущностями) | **TODO** | `PC01` |
-| T2.6.3 | Развёртывание S3 + Parquet для Cold (Athena для запросов) | **TODO** | `PC01` |
-| T2.6.4 | Migration-джоб: ежедневно переносит трейсы старше 14 дней из Hot в Warm (со сжатием — удаляем llm.input_text, оставляем llm.input_chars и хэш) | **TODO** | `PC22` |
-| T2.6.5 | Migration-джоб: еженедельно переносит трейсы старше 90 дней из Warm в Cold (только агрегаты) | **TODO** | `PC23` |
+| T2.6.1 | Развёртывание ClickHouse с шардированием по agent_id и tenant_id | **DONE** | `PC01` |
+| T2.6.2 | Развёртывание Postgres для Warm (join с user/tenant сущностями) | **DONE** | `PC01` |
+| T2.6.3 | Развёртывание S3 + Parquet для Cold (Athena для запросов) | **DONE** | `PC01` |
+| T2.6.4 | Migration-джоб: ежедневно переносит трейсы старше 14 дней из Hot в Warm (со сжатием — удаляем llm.input_text, оставляем llm.input_chars и хэш) | **DONE** | `PC22` |
+| T2.6.5 | Migration-джоб: еженедельно переносит трейсы старше 90 дней из Warm в Cold (только агрегаты) | **DONE** | `PC23` |
 #### E2.7 — Adaptive sampling по load/error-rate
 
 **ТРИЗ-обоснование.** Принцип 15 (динамичность): характеристики сэмплера меняются так, чтобы быть оптимальными в каждом режиме. Стандарт 2.2.4 (динамизированный веполь): поле observability адаптируется к обстановке.
@@ -370,10 +370,10 @@
 
 | Тикет | Описание | Статус | Промпт |
 |---|---|---|---|
-| T2.8.1 | При каждом маскировании писать запись в compliance_catalog (агент, tool, field, PII type, frequency) | **TODO** | `PC33` |
-| T2.8.2 | Cron-джоб: ежедневная агрегация каталога | **TODO** | `PC34` |
-| T2.8.3 | Экспорт в формате GDPR Data Map (Excel/CSV) | **TODO** | `PC35` |
-| T2.8.4 | UI: страница «Data Map» в observability UI | **TODO** | `PC36` |
+| T2.8.1 | При каждом маскировании писать запись в compliance_catalog (агент, tool, field, PII type, frequency) | **DONE** | `PC33` |
+| T2.8.2 | Cron-джоб: ежедневная агрегация каталога | **DONE** | `PC34` |
+| T2.8.3 | Экспорт в формате GDPR Data Map (Excel/CSV) | **DONE** | `PC35` |
+| T2.8.4 | UI: страница «Data Map» в observability UI | **DONE** | `PC36` |
 ---
 
 ## 3. Уровень 3 — production-ready (6 месяцев)

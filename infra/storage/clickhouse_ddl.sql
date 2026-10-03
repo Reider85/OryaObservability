@@ -1,5 +1,7 @@
+-- clickhouse_ddl.sql
 -- ClickHouse DDL for observability database
--- This script creates the tables for hot-tier storage: spans_hot, eval_results_hot, audit_events_hot
+-- This script creates the tables for hot-tier storage: spans_hot,
+-- span_embeddings, eval_results_hot, audit_events_hot
 
 -- Create the observability database (if it doesn't exist)
 CREATE DATABASE IF NOT EXISTS observability;
@@ -17,6 +19,8 @@ USE observability;
 --
 -- response_embedding Array(Float32) DEFAULT [] for drift detection (PC24).
 -- ClickHouse supports Array but not Nullable(Array), so we use DEFAULT [].
+-- NOTE (PC24): the primary store for embeddings is span_embeddings (below).
+-- This column is kept for compatibility; do NOT write partial INSERTs here.
 CREATE TABLE IF NOT EXISTS spans_hot (
     trace_id String,
     span_id String,
@@ -38,6 +42,42 @@ ENGINE = MergeTree()
 ORDER BY (tenant_id, agent_id, start_time)
 PARTITION BY toYYYYMMDD(start_time)
 TTL start_time + INTERVAL 21 DAY
+SETTINGS index_granularity = 8192;
+
+-- IDEMPOTENT MIGRATION (PC24): heal existing volumes created before the
+-- response_embedding column existed. CREATE TABLE IF NOT EXISTS above never
+-- adds columns to existing tables, so a fresh install is fine but a volume
+-- created from an older DDL silently keeps the old shape. Re-running this
+-- script (docker compose run --rm clickhouse-init) applies the ALTER.
+ALTER TABLE spans_hot ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
+
+-- span_embeddings: response embeddings for drift detection + Phoenix export.
+--
+-- PC24 sidecar design: embeddings are produced asynchronously (after the LLM
+-- call) and cannot be attached to the spans_hot row in place — no production
+-- writer emits full span rows into spans_hot, so a partial INSERT would only
+-- create ghost rows with empty agent_id (drift queries filter on agent_id and
+-- would never match) and start_time=0 (Phoenix filters on start_time within
+-- the last hour). Storing them in a sidecar table with full keys avoids the
+-- ghost-row problem entirely.
+--
+-- INVARIANT: TTL must match spans_hot (21d) so embeddings do not outlive
+-- their spans. Embeddings do NOT survive the Hot→Warm migration (traces_warm
+-- has no embedding column) — same lifecycle as the column in spans_hot.
+CREATE TABLE IF NOT EXISTS span_embeddings (
+    trace_id String,
+    span_id String,
+    agent_id String,
+    tenant_id String,
+    model String DEFAULT 'text-embedding-3-small',
+    dims UInt16 DEFAULT 0,
+    embedding Array(Float32),
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (agent_id, created_at)
+PARTITION BY toYYYYMMDD(created_at)
+TTL created_at + INTERVAL 21 DAY
 SETTINGS index_granularity = 8192;
 
 -- eval_results_hot table: evaluation results for hot tier

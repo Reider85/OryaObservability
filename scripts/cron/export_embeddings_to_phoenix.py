@@ -54,19 +54,19 @@ def _get_clickhouse_client() -> HotStore:
 async def fetch_embeddings_from_clickhouse(
     hotstore: HotStore, limit: int = BATCH_SIZE
 ) -> list[dict]:
-    """Fetch embeddings from ClickHouse spans_hot table.
+    """Fetch embeddings from ClickHouse span_embeddings table.
 
-    Returns list of dicts with trace_id, agent_id, response_embedding.
+    Returns list of dicts with trace_id, agent_id, embedding.
     """
     try:
         client = hotstore._get_client()
         rows = client.execute(
             """
-            SELECT trace_id, agent_id, response_embedding
-            FROM spans_hot
-            WHERE response_embedding IS NOT NULL
-              AND start_time > now() - INTERVAL 1 HOUR
-            ORDER BY start_time DESC
+            SELECT trace_id, agent_id, embedding
+            FROM span_embeddings
+            WHERE length(embedding) > 0
+              AND created_at > now() - INTERVAL 1 HOUR
+            ORDER BY created_at DESC
             LIMIT %(limit)s
             """,
             {"limit": limit},

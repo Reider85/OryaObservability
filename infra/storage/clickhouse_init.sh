@@ -78,6 +78,35 @@ echo "Running DDL from ${DDL_PATH} on both shards..."
 client --database=observability --multiquery < "${DDL_PATH}"
 client2 --database=observability --multiquery < "${DDL_PATH}"
 
+# PC24: verify embedding storage schema on both shards. Fails the init loudly
+# if span_embeddings is missing or spans_hot never got the response_embedding
+# healing ALTER (existing volumes do not re-run CREATE TABLE IF NOT EXISTS).
+echo "Verifying PC24 embedding schema on shard 1..."
+client --database=observability --query "
+SELECT
+    table,
+    name,
+    type
+FROM system.columns
+WHERE database = 'observability'
+  AND table IN ('spans_hot', 'span_embeddings')
+  AND name IN ('response_embedding', 'embedding', 'agent_id', 'created_at')
+ORDER BY table, name
+"
+
+echo "Verifying PC24 embedding schema on shard 2..."
+client2 --database=observability --query "
+SELECT
+    table,
+    name,
+    type
+FROM system.columns
+WHERE database = 'observability'
+  AND table IN ('spans_hot', 'span_embeddings')
+  AND name IN ('response_embedding', 'embedding', 'agent_id', 'created_at')
+ORDER BY table, name
+"
+
 echo "Verifying tables on shard 1..."
 client --database=observability --query "
 SELECT

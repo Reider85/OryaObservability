@@ -530,7 +530,13 @@ class ObservabilitySDK:
         if embedding is not None:
             try:
                 self._embedding_queue.put_nowait(
-                    (span.context.trace_id, span.context.span_id, embedding)
+                    (
+                        span.context.trace_id,
+                        span.context.span_id,
+                        span.context.agent_id,
+                        span.attributes.get("tenant_id", ""),
+                        embedding,
+                    )
                 )
             except asyncio.QueueFull:
                 from agent_obs.metrics import embeddings_storage_failed_total
@@ -807,13 +813,13 @@ class ObservabilitySDK:
 
     async def _embedding_worker(self) -> None:
         """Background worker that drains the embedding queue and batch-inserts
-        into ClickHouse ``spans_hot.response_embedding``.
+        into ClickHouse ``span_embeddings``.
 
         Batches are flushed every 5 seconds or when the queue reaches 256
         entries, whichever comes first.  This keeps the main export path
         completely unblocked.
         """
-        batch: list[tuple[str, str, list[float]]] = []
+        batch: list[tuple[str, str, str, str, list[float]]] = []
         deadline: float = 0.0
 
         while True:
@@ -905,16 +911,20 @@ class ObservabilitySDK:
         agent_error_rate_5m.labels(agent_id=agent_id).set(errors / total)
 
     async def _flush_embedding_batch(
-        self, batch: list[tuple[str, str, list[float]]]
+        self, batch: list[tuple[str, str, str, str, list[float]]]
     ) -> None:
-        """Persist a batch of (trace_id, span_id, embedding) tuples.
+        """Persist a batch of (trace_id, span_id, agent_id, tenant_id, embedding) tuples.
 
-        Writes to ClickHouse spans_hot.response_embedding first, then falls back
-        to Redis if ClickHouse is unavailable (PC24).
+        Writes to ClickHouse span_embeddings first, then falls back to Redis if
+        ClickHouse is unavailable (PC24). Only successful ClickHouse writes
+        increment embeddings_stored_total; failures increment embeddings_storage_failed_total.
+        Redis fallback increments embeddings_redis_fallback_total.
         """
         from agent_obs.metrics import (
             embeddings_batch_size,
             embeddings_stored_total,
+            embeddings_storage_failed_total,
+            embeddings_redis_fallback_total,
         )
 
         if not batch:
@@ -925,18 +935,27 @@ class ObservabilitySDK:
         try:
             # Try ClickHouse first
             await self._embedding_clickhouse_write(batch)
+            embeddings_stored_total.inc(len(batch))
         except Exception as e:
+            embeddings_storage_failed_total.inc(len(batch))
             logger.warning("ClickHouse write failed, falling back to Redis: %s", e)
-            await self._embedding_redis_fallback(batch)
-        
-        embeddings_stored_total.inc(len(batch))
+            try:
+                await self._embedding_redis_fallback(batch)
+                embeddings_redis_fallback_total.inc(len(batch))
+            except Exception:
+                logger.warning(
+                    "Redis fallback for %d embeddings also failed; data lost",
+                    len(batch),
+                    exc_info=True,
+                )
 
     async def _embedding_clickhouse_write(
-        self, batch: list[tuple[str, str, list[float]]]
+        self, batch: list[tuple[str, str, str, str, list[float]]]
     ) -> None:
-        """Write embeddings to ClickHouse spans_hot.response_embedding column.
+        """Write embeddings to ClickHouse span_embeddings table.
         
         In sharded setup, writes to Distributed table which routes to appropriate shard.
+        Uses asyncio.to_thread to avoid blocking the event loop with sync clickhouse_driver.
         """
         from agent_obs.storage.hot import HotStore
         
@@ -944,21 +963,36 @@ class ObservabilitySDK:
         client = hot_store._get_client()
         
         rows = []
-        for trace_id, span_id, embedding in batch:
-            rows.append((trace_id, span_id, embedding))
+        for trace_id, span_id, agent_id, tenant_id, embedding in batch:
+            rows.append((
+                trace_id,
+                span_id,
+                agent_id,
+                tenant_id,
+                "text-embedding-3-small",  # default model
+                len(embedding),
+                embedding,
+            ))
         
-        client.execute(
+        # Use to_thread to avoid blocking the event loop with sync client.execute
+        await asyncio.to_thread(
+            client.execute,
             """
-            INSERT INTO spans_hot (trace_id, span_id, response_embedding)
+            INSERT INTO span_embeddings
+            (trace_id, span_id, agent_id, tenant_id, model, dims, embedding)
             VALUES
             """,
             rows,
         )
 
     async def _embedding_redis_fallback(
-        self, batch: list[tuple[str, str, list[float]]]
+        self, batch: list[tuple[str, str, str, str, list[float]]]
     ) -> None:
-        """Store embeddings in Redis with TTL 1 hour when ClickHouse is down."""
+        """Store embeddings in Redis with TTL 1 hour when ClickHouse is down (PC24).
+        
+        Stores as JSON with key format: embedding:{trace_id}:{span_id}
+        Used only as degraded fallback when ClickHouse is unavailable.
+        """
         try:
             import json
 
@@ -967,14 +1001,14 @@ class ObservabilitySDK:
             redis_url = os.environ.get("AGENT_OBS_REDIS_URL", "redis://localhost:6379")
             redis_client = aioredis.from_url(redis_url, decode_responses=True)
             pipe = redis_client.pipeline()
-            for trace_id, span_id, embedding in batch:
+            for trace_id, span_id, agent_id, tenant_id, embedding in batch:
                 key = f"embedding:{trace_id}:{span_id}"
                 pipe.set(key, json.dumps(embedding), ex=3600)  # TTL 1 hour
             await pipe.execute()
             await redis_client.aclose()
-            from agent_obs.metrics import eval_annotation_redis_fallback_total
-
-            eval_annotation_redis_fallback_total.inc(len(batch))
+            logger.info(
+                "Stored %d embeddings in Redis fallback", len(batch)
+            )
         except Exception:
             logger.warning(
                 "Redis fallback for %d embeddings also failed; data lost",

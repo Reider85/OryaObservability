@@ -163,6 +163,10 @@ class HotStore:
 
         Includes response_embedding Array(Float32) for drift detection (PC24).
         In sharded setup, writes to Distributed table which routes to appropriate shard.
+        NOTE (PC24): the primary embedding store is span_embeddings (sidecar);
+        this method writes the embedding column for compatibility but it's not
+        the main path for storing embeddings (they arrive asynchronously via
+        ObservabilitySDK._embedding_clickhouse_write).
         """
         if not spans:
             return
@@ -199,7 +203,12 @@ class HotStore:
         )
 
     def get_spans(self, trace_id: str) -> list[dict]:
-        """Retrieve all spans for a trace from spans_hot."""
+        """Retrieve all spans for a trace from spans_hot.
+        
+        Includes response_embedding Array(Float32) for drift detection (PC24).
+        The primary embedding store is span_embeddings (sidecar), but this method
+        returns the embedding field from spans_hot for compatibility.
+        """
         client = self._get_client()
         rows = client.execute(
             """
@@ -230,6 +239,7 @@ class HotStore:
                     "attributes": json.loads(row[10]) if isinstance(row[10], str) else row[10],
                     "events": json.loads(row[11]) if isinstance(row[11], str) else row[11],
                     "cost_usd": row[12],
+                    "response_embedding": row[13] if len(row) > 13 else [],
                 }
             )
         return spans

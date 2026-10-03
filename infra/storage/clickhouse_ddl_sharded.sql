@@ -1,5 +1,6 @@
 -- ClickHouse DDL for observability database with sharding
--- This script creates the tables for hot-tier storage: spans_hot, eval_results_hot, audit_events_hot
+-- This script creates the tables for hot-tier storage: spans_hot,
+-- span_embeddings, eval_results_hot, audit_events_hot
 -- For sharded setup, creates both local tables on each shard and Distributed tables for queries
 
 -- Create the observability database (if it doesn exist)
@@ -8,6 +9,8 @@ CREATE DATABASE IF NOT EXISTS observability;
 USE observability;
 
 -- Local tables for shard 1 (spans_hot_local, etc.)
+-- NOTE (PC24): response_embedding in spans_hot is kept for compatibility;
+-- the primary embedding store is span_embeddings (sidecar, below).
 CREATE TABLE IF NOT EXISTS spans_hot_local ON CLUSTER 'observability_cluster' (
     trace_id String,
     span_id String,
@@ -30,6 +33,42 @@ ORDER BY (tenant_id, agent_id, start_time)
 PARTITION BY toYYYYMMDD(start_time)
     TTL start_time + INTERVAL 21 DAY
     SETTINGS index_granularity = 8192;
+
+-- IDEMPOTENT MIGRATION (PC24): heal existing volumes created before the
+-- response_embedding column existed (CREATE TABLE IF NOT EXISTS never adds
+-- columns to existing tables). Re-run via docker compose run --rm clickhouse-init.
+ALTER TABLE spans_hot_local ON CLUSTER 'observability_cluster'
+    ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
+-- The Distributed table keeps its own metadata copy of the structure, so it
+-- needs the ALTER too (metadata-only; local data is untouched).
+ALTER TABLE spans_hot ON CLUSTER 'observability_cluster'
+    ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
+
+-- span_embeddings_local: response embeddings for drift detection + Phoenix
+-- export (PC24 sidecar). Embeddings arrive asynchronously and no production
+-- writer emits full span rows into spans_hot, so a partial INSERT would only
+-- create ghost rows (empty agent_id / start_time=0) that the readers can
+-- never match. A sidecar with full keys avoids this.
+--
+-- Sharded by agent_id (NOT tenant_id): SpanContext has no tenant_id field
+-- yet (ROADMAP T3.8.1), so sharding by tenant would funnel every row into
+-- one shard until tenants exist.
+-- TTL matches spans_hot (21d): embeddings must not outlive their spans.
+CREATE TABLE IF NOT EXISTS span_embeddings_local ON CLUSTER 'observability_cluster' (
+    trace_id String,
+    span_id String,
+    agent_id String,
+    tenant_id String,
+    model String DEFAULT 'text-embedding-3-small',
+    dims UInt16 DEFAULT 0,
+    embedding Array(Float32),
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (agent_id, created_at)
+PARTITION BY toYYYYMMDD(created_at)
+TTL created_at + INTERVAL 21 DAY
+SETTINGS index_granularity = 8192;
 
 -- Local table for eval_results_hot on shard 1
 CREATE TABLE IF NOT EXISTS eval_results_hot_local ON CLUSTER 'observability_cluster' (
@@ -73,6 +112,9 @@ SETTINGS index_granularity = 8192;
 -- Distributed tables for querying across shards
 CREATE TABLE IF NOT EXISTS spans_hot ON CLUSTER 'observability_cluster' AS spans_hot_local
 ENGINE = Distributed('observability_cluster', 'observability', 'spans_hot_local', tenant_id);
+
+CREATE TABLE IF NOT EXISTS span_embeddings ON CLUSTER 'observability_cluster' AS span_embeddings_local
+ENGINE = Distributed('observability_cluster', 'observability', 'span_embeddings_local', agent_id);
 
 CREATE TABLE IF NOT EXISTS eval_results_hot ON CLUSTER 'observability_cluster' AS eval_results_hot_local
 ENGINE = Distributed('observability_cluster', 'observability', 'eval_results_hot_local', tenant_id);

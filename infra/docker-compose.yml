@@ -641,6 +641,8 @@ volumes:
   eval_redis_data:
   clickhouse_data:
   clickhouse_logs:
+  clickhouse_data2:
+  clickhouse_logs2:
   minio_data:
   vault_data:
   phoenix_data:

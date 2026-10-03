@@ -271,11 +271,12 @@ account has no `CREATE USER` grant, so the app user is config-defined, not
 SQL-created). `clickhouse-init` runs `SYSTEM RELOAD CONFIG` so the user is
 live without a server restart.
 
-Known ClickHouse constraint: `Nullable(Array(...))` is illegal, so
-`spans_hot` has **no** `response_embedding` column (1C). Embeddings persist
-in Redis only until reintroduced as `Array(Float32) DEFAULT []` (1A) or moved
-out of ClickHouse (1B). Drift detection and the Phoenix export degrade
-(logged warning / empty result) while the column is absent.
+PC24: Embeddings are stored in `span_embeddings` sidecar table with full keys
+(agent_id, tenant_id, model, dims, embedding). The `spans_hot.response_embedding`
+column exists (Array(Float32) DEFAULT []) for compatibility but is not the primary
+store. Drift detection and Phoenix export query `span_embeddings` directly.
+For existing volumes created before the column: run `docker compose run --rm clickhouse-init`
+to apply idempotent ALTER migrations.
 
 ## 8. Useful commands
 
