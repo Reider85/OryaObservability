@@ -17,6 +17,8 @@ from typing import Any
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from prometheus_client import Counter, Histogram
+
 from agent_obs.storage.hot import HotStore
 
 # Configure logging
@@ -33,11 +35,21 @@ PHOENIX_BASE_URL = f"http://{PHOENIX_HOST}:{PHOENIX_PORT}"
 EXPORT_INTERVAL_SECONDS = int(os.environ.get("PHOENIX_EXPORT_INTERVAL", "300"))  # 5 minutes
 BATCH_SIZE = int(os.environ.get("PHOENIX_EXPORT_BATCH_SIZE", "1000"))
 
-# Prometheus metrics (will be exposed by scheduler.py)
-EXPORT_RUNS_TOTAL = 0
-EXPORT_ROWS_TOTAL = 0
-EXPORT_ERRORS_TOTAL = 0
-EXPORT_DURATION_SECONDS = 0.0
+# PC28: Prometheus metrics for Phoenix export (registered in default registry)
+# These will be served by the scheduler's :9777/metrics endpoint
+phoenix_export_runs_total = Counter(
+    "phoenix_export_runs_total",
+    "Number of Phoenix embedding export runs",
+)
+phoenix_export_duration_seconds = Histogram(
+    "phoenix_export_duration_seconds",
+    "Duration of Phoenix embedding export operations",
+    buckets=[1, 5, 10, 30, 60, 120, 300],
+)
+phoenix_export_rows_total = Counter(
+    "phoenix_export_rows_total",
+    "Number of rows exported to Phoenix",
+)
 
 
 def _get_clickhouse_client() -> HotStore:
@@ -155,8 +167,6 @@ async def run_phoenix_export() -> dict:
 
     Returns dict with metrics for Prometheus.
     """
-    global EXPORT_RUNS_TOTAL, EXPORT_ROWS_TOTAL, EXPORT_ERRORS_TOTAL, EXPORT_DURATION_SECONDS
-
     start_time = time.time()
     metrics = {
         "runs_total": 0,
@@ -177,8 +187,8 @@ async def run_phoenix_export() -> dict:
         if not embeddings:
             logger.info("No embeddings to export")
             metrics["duration_seconds"] = time.time() - start_time
-            EXPORT_RUNS_TOTAL += 1
-            EXPORT_DURATION_SECONDS += metrics["duration_seconds"]
+            phoenix_export_runs_total.inc()
+            phoenix_export_duration_seconds.observe(metrics["duration_seconds"])
             return metrics
 
         # Push to Phoenix
@@ -186,10 +196,9 @@ async def run_phoenix_export() -> dict:
 
         if success:
             metrics["rows_total"] = len(embeddings)
-            EXPORT_ROWS_TOTAL += len(embeddings)
+            phoenix_export_rows_total.inc(len(embeddings))
         else:
             metrics["errors_total"] = 1
-            EXPORT_ERRORS_TOTAL += 1
 
         # Cleanup
         hotstore.close()
@@ -197,11 +206,11 @@ async def run_phoenix_export() -> dict:
     except Exception as e:
         logger.error("Phoenix export run failed: %s", e)
         metrics["errors_total"] = 1
-        EXPORT_ERRORS_TOTAL += 1
 
-    metrics["duration_seconds"] = time.time() - start_time
-    EXPORT_RUNS_TOTAL += 1
-    EXPORT_DURATION_SECONDS += metrics["duration_seconds"]
+    duration = time.time() - start_time
+    metrics["duration_seconds"] = duration
+    phoenix_export_runs_total.inc()
+    phoenix_export_duration_seconds.observe(duration)
 
     logger.info(
         "Phoenix export completed: rows=%d, errors=%d, duration=%.2fs",

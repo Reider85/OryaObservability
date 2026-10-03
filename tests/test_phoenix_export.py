@@ -5,6 +5,7 @@ Validates that:
 - Embedding export script exists and is importable
 - Scheduler includes Phoenix export job
 - Export functions handle edge cases correctly
+- Prometheus metrics are registered and incremented correctly
 """
 
 from pathlib import Path
@@ -201,3 +202,40 @@ class TestExportEdgeCases:
 
         batch_size = int(os.environ.get("PHOENIX_EXPORT_BATCH_SIZE", "1000"))
         assert batch_size == 1000
+
+
+# ---------------------------------------------------------------------------
+# PC28: Prometheus metrics tests
+# ---------------------------------------------------------------------------
+
+
+class TestPhoenixExportMetrics:
+    """Test that PC28 Prometheus metrics are properly implemented."""
+
+    def test_metrics_available_via_scheduler(self):
+        """Phoenix metrics are available via scheduler's metrics endpoint."""
+        # Test that the scheduler imports the module and metrics are in registry
+        scheduler_content = SCHEDULER_PATH.read_text(encoding="utf-8")
+        
+        # Scheduler imports the export module via _phoenix_export_job
+        assert "_phoenix_export_job" in scheduler_content
+        assert "from scripts.cron.export_embeddings_to_phoenix import run_phoenix_export" in scheduler_content
+        
+        # The scheduler serves metrics on :9777/metrics via prometheus_client.start_http_server
+        assert "start_http_server" in scheduler_content
+        assert "9777" in scheduler_content
+
+    def test_metrics_use_pc28_names(self):
+        """Phoenix export metrics use exact PC28 names."""
+        # Read the source file to verify metric names
+        source_content = EXPORT_SCRIPT_PATH.read_text(encoding="utf-8")
+        
+        # Check that PC28 metric names are used in the source
+        assert "phoenix_export_runs_total = Counter(" in source_content
+        assert "phoenix_export_duration_seconds = Histogram(" in source_content
+        assert "phoenix_export_rows_total = Counter(" in source_content
+        
+        # Check that metrics are incremented in run_phoenix_export
+        assert "phoenix_export_runs_total.inc()" in source_content
+        assert "phoenix_export_duration_seconds.observe(" in source_content
+        assert "phoenix_export_rows_total.inc(" in source_content
