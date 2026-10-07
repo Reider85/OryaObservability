@@ -33,7 +33,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$RootDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$RootDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition | Split-Path -Parent
 $InfraDir  = Join-Path $RootDir 'infra'
 $ComposeFile = Join-Path $InfraDir 'docker-compose.yml'
 $OverrideFile = Join-Path $InfraDir 'docker-compose.override.yml'
@@ -154,14 +154,6 @@ if (-not (Test-Path $EnvFile)) {
 
 # Check for placeholder secrets (warnings only)
 $envContent = Get-Content $EnvFile
-$placeholders = @(
-    @{key='LANGFUSE_SALT'; pattern='change-me'; desc='Langfuse salt'},
-    @{key='NEXTAUTH_SECRET'; pattern='change-me'; desc='NextAuth secret'},
-    @{key='LANGFUSE_PUBLIC_KEY'; pattern='pk-lf-your'; desc='Langfuse public key'},
-    @{key='OPENAI_API_KEY'; pattern=''; desc='OpenAI API key (for eval worker/judge)'},
-    @{key='VAULT_TOKEN'; pattern=''; desc='Vault token (for PII recovery)'}
-)
-
 $placeholders = @(
     @{key='LANGFUSE_SALT'; pattern='change-me'; desc='Langfuse salt'},
     @{key='NEXTAUTH_SECRET'; pattern='change-me'; desc='NextAuth secret'},
