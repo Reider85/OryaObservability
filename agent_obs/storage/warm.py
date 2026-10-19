@@ -427,7 +427,8 @@ class WarmStore:
             
             async with pool.acquire() as conn:
                 # Update last_seen, first_seen, and frequency from hot tier
-                updated = await conn.fetchval(
+                # Use executemany for proper batch processing
+                updated = await conn.executemany(
                     """
                     INSERT INTO compliance_catalog
                         (agent_id, tool, field, pii_type, frequency, first_seen, last_seen)
@@ -438,11 +439,15 @@ class WarmStore:
                         first_seen = LEAST(compliance_catalog.first_seen, EXCLUDED.first_seen),
                         frequency = GREATEST(compliance_catalog.frequency, EXCLUDED.frequency),
                         updated_at = now()
-                    RETURNING count(*)
+                    RETURNING (xmax = 0) AS inserted
                     """,
-                    *values
+                    values
                 )
-                updated_count += int(updated) if updated else 0
+                
+                # Count inserted rows (where xmax = 0 means it was an insert, not update)
+                for row in updated:
+                    if row["inserted"]:
+                        updated_count += 1
         
         logger.debug(
             "Compliance catalog last_seen updated from hot tier: rows=%d",

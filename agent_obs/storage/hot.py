@@ -680,6 +680,85 @@ class HotStore:
             })
         return results
 
+    def get_compliance_catalog_all_batched(
+        self, 
+        batch_size: int = 1000,
+        last_trace_id: str | None = None
+    ) -> tuple[list[dict], str | None]:
+        """Read compliance catalog rows in batches for migration.
+        
+        Uses keyset pagination to efficiently scan all rows.
+        Returns (batch_rows, next_trace_id) where next_trace_id is None when done.
+        
+        Args:
+            batch_size: Number of rows to return per batch
+            last_trace_id: Trace ID from previous batch for pagination
+            
+        Returns:
+            Tuple of (batch_rows, next_trace_id)
+        """
+        client = self._get_client()
+        
+        if last_trace_id is None:
+            # First batch - get earliest rows
+            rows = client.execute(
+                """
+                SELECT agent_id, tool, field, pii_type, frequency, first_seen, last_seen, updated_at
+                FROM compliance_catalog_hot
+                ORDER BY last_seen ASC, agent_id ASC, tool ASC, field ASC, pii_type ASC
+                LIMIT %(limit)s
+                """,
+                {"limit": batch_size},
+            )
+        else:
+            # Subsequent batches - use keyset pagination
+            rows = client.execute(
+                """
+                SELECT agent_id, tool, field, pii_type, frequency, first_seen, last_seen, updated_at
+                FROM compliance_catalog_hot
+                WHERE (
+                    last_seen > %(cutoff)s OR
+                    (last_seen = %(cutoff)s AND agent_id > %(agent_id)s) OR
+                    (last_seen = %(cutoff)s AND agent_id = %(agent_id)s AND tool > %(tool)s) OR
+                    (last_seen = %(cutoff)s AND agent_id = %(agent_id)s AND tool = %(tool)s AND field > %(field)s) OR
+                    (last_seen = %(cutoff)s AND agent_id = %(agent_id)s AND tool = %(tool)s AND field = %(field)s AND pii_type > %(pii_type)s)
+                )
+                ORDER BY last_seen ASC, agent_id ASC, tool ASC, field ASC, pii_type ASC
+                LIMIT %(limit)s
+                """,
+                {
+                    "cutoff": last_trace_id.split("|")[0] if "|" in last_trace_id else last_trace_id,
+                    "agent_id": last_trace_id.split("|")[1] if "|" in last_trace_id else "",
+                    "tool": last_trace_id.split("|")[2] if "|" in last_trace_id else "",
+                    "field": last_trace_id.split("|")[3] if "|" in last_trace_id else "",
+                    "pii_type": last_trace_id.split("|")[4] if "|" in last_trace_id else "",
+                    "limit": batch_size,
+                },
+            )
+        
+        # Extract last values for pagination
+        if not rows:
+            return [], None
+        
+        results: list[dict] = []
+        for row in rows:
+            results.append({
+                "agent_id": row[0],
+                "tool": row[1],
+                "field": row[2],
+                "pii_type": row[3],
+                "frequency": row[4],
+                "first_seen": row[5],
+                "last_seen": row[6],
+                "updated_at": row[7],
+            })
+        
+        # Get the last row's values for pagination
+        last_row = rows[-1]
+        next_trace_id = f"{last_row[6]}|{last_row[0]}|{last_row[1]}|{last_row[2]}|{last_row[3]}"
+        
+        return results, next_trace_id
+
     def get_compliance_catalog_all(self) -> list[dict]:
         """Read all compliance catalog rows from hot tier.
         
@@ -717,12 +796,20 @@ class HotStore:
             Number of rows actually deleted.
         """
         client = self._get_client()
-        deleted = client.fetchval(
-            "DELETE FROM compliance_catalog_hot WHERE last_seen < %(cutoff)s RETURNING count(*)",
-            {"cutoff": cutoff},
-        )
-        deleted_count = int(deleted) if deleted else 0
-        logger.info("compliance_catalog_hot purged: rows=%d", deleted_count)
+        
+        # Count rows to be deleted first (ClickHouse doesn't support RETURNING)
+        count_query = "SELECT count() FROM compliance_catalog_hot WHERE last_seen < %(cutoff)s"
+        count_result = client.execute(count_query, {"cutoff": cutoff})
+        deleted_count = int(count_result[0][0]) if count_result else 0
+        
+        if deleted_count > 0:
+            # Delete old rows
+            client.execute(
+                "DELETE FROM compliance_catalog_hot WHERE last_seen < %(cutoff)s",
+                {"cutoff": cutoff},
+            )
+            logger.info("compliance_catalog_hot purged: rows=%d", deleted_count)
+        
         return deleted_count
 
     def _execute_clickhouse(self, query: str, params: dict | None = None) -> list[tuple]:

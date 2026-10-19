@@ -1,16 +1,20 @@
 """Daily aggregation of compliance catalog (PC34)."""
 
 import asyncio
+import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from prometheus_client import Counter, Gauge, Histogram
 
 from agent_obs.compliance.catalog import ComplianceRow
 from agent_obs.storage.maintenance import run_cron_job_async
 from agent_obs.storage.warm import WarmStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -106,8 +110,6 @@ async def aggregate_compliance_catalog(
             errors=cleaned_count,
             new_rows_24h=new_rows_24h,
         )
-    finally:
-        await warm_store.close()
 
 
 # Job name constant for scheduler

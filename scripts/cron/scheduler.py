@@ -46,6 +46,7 @@ from agent_obs.storage.maintenance import (
     JOB_EXPORT_EMBEDDINGS,
     JOB_MIGRATE_SPANS,
     JOB_MIGRATE_TRACES,
+    JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
     archive_expired_audit_events,
     build_cold_store,
     build_cold_trace_store,
@@ -471,14 +472,52 @@ def _compliance_aggregation_job() -> Awaitable[Any]:
     
     Updates last_seen, cleans stale records, refreshes views.
     """
-    return _run_sync(
-        JOB_AGGREGATE_COMPLIANCE_CATALOG,
-        lambda: aggregate_compliance_catalog(
-            warm_store=build_warm_store(),
-            retention_days=int(os.environ.get("AGENT_OBS_CRON_COMPLIANCE_RETENTION_DAYS", 90)),
-            dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
-        ),
-    )
+    warm = build_warm_store()
+    hot = build_hot_store()
+    
+    async def _runner() -> Any:
+        try:
+            return await run_cron_job_async(
+                JOB_AGGREGATE_COMPLIANCE_CATALOG,
+                aggregate_compliance_catalog,
+                warm_store=warm,
+                hot_store=hot if hot.is_available() else None,
+                retention_days=int(os.environ.get("AGENT_OBS_CRON_COMPLIANCE_RETENTION_DAYS", 90)),
+                dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+            )
+        finally:
+            await warm.close()
+            if hot is not None:
+                hot.close()
+    
+    return _runner()
+
+
+def _compliance_hot_to_warm_job() -> Awaitable[Any]:
+    """PC34: weekly compliance catalog hot to warm migration.
+    
+    Moves compliance catalog rows from ClickHouse hot tier to Postgres warm tier,
+    then deletes old hot rows to enforce 14-day retention.
+    """
+    hot = build_hot_store()
+    warm = build_warm_store()
+    
+    async def _runner() -> Any:
+        try:
+            return await run_cron_job_async(
+                JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
+                migrate_compliance_catalog_hot_to_warm,
+                hot_store=hot,
+                warm_store=warm,
+                hot_retention_days=int(os.environ.get("AGENT_OBS_CRON_COMPLIANCE_HOT_RETENTION_DAYS", 14)),
+                batch_size=int(os.environ.get("AGENT_OBS_CRON_BATCH_SIZE", 1000)),
+                dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+            )
+        finally:
+            await warm.close()
+            hot.close()
+    
+    return _runner()
 
 
 def build_jobs() -> list[CronJob]:
@@ -546,14 +585,7 @@ def build_jobs() -> list[CronJob]:
         CronJob(
             JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
             os.environ.get("AGENT_OBS_CRON_COMPLIANCE_MIGRATION_SPEC", "0 5 * * 1"),  # Monday 05:00 UTC weekly
-            lambda: run_cron_job_async(
-                JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
-                lambda: migrate_compliance_catalog_hot_to_warm(
-                    hot_store=build_hot_store(),
-                    warm_store=build_warm_store(),
-                    dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
-                ),
-            ),
+            _compliance_hot_to_warm_job,
             604800,  # 7 days in seconds (weekly)
         ),
     ]
