@@ -1,11 +1,11 @@
 {
   "uid": "sampler-policy-history",
   "title": "Sampler Policy History",
-  "description": "PC32 (T2.7.4): current normal-trace sampling rate chosen by the adaptive policy engine, with reason annotations. Level 3 extends this with dropped_spans / cpu / error-rate correlation.",
-  "tags": ["agent-obs", "sampler", "pc32"],
+  "description": "PP03-PP06 (T3.1): adaptive sampling policy engine with eval-aware feedback loop. Tracks sampling rate changes, policy reasons, and correlates with system metrics.",
+  "tags": ["agent-obs", "sampler", "pc32", "pp03", "pp04", "pp05", "pp06"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": false,
   "refresh": "30s",
   "time": { "from": "now-6h", "to": "now" },
@@ -24,6 +24,20 @@
           "tags": [],
           "type": "dashboard"
         }
+      },
+      {
+        "name": "Sampling decisions",
+        "datasource": { "type": "clickhouse", "uid": "clickhouse" },
+        "enable": true,
+        "iconColor": "orange",
+        "expr": "SELECT timestamp, reason FROM audit_events_hot WHERE action = 'sampler.rate_change' AND timestamp > now() - 6h ORDER BY timestamp DESC LIMIT 50",
+        "titleFormat": "{{reason}}",
+        "target": {
+          "limit": 50,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        }
       }
     ]
   },
@@ -32,8 +46,8 @@
       "id": 1,
       "type": "timeseries",
       "title": "Sampler rate over time",
-      "description": "agent_obs_tail_sampler_current_rate, one series per policy_reason (cpu_high=0.05, error_high=0.30, default=0.10). Annotations mark every rate change.",
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "description": "agent_obs_tail_sampler_current_rate, one series per policy_reason (cpu_high=0.05, error_high=0.30, default=0.10, eval_feedback*=0.25/0.40, error_keep=1.0, cost_high_keep=1.0, security_keep=1.0, random=0.10). Annotations mark every rate change.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -71,20 +85,85 @@
     },
     {
       "id": 2,
+      "type": "piechart",
+      "title": "Sampling decisions by reason",
+      "description": "Distribution of sampling decisions by policy reason (PP03-PP04). Shows which policies are triggering most often.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "hideFrom": { "tooltip": false, "viz": false }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "right"
+        },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(agent_obs_tail_sampler_policy_evaluations_total[5m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "barchart",
+      "title": "Kept spans by reason",
+      "description": "Number of spans kept by each policy reason (stacked). Shows impact of different sampling policies.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "hideFrom": { "tooltip": false, "viz": false }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "hidden"
+        },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(agent_obs_tail_sampler_traces_sampled_total[5m])) by (decision)",
+          "legendFormat": "{{decision}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 4,
       "type": "timeseries",
-      "title": "Sampler rate changes",
-      "description": "Increase of agent_obs_tail_sampler_rate_changes_total per hour, labelled by from_reason → to_reason. Correlate with dropped_spans_total during an incident.",
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "title": "Eval score correlation",
+      "description": "Average faithfulness score over 5-minute window (PP04 feedback loop). Correlate with sampling rate changes.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "min": 0,
+          "max": 1,
           "custom": {
             "drawStyle": "line",
-            "lineWidth": 1,
-            "showPoints": "always",
-            "pointSize": 5,
+            "lineWidth": 2,
+            "showPoints": "never",
             "spanNulls": false
           }
         },
@@ -92,7 +171,7 @@
       },
       "options": {
         "legend": {
-          "calcs": ["sum"],
+          "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
@@ -102,8 +181,57 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "increase(agent_obs_tail_sampler_rate_changes_total[1h])",
-          "legendFormat": "{{from_reason}} → {{to_reason}}",
+          "expr": "avg_over_time(faithfulness_score[5m])",
+          "legendFormat": "faithfulness_score",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "System correlation",
+      "description": "System CPU ratio and agent error rate (PP0 baseline). Correlate with sampling rate changes.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_obs_system_cpu_ratio",
+          "legendFormat": "system_cpu_ratio",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "agent_obs_agent_error_rate_5m",
+          "legendFormat": "agent_error_rate_5m",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "range": true
