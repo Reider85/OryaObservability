@@ -6,12 +6,20 @@ Extends CRITICAL-сэмплер (PC29–PC32) до adaptive v2: eval-aware + dyn
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agent_obs.eval.base import EvalResult
+from agent_obs.metrics import (
+    tail_sampler_current_rate,
+    tail_sampler_rate_changes_total,
+    tail_sampler_traces_sampled_total,
+)
 from agent_obs.observability import Span
 
 logger = logging.getLogger(__name__)
@@ -279,3 +287,115 @@ def should_keep_content_with_decision(
     from agent_obs.content_sampling import should_keep_content
     
     return should_keep_content(trace_id, rate)
+
+
+@dataclass
+class FeedbackLoopPolicy:
+    """PP04: Feedback loop from eval_score_avg_5m to global sampling rate.
+    
+    Monitors average faithfulness score over 5-minute window and adjusts
+    global sampling rate accordingly:
+    - score >= 0.8: global_rate = 0.10 (normal)
+    - score < 0.8: global_rate = 0.25 (degradation)
+    - score < 0.6: global_rate = 0.40 (heavy degradation)
+    """
+    
+    prometheus_url: str = "http://localhost:9090"
+    query: str = 'avg_over_time(faithfulness_score[5m])'
+    cache_ttl: float = 30.0  # seconds
+    normal_rate: float = 0.10
+    degradation_rate: float = 0.25
+    heavy_degradation_rate: float = 0.40
+    
+    def __post_init__(self):
+        self._cache_time: float = 0.0
+        self._cached_score: float | None = None
+        self._current_rate: float = self.normal_rate
+        self._lock = asyncio.Lock()
+        self._logger = logging.getLogger(__name__)
+    
+    async def get_eval_score(self) -> float:
+        """Get average faithfulness score from Prometheus with caching."""
+        import aiohttp
+        
+        now = time.time()
+        if self._cached_score is not None and (now - self._cache_time) < self.cache_ttl:
+            return self._cached_score
+        
+        async with self._lock:
+            # Double-check after acquiring lock
+            if self._cached_score is not None and (now - self._cache_time) < self.cache_ttl:
+                return self._cached_score
+            
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
+                    params = {"query": self.query}
+                    async with session.get(f"{self.prometheus_url}/api/v1/query", params=params) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data["status"] == "success" and data["data"]["result"]:
+                                # Extract value from Prometheus response
+                                value = float(data["data"]["result"][0]["value"][1])
+                                self._cached_score = value
+                                self._cache_time = now
+                                self._logger.debug(f"Updated eval score cache: {value}")
+                                return value
+                            else:
+                                self._logger.warning(f"Prometheus query failed: {data}")
+                        else:
+                            self._logger.warning(f"Prometheus query failed: {response.status}")
+            except Exception as e:
+                self._logger.error(f"Error fetching eval score: {e}")
+            
+            # Return last known value or default
+            return self._cached_score if self._cached_score is not None else 0.5
+    
+    async def evaluate_rate(self) -> float:
+        """Evaluate global rate based on current eval score."""
+        score = await self.get_eval_score()
+        
+        old_rate = self._current_rate
+        
+        if score >= 0.8:
+            self._current_rate = self.normal_rate
+            reason = "normal"
+        elif score >= 0.6:
+            self._current_rate = self.degradation_rate
+            reason = "degradation"
+        else:
+            self._current_rate = self.heavy_degradation_rate
+            reason = "heavy_degradation"
+        
+        # Report rate change if different
+        if old_rate != self._current_rate:
+            self._report_rate_change(old_rate, self._current_rate, reason, score)
+        
+        return self._current_rate
+    
+    def _report_rate_change(self, old_rate: float, new_rate: float, reason: str, score: float) -> None:
+        """Report rate change to metrics and audit trail."""
+        # Update metrics
+        tail_sampler_current_rate.labels(policy_reason=f"eval_feedback_{reason}").set(new_rate)
+        tail_sampler_rate_changes_total.labels(
+            from_reason=f"eval_feedback_{self._get_reason_for_rate(old_rate)}",
+            to_reason=f"eval_feedback_{reason}"
+        ).inc()
+        
+        # Log to audit trail
+        self._logger.info(
+            f"Feedback loop: rate changed from {old_rate:.2f} to {new_rate:.2f} "
+            f"(reason: {reason}, eval_score: {score:.2f})"
+        )
+    
+    def _get_reason_for_rate(self, rate: float) -> str:
+        """Get reason label for a given rate."""
+        if rate == self.normal_rate:
+            return "normal"
+        elif rate == self.degradation_rate:
+            return "degradation"
+        else:
+            return "heavy_degradation"
+    
+    def get_current_rate(self) -> float:
+        """Get current rate (for testing)."""
+        return self._current_rate
