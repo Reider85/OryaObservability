@@ -66,9 +66,16 @@ docker compose -f infra/docker-compose.ha.yml up -d
 
 ## Rotation (every 90 days)
 
+**Recommended cadence**: Every 90 days to align with certificate validity period.
+Set up a cron job or GitHub Actions workflow to run rotation automatically.
+
 ```bash
+# Manual rotation with validation and rollback
 scripts/rotate-certs.sh           # rotate + rolling reload + handshake checks
 scripts/rotate-certs.sh --dry-run # print planned actions only
+
+# Example cron entry (run at 2 AM on the 1st of each month):
+# 0 2 1 * * cd /path/to/OryaObservability && ./scripts/rotate-certs.sh
 ```
 
 The script re-issues service certificates (the CA is untouched), refreshes the
@@ -86,8 +93,8 @@ AGENT_OBS_TLS_CERT=/path/to/sdk.pem
 AGENT_OBS_TLS_KEY=/path/to/sdk-key.pem   # optional if the PEM bundles the key
 ```
 
-`LangfuseExporter` reads these in `from_env()` and passes them to httpx as
-`verify=<CA context>` + `cert=(cert, key)`. TLS verification is always on —
+`LangfuseExporter` reads these in `from_env()` and configures an SSL context with
+the CA certificate and client certificate/key pair. TLS verification is always on —
 there is no `verify=False` path.
 
 ## Manual handshake verification

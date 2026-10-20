@@ -38,7 +38,13 @@ dc() {
     docker compose -f "${COMPOSE_FILE}" "$@"
 }
 
-echo "==> [1/4] Re-issuing service certificates (CA unchanged)"
+echo "==> [1/4] Backing up current certificates"
+BACKUP_DIR="${CERTS_DIR}/backup-$(date +%Y%m%d-%H%M%S)"
+run mkdir -p "${BACKUP_DIR}"
+run cp -r "${CERTS_DIR}"/* "${BACKUP_DIR}/"
+echo "Backed up to: ${BACKUP_DIR}"
+
+echo "==> [2/4] Re-issuing service certificates (CA unchanged)"
 run bash "${SCRIPT_DIR}/certs/issue-certs.sh"
 
 echo "==> [2/4] Refreshing mTLS cert volumes (certs-init)"
@@ -47,37 +53,114 @@ run dc run --rm --no-deps certs-init
 echo "==> [3/4] Rolling reload of services"
 
 # nginx: graceful reload, zero dropped connections
-run dc exec -T nginx-langfuse nginx -s reload || true
-run dc exec -T nginx-otel nginx -s reload || true
+run dc exec -T nginx-langfuse nginx -s reload
+run dc exec -T nginx-otel nginx -s reload
 
 # ClickHouse: re-reads openSSL server certs on SYSTEM RELOAD CONFIG
 for ch in clickhouse1 clickhouse2 clickhouse3 clickhouse4; do
     run dc exec -T "${ch}" clickhouse-client \
-        --query "SYSTEM RELOAD CONFIG" || true
+        --query "SYSTEM RELOAD CONFIG"
 done
 
 # Redis: CONFIG SET swaps cert files for new TLS connections
 for rd in redis-master redis-replica-1 redis-replica-2; do
     run dc exec -T "${rd}" redis-cli -a "${REDIS_AUTH:-orya-local-redis-secret}" \
-        CONFIG SET tls-cert-file /etc/redis/certs/redis.pem || true
+        CONFIG SET tls-cert-file /etc/redis/certs/redis.pem
     run dc exec -T "${rd}" redis-cli -a "${REDIS_AUTH:-orya-local-redis-secret}" \
-        CONFIG SET tls-key-file /etc/redis/certs/redis-key.pem || true
+        CONFIG SET tls-key-file /etc/redis/certs/redis-key.pem
 done
 
 # Vault / Postgres / pgBouncer / OTel Collector read certs at startup:
-# restart one node at a time to keep the quorum / pool alive.
+# restart one node at a time with health-gating to keep quorum/pool alive.
+echo "==> [3a/4] Health-gated restart of certificate-requiring services"
+
+# Function to wait for service health
+wait_for_health() {
+    local svc=$1
+    local timeout=30
+    local elapsed=0
+    echo -n "Waiting for ${svc} to be healthy..."
+    while [[ ${elapsed} -lt ${timeout} ]]; do
+        if dc exec -T "${svc}" curl -sf http://localhost: health > /dev/null 2>&1; then
+            echo " OK"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+        echo -n "."
+    done
+    echo " FAILED after ${timeout}s"
+    return 1
+}
+
+# Vault: restart secondary first, then primary to maintain quorum
 for svc in vault-2 vault-1; do
     run dc restart "${svc}"
+    if ! wait_for_health "${svc}"; then
+        echo "ERROR: ${svc} failed to become healthy, ROLLING BACK" >&2
+        run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
+        run dc run --rm --no-deps certs-init
+        exit 1
+    fi
 done
-for svc in pg-replica-2 pg-replica-1 pg-primary; do
+
+# Postgres: restart replicas first, then primary
+for svc in pg-replica-2 pg-replica-1; do
     run dc restart "${svc}"
+    if ! wait_for_health "${svc}"; then
+        echo "ERROR: ${svc} failed to become healthy, ROLLING BACK" >&2
+        run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
+        run dc run --rm --no-deps certs-init
+        exit 1
+    fi
 done
+
+# Primary postgres last (most critical)
+run dc restart pg-primary
+if ! wait_for_health "pg-primary"; then
+    echo "ERROR: pg-primary failed to become healthy, ROLLING BACK" >&2
+    run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
+    run dc run --rm --no-deps certs-init
+    exit 1
+fi
+
+# pgBouncer (single instance, restart quickly)
 run dc restart pgbouncer
+if ! wait_for_health "pgbouncer"; then
+    echo "ERROR: pgbouncer failed to become healthy, ROLLING BACK" >&2
+    run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
+    run dc run --rm --no-deps certs-init
+    exit 1
+fi
+
+# OTel collectors: restart all three
 for svc in otel-collector-3 otel-collector-2 otel-collector-1; do
     run dc restart "${svc}"
+    if ! wait_for_health "${svc}"; then
+        echo "ERROR: ${svc} failed to become healthy, ROLLING BACK" >&2
+        run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
+        run dc run --rm --no-deps certs-init
+        exit 1
+    fi
 done
 
 echo "==> [4/4] Validating mTLS handshakes (inside the compose network)"
+
+# Function to rollback on validation failure
+rollback_on_failure() {
+    echo "ERROR: Validation failed, ROLLING BACK to previous certificates" >&2
+    run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
+    run dc run --rm --no-deps certs-init
+    # Restart services with old certs (quick health checks not needed for rollback)
+    for svc in vault-1 vault-2 pg-primary pg-replica-1 pg-replica-2 pgbouncer otel-collector-1 otel-collector-2 otel-collector-3; do
+        run dc restart "${svc}"
+    done
+    for svc in nginx-langfuse nginx-otel; do
+        run dc exec -T "${svc}" nginx -s reload
+    done
+    echo "Rollback complete. Please check service logs for issues."
+    exit 1
+}
 
 # nginx LBs: TLS handshake from the test-client container (sdk identity)
 validate_nginx() {
@@ -97,7 +180,7 @@ with socket.create_connection(('${host}', ${port}), timeout=5) as s:
         echo "OK: ${name} ${host}:${port} mTLS handshake succeeded"
     else
         echo "ERROR: ${name} ${host}:${port} mTLS handshake FAILED" >&2
-        return 1
+        rollback_on_failure
     fi
 }
 
@@ -113,7 +196,7 @@ validate_service() {
         echo "OK: ${name} mTLS probe succeeded"
     else
         echo "ERROR: ${name} mTLS probe FAILED" >&2
-        return 1
+        rollback_on_failure
     fi
 }
 

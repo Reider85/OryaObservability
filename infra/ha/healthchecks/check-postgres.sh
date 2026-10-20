@@ -6,7 +6,7 @@
 set -e
 
 PG_PRIMARY="pg-primary"
-PG_STANDBYS=("pg-replica1" "pg-replica2")
+PG_STANDBYS=("pg-replica-1" "pg-replica-2")
 PG_PORT=5432
 PGBOUNCER_PORT=6432
 REPMGR_USER="repmgr"

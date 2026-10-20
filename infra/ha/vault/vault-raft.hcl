@@ -32,6 +32,7 @@ listener "tcp" {
   tls_key_file              = "/vault/certs/vault-key.pem"
   tls_ca_cert_file          = "/vault/certs/ca.pem"
   tls_disable_client_certs  = false
+  require_request_client_cert = true
 }
 
 api_addr     = "https://${VAULT_NODE_ID:-vault-1}:8200"

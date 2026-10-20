@@ -514,8 +514,70 @@ class TestInfraMtlsConfig:
         text = (
             REPO_ROOT / "infra" / "ha" / "postgres" / "pgbouncer.ini"
         ).read_text(encoding="utf-8")
-        assert "client_tls_sslmode = verify-ca" in text
+        assert "client_tls_sslmode = verify-full" in text  # Changed from verify-ca
         assert "server_tls_sslmode = verify-full" in text
+
+    def test_vault_enforces_client_cert_requirement(self) -> None:
+        # Main vault config
+        text = (
+            REPO_ROOT / "infra" / "ha" / "vault" / "vault-raft.hcl"
+        ).read_text(encoding="utf-8")
+        assert "tls_disable_client_certs  = false" in text or "tls_disable_client_certs = false" in text
+        assert "require_request_client_cert = true" in text
+        
+        # Compose vault-unseal config
+        compose_text = (REPO_ROOT / "infra" / "docker-compose.ha.yml").read_text(encoding="utf-8")
+        assert '"require_request_client_cert":true' in compose_text
+
+    def test_nginx_oss_compatible_no_plus_directives(self) -> None:
+        for name in ("nginx-langfuse.conf", "nginx-otel.conf"):
+            text = (REPO_ROOT / "infra" / "ha" / "nginx" / name).read_text(encoding="utf-8")
+            # NGINX Plus directives should be absent (but allow in comments)
+            assert "health_check" not in text, f"{name} contains Plus-only health_check"
+            # Check for actual sticky directive, not just in comments
+            lines = text.split('\n')
+            directive_lines = [line for line in lines if line.strip() and not line.strip().startswith('#')]
+            assert "sticky" not in ' '.join(directive_lines), f"{name} contains Plus-only sticky directive"
+            # OSS alternatives should be present
+            assert "ip_hash" in text, f"{name} missing ip_hash for session affinity"
+            # OTLP/HTTP should have separate upstream from gRPC
+            if name == "nginx-otel.conf":
+                assert "otel_collector_grpc_backend" in text
+                assert "otel_collector_http_backend" in text
+                # HTTP server should proxy to HTTP upstream
+                assert "proxy_pass https://otel_collector_http_backend" in text
+
+    def test_nginx_otel_http_upstream_correct(self) -> None:
+        text = (REPO_ROOT / "infra" / "ha" / "nginx" / "nginx-otel.conf").read_text(encoding="utf-8")
+        # Verify 4318 server proxies to HTTP upstream (not gRPC)
+        assert "listen 4318 ssl" in text
+        assert "proxy_pass https://otel_collector_http_backend" in text
+        # Verify 4317 server proxies to gRPC upstream
+        assert "listen 4317 ssl" in text
+        assert "grpc_pass grpcs://otel_collector_grpc_backend" in text
+
+    def test_postgres_docker_entrypoint_exists(self) -> None:
+        # Verify the postgres docker-entrypoint script exists (after postgress->postgres rename)
+        assert (REPO_ROOT / "infra" / "ha" / "postgres" / "docker-entrypoint-ha.sh").exists()
+
+    def test_ha_test_client_module_exists(self) -> None:
+        # Verify test_ha_client.py exists for HA smoke test
+        assert (REPO_ROOT / "test_ha_client.py").exists()
+
+    def test_healthcheck_scripts_use_correct_replica_names(self) -> None:
+        # check-postgres.sh
+        text = (REPO_ROOT / "infra" / "ha" / "healthchecks" / "check-postgres.sh").read_text(encoding="utf-8")
+        assert "pg-replica-1" in text
+        assert "pg-replica-2" in text
+        assert "pg-replica1" not in text  # old name
+        
+        # check-redis.sh  
+        text = (REPO_ROOT / "infra" / "ha" / "healthchecks" / "check-redis.sh").read_text(encoding="utf-8")
+        assert "redis-replica-1" in text
+        assert "redis-replica-2" in text
+        assert "redis-sentinel-1" in text
+        assert "redis-sentinel-2" in text
+        assert "redis-replica1" not in text  # old name
 
     def test_cert_material_is_gitignored(self) -> None:
         text = (REPO_ROOT / "infra" / "ha" / "certs" / ".gitignore").read_text(

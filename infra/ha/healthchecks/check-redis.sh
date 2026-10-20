@@ -5,8 +5,8 @@
 set -e
 
 REDIS_MASTER="redis-master"
-REDIS_REPLICAS=("redis-replica1" "redis-replica2")
-REDIS_SENTINELS=("redis-sentinel1" "redis-sentinel2" "redis-sentinel3")
+REDIS_REPLICAS=("redis-replica-1" "redis-replica-2")
+REDIS_SENTINELS=("redis-sentinel-1" "redis-sentinel-2" "redis-sentinel-3")
 REDIS_TLS_PORT=6380
 SENTINEL_PORT=26379
 REDIS_AUTH="${REDIS_AUTH:-orya-local-redis-secret}"
