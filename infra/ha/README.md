@@ -254,6 +254,18 @@ The HA infrastructure includes automated backups:
 
 ## Security
 
+### mTLS (PP02)
+
+All internal services in the HA stack communicate over mutual TLS using an
+internal CA (`infra/ha/certs/`). See [certs/README.md](certs/README.md) for
+issuance, rotation and SDK configuration.
+
+- Certificate issuance: `scripts/certs/generate-ca.sh` + `scripts/certs/issue-certs.sh`
+- Rotation (90-day cadence): `scripts/rotate-certs.sh`
+- SDK-side: `AGENT_OBS_TLS_CA` + `AGENT_OBS_TLS_CERT` (+ optional `AGENT_OBS_TLS_KEY`)
+- Public endpoints (nginx LBs :3000 / :4317 / :4318, OTel receivers) refuse
+  connections without a valid client certificate
+
 ### Authentication and Authorization
 
 - **PostgreSQL**: Role-based access control

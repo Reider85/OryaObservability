@@ -109,26 +109,35 @@ else
     failed_checks=$((failed_checks + 1))
 fi
 
-# Check nginx load balancers
+# Check nginx load balancers (mTLS listeners, PP02)
 echo ""
-echo "Checking nginx load balancers..."
+echo "Checking nginx load balancers (mTLS)..."
 echo "------------------------------"
 
-# Check nginx for Langfuse
-if curl -f -s "http://nginx-langfuse:3000/nginx_status" > /dev/null 2>&1; then
-    print_status "OK" "nginx Langfuse load balancer is accessible"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CERT_DIR="${MTLS_CERTS_DIR:-${SCRIPT_DIR}/../certs}"
+
+# Check mTLS listener for Langfuse
+if echo | openssl s_client -connect "nginx-langfuse:3000" \
+    -CAfile "${CERT_DIR}/internal-ca/ca.pem" \
+    -cert "${CERT_DIR}/sdk/sdk.pem" -key "${CERT_DIR}/sdk/sdk-key.pem" \
+    -verify_return_error > /dev/null 2>&1; then
+    print_status "OK" "nginx Langfuse LB is accessible (mTLS)"
     passed_checks=$((passed_checks + 1))
 else
-    print_status "ERROR" "nginx Langfuse load balancer is not accessible"
+    print_status "ERROR" "nginx Langfuse LB mTLS handshake failed"
     failed_checks=$((failed_checks + 1))
 fi
 
-# Check nginx for OTel
-if curl -f -s "http://nginx-otel:4317/nginx_status" > /dev/null 2>&1; then
-    print_status "OK" "nginx OTel load balancer is accessible"
+# Check mTLS listener for OTel
+if echo | openssl s_client -connect "nginx-otel:4318" \
+    -CAfile "${CERT_DIR}/internal-ca/ca.pem" \
+    -cert "${CERT_DIR}/sdk/sdk.pem" -key "${CERT_DIR}/sdk/sdk-key.pem" \
+    -verify_return_error > /dev/null 2>&1; then
+    print_status "OK" "nginx OTel LB is accessible (mTLS)"
     passed_checks=$((passed_checks + 1))
 else
-    print_status "ERROR" "nginx OTel load balancer is not accessible"
+    print_status "ERROR" "nginx OTel LB mTLS handshake failed"
     failed_checks=$((failed_checks + 1))
 fi
 

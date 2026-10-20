@@ -1,0 +1,8 @@
+# Generated PKI material must never be committed (PP02).
+# Only this .gitignore and README.md are tracked; everything else (CA, keys,
+# service certs, per-service openssl.cnf) is produced by
+# scripts/certs/generate-ca.sh + issue-certs.sh. ca-key.pem additionally
+# lives in Vault, not on disk long-term.
+*
+!.gitignore
+!README.md

@@ -7,13 +7,36 @@ set -e
 OTEL_NODES=("otel-collector-1" "otel-collector-2" "otel-collector-3")
 OTEL_PORT=4317
 OTEL_HTTP_PORT=8888
+OTEL_HEALTH_PORT=13133
 
-# Function to check OTel Collector connectivity
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CERT_DIR="${MTLS_CERTS_DIR:-${SCRIPT_DIR}/../certs}"
+CA_PEM="${CERT_DIR}/internal-ca/ca.pem"
+OTEL_CERT="${CERT_DIR}/otel-collector/otel-collector.pem"
+OTEL_KEY="${CERT_DIR}/otel-collector/otel-collector-key.pem"
+
+# Function to verify the mTLS handshake on the OTLP receiver
+check_otel_mtls() {
+    local host=$1
+    local port=$2
+
+    if echo | openssl s_client -connect "${host}:${port}" \
+        -CAfile "${CA_PEM}" -cert "${OTEL_CERT}" -key "${OTEL_KEY}" \
+        -verify_return_error > /dev/null 2>&1; then
+        echo "OK: OTel Collector ${host}:${port} mTLS handshake succeeded"
+        return 0
+    else
+        echo "ERROR: OTel Collector ${host}:${port} mTLS handshake failed"
+        return 1
+    fi
+}
+
+# Function to check OTel Collector connectivity (health extension, plain HTTP)
 check_otel_collector() {
     local host=$1
     local port=$2
-    
-    if curl -f -s "http://${host}:${port}/health" > /dev/null 2>&1; then
+
+    if curl -f -s "http://${host}:${port}/" > /dev/null 2>&1; then
         echo "OK: OTel Collector ${host}:${port} is accessible"
         return 0
     else
@@ -117,7 +140,7 @@ check_otel_cpu() {
 }
 
 # Main health check
-echo "Starting OTel Collector HA health check..."
+echo "Starting OTel Collector HA health check (mTLS)..."
 
 # Check individual OTel Collector nodes
 all_nodes_ok=true
@@ -125,7 +148,11 @@ all_metrics_ok=true
 all_info_ok=true
 
 for node in "${OTEL_NODES[@]}"; do
-    if ! check_otel_collector "$node" "$OTEL_PORT"; then
+    if ! check_otel_mtls "$node" "$OTEL_PORT"; then
+        all_nodes_ok=false
+    fi
+
+    if ! check_otel_collector "$node" "$OTEL_HEALTH_PORT"; then
         all_nodes_ok=false
     fi
     

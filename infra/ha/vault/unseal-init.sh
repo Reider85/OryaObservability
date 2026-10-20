@@ -1,25 +1,38 @@
 #!/bin/bash
 # Vault unseal bootstrap script
 # This script initializes the transit vault and unseals the raft nodes
+# mTLS (PP02): the transit vault listener requires client certificates.
 
 set -e
 
-VAULT_ADDR="http://localhost:8200"
+VAULT_ADDR="https://localhost:8200"
+VAULT_CACERT="${VAULT_CACERT:-/vault/certs/ca.pem}"
+VAULT_CLIENT_CERT="${VAULT_CLIENT_CERT:-/vault/certs/vault-unseal.pem}"
+VAULT_CLIENT_KEY="${VAULT_CLIENT_KEY:-/vault/certs/vault-unseal-key.pem}"
 VAULT_TRANSIT_TOKEN="vault-transit-token"
 VAULT_UNSEAL_TOKEN="vault-unseal-token"
+
+# Every call presents the vault-unseal mesh certificate and trusts the
+# internal CA (no -k / insecure flags anywhere).
+vtls() {
+    curl --cacert "${VAULT_CACERT}" \
+         --cert "${VAULT_CLIENT_CERT}" \
+         --key "${VAULT_CLIENT_KEY}" \
+         "$@"
+}
 
 echo "Starting Vault unseal initialization..."
 
 # Wait for Vault to be ready
-until curl -f -s "${VAULT_ADDR}/v1/sys/health"; do
+until vtls -f -s "${VAULT_ADDR}/v1/sys/health"; do
     echo "Waiting for Vault to be ready..."
     sleep 2
 done
 
 # Initialize Vault if not already initialized
-if ! curl -f -s "${VAULT_ADDR}/v1/sys/init" | grep -q "initialized.*true"; then
+if ! vtls -f -s "${VAULT_ADDR}/v1/sys/init" | grep -q "initialized.*true"; then
     echo "Initializing Vault..."
-    INIT_RESPONSE=$(curl -s -X PUT "${VAULT_ADDR}/v1/sys/init" \
+    INIT_RESPONSE=$(vtls -s -X PUT "${VAULT_ADDR}/v1/sys/init" \
         -H "Content-Type: application/json" \
         -d '{"secret_shares": 5, "secret_threshold": 3, "recovery_shares": 5, "recovery_threshold": 3}')
     
@@ -37,14 +50,14 @@ if ! curl -f -s "${VAULT_ADDR}/v1/sys/init" | grep -q "initialized.*true"; then
     
     # Enable transit backend
     echo "Enabling transit backend..."
-    curl -s -X PUT "${VAULT_ADDR}/v1/sys/mounts/transit" \
+    vtls -s -X PUT "${VAULT_ADDR}/v1/sys/mounts/transit" \
         -H "X-Vault-Token: $ROOT_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{"type": "transit"}'
     
     # Create a token for auto-unseal
     echo "Creating transit token for auto-unseal..."
-    TRANSIT_TOKEN_RESPONSE=$(curl -s -X POST "${VAULT_ADDR}/v1/auth/token/create" \
+    TRANSIT_TOKEN_RESPONSE=$(vtls -s -X POST "${VAULT_ADDR}/v1/auth/token/create" \
         -H "X-Vault-Token: $ROOT_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{"policies": ["root"], "ttl": "24h", "renewable": true}')
@@ -57,7 +70,7 @@ if ! curl -f -s "${VAULT_ADDR}/v1/sys/init" | grep -q "initialized.*true"; then
     KEY_NAME="vault-unseal-key"
     
     # Create the key
-    curl -s -X POST "${VAULT_ADDR}/v1/transit/keys/${KEY_NAME}" \
+    vtls -s -X POST "${VAULT_ADDR}/v1/transit/keys/${KEY_NAME}" \
         -H "X-Vault-Token: $ROOT_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{"type": "aes256-gcm96", "exportable": true}'
@@ -65,7 +78,7 @@ if ! curl -f -s "${VAULT_ADDR}/v1/sys/init" | grep -q "initialized.*true"; then
     # Store unseal keys in the transit backend
     while IFS= read -r unseal_key; do
         if [ -n "$unseal_key" ]; then
-            curl -s -X POST "${VAULT_ADDR}/v1/transit/encrypt/${KEY_NAME}" \
+            vtls -s -X POST "${VAULT_ADDR}/v1/transit/encrypt/${KEY_NAME}" \
                 -H "X-Vault-Token: $ROOT_TOKEN" \
                 -H "Content-Type: application/json" \
                 -d '{"plaintext": "'"$(echo -n "$unseal_key" | base64 -w 0)"'"}' | \
@@ -88,8 +101,9 @@ storage "raft" {
 }
 
 seal "transit" {
-  address = "http://vault-unseal:8200"
+  address = "https://vault-unseal:8200"
   token = "$VAULT_TRANSIT_TOKEN"
+  tls_ca_cert = "/vault/certs/ca.pem"
   disable_renewal = "false"
   mount_path = "transit/"
   key_name = "$KEY_NAME"
@@ -97,11 +111,14 @@ seal "transit" {
 
 listener "tcp" {
   address = "0.0.0.0:8200"
-  tls_disable = "true"
+  tls_cert_file = "/vault/certs/vault.pem"
+  tls_key_file = "/vault/certs/vault-key.pem"
+  tls_ca_cert_file = "/vault/certs/ca.pem"
+  tls_disable_client_certs = false
 }
 
-api_addr = "http://localhost:8200"
-cluster_addr = "http://vault-1:8200"
+api_addr = "https://localhost:8200"
+cluster_addr = "https://vault-1:8200"
 EOF
     
     # Copy the configuration to the raft nodes
@@ -122,7 +139,7 @@ else
         echo "Using existing unseal keys..."
         while IFS= read -r unseal_key; do
             if [ -n "$unseal_key" ]; then
-                curl -s -X PUT "${VAULT_ADDR}/v1/sys/unseal" \
+                vtls -s -X PUT "${VAULT_ADDR}/v1/sys/unseal" \
                     -H "Content-Type: application/json" \
                     -d '{"key": "'"$unseal_key"'"}' | \
                     jq -r '.sealed'
@@ -135,7 +152,7 @@ else
 fi
 
 # Check if Vault is unsealed
-SEALED_STATUS=$(curl -s "${VAULT_ADDR}/v1/sys/health" | jq -r '.sealed')
+SEALED_STATUS=$(vtls -s "${VAULT_ADDR}/v1/sys/health" | jq -r '.sealed')
 if [ "$SEALED_STATUS" = "false" ]; then
     echo "Vault successfully unsealed!"
 else

@@ -1,0 +1,19 @@
+<clickhouse>
+    <!-- mTLS (PP02 / T3.0.2): HTTPS + native secure ports with mandatory,
+         strictly verified client certificates. The plain HTTP port stays
+         available for in-cluster application clients that cannot present
+         client certificates (Langfuse). -->
+    <https_port>8443</https_port>
+    <tcp_port_secure>9440</tcp_port_secure>
+
+    <openSSL>
+        <server>
+            <certFile>/etc/clickhouse-server/certs/clickhouse.pem</certFile>
+            <privateKeyFile>/etc/clickhouse-server/certs/clickhouse-key.pem</privateKeyFile>
+            <caConfig>/etc/clickhouse-server/certs/ca.pem</caConfig>
+            <verificationMode>strict</verificationMode>
+            <loadSystemCA>true</loadSystemCA>
+            <cacheSessions>true</cacheSessions>
+        </server>
+    </openSSL>
+</clickhouse>

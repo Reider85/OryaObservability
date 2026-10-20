@@ -1,0 +1,107 @@
+# OTel Collector config for the HA stack with mTLS (PP02 / T3.0.2).
+#
+# HA-only variant of infra/otel-collector/config.yaml (that file also serves
+# the plaintext base stack and must stay unchanged):
+# - OTLP receivers require and verify client certificates.
+# - Exporter to Langfuse goes through the mTLS nginx-LB (https + client cert).
+# - Health-check extension stays on plain HTTP 13133 (loopback probes).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        tls:
+          cert_file: /etc/otelcol-contrib/certs/otel-collector.pem
+          key_file: /etc/otelcol-contrib/certs/otel-collector-key.pem
+          client_ca_file: /etc/otelcol-contrib/certs/ca.pem
+          min_version: "1.2"
+      http:
+        endpoint: 0.0.0.0:4318
+        tls:
+          cert_file: /etc/otelcol-contrib/certs/otel-collector.pem
+          key_file: /etc/otelcol-contrib/certs/otel-collector-key.pem
+          client_ca_file: /etc/otelcol-contrib/certs/ca.pem
+          min_version: "1.2"
+
+processors:
+  # P20 (E1.3): tail-sampling policy — «интересные» трейсы сохраняются всегда,
+  # обычные — только probabilistic-доля (ТРИЗ Принцип 16).
+  # Атрибуты root-span'а (cost.over_budget / security.incident / status)
+  # заполняются SDK-агрегацией в _enqueue (см. ObservabilitySDK).
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 10000
+    expected_new_traces_per_sec: 100
+    policies:
+      # 1) Ошибки → keep 100%
+      - name: error-keep
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      # 2) Превышение бюджета (cost.usd_sum > TAIL_SAMPLER_COST_THRESHOLD) → keep 100%
+      - name: cost-over-budget-keep
+        type: string_attribute
+        string_attribute:
+          key: cost.over_budget
+          values: ["true"]
+      # 3) Security-инцидент (заглушка на MVP, SDK выставляет "false") → keep 100%
+      - name: security-incident-keep
+        type: string_attribute
+        string_attribute:
+          key: security.incident
+          values: ["true"]
+      # 4) Обычные трейсы → probabilistic TAIL_SAMPLER_NORMAL_RATE% (по умолчанию 10)
+      - name: normal-sample
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${env:TAIL_SAMPLER_NORMAL_RATE}
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+extensions:
+  basicauth/langfuse:
+    client_auth:
+      username: ${env:LANGFUSE_PUBLIC_KEY}
+      password: ${env:LANGFUSE_SECRET_KEY}
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+exporters:
+  otlphttp/langfuse:
+    # Langfuse is exposed through the mTLS nginx LB; the collector presents
+    # its mesh client certificate (PP02).
+    endpoint: https://nginx-langfuse:3000/api/public/otel
+    auth:
+      authenticator: basicauth/langfuse
+    tls:
+      cert_file: /etc/otelcol-contrib/certs/otel-collector.pem
+      key_file: /etc/otelcol-contrib/certs/otel-collector-key.pem
+      ca_file: /etc/otelcol-contrib/certs/ca.pem
+      min_version: "1.2"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 200ms
+      max_interval: 30s
+      max_elapsed_time: 60s
+  debug:
+    verbosity: basic
+
+service:
+  extensions: [basicauth/langfuse, health_check]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+      level: normal
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [otlphttp/langfuse, debug]

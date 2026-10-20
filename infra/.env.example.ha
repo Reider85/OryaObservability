@@ -113,13 +113,23 @@ BACKUP_RETENTION=30
 BACKUP_COMPRESSION=true
 
 # Security settings
-ENABLE_TLS=true
-TLS_CERT_PATH=/etc/ssl/certs
-TLS_KEY_PATH=/etc/ssl/private
+# mTLS (PP02): internal CA + per-service mesh certificates.
+# Generate with: scripts/certs/generate-ca.sh && scripts/certs/issue-certs.sh
 ENABLE_AUTH=true
 AUTH_METHOD=oauth2
 JWT_SECRET=your-jwt-secret-here
 API_KEYS=your-api-keys-here
+
+# SDK-side mTLS (PP02): point the agent SDK at the internal CA and its
+# client certificate. AGENT_OBS_TLS_KEY may be omitted when the cert PEM
+# already bundles the private key.
+AGENT_OBS_TLS_CA=./ha/certs/internal-ca/ca.pem
+AGENT_OBS_TLS_CERT=./ha/certs/sdk/sdk.pem
+AGENT_OBS_TLS_KEY=./ha/certs/sdk/sdk-key.pem
+
+# Public endpoints are mTLS-protected (nginx LBs verify client certs)
+LANGFUSE_HOST=https://localhost:3000
+OTEL_ENDPOINT=https://localhost:4318
 
 # Monitoring and logging
 LOG_LEVEL=info

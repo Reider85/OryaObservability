@@ -6,9 +6,11 @@ name: orya-observability-ha
 
 # Shared environment for langfuse-web and langfuse-worker (Langfuse v3 HA)
 x-langfuse-env: &langfuse-env
-  NEXTAUTH_URL: ${LANGFUSE_HOST:-http://localhost:3000}
+  NEXTAUTH_URL: ${LANGFUSE_HOST:-https://localhost:3000}
   NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-my-observability-session-secret}
-  DATABASE_URL: ${DATABASE_URL:-postgresql://langfuse:langfuse@pg-primary:5432/langfuse}
+  # mTLS (PP02): Prisma connects to Postgres with the langfuse mesh cert
+  # (CN=langfuse matches the database role under `cert clientcert=verify-full`)
+  DATABASE_URL: "${DATABASE_URL:-postgresql://langfuse:langfuse@pg-primary:5432/langfuse?sslmode=verify-full&sslrootcert=/var/lib/postgresql/certs/ca.pem&sslcert=/var/lib/postgresql/certs/langfuse.pem&sslkey=/var/lib/postgresql/certs/langfuse-key.pem}"
   SALT: ${LANGFUSE_SALT}
   ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
   TELEMETRY_ENABLED: "false"
@@ -43,6 +45,25 @@ x-langfuse-env: &langfuse-env
   LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
 
 services:
+  # --- mTLS material: populate per-service cert volumes once (PP02) ---
+  certs-init:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - ./ha/certs:/src/certs:ro
+      - ./ha/certs-init.sh:/usr/local/bin/certs-init.sh:ro
+      - certs_postgres:/volumes/certs_postgres
+      - certs_pgbouncer:/volumes/certs_pgbouncer
+      - certs_redis:/volumes/certs_redis
+      - certs_vault:/volumes/certs_vault
+      - certs_vault_unseal:/volumes/certs_vault_unseal
+      - certs_clickhouse:/volumes/certs_clickhouse
+      - certs_nginx:/volumes/certs_nginx
+      - certs_otel:/volumes/certs_otel
+      - certs_langfuse:/volumes/certs_langfuse
+      - certs_sdk:/volumes/certs_sdk
+    entrypoint: ["/bin/sh", "/usr/local/bin/certs-init.sh"]
+
   # --- ClickHouse HA: 2 shards × 2 replicas + Keeper quorum ---
   clickhouse1:
     # Pinned: 26.9 verified live against this DDL (JSON columns, UUID,
@@ -53,6 +74,9 @@ services:
     image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
     user: "101:101"
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       CLICKHOUSE_DB: observability
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
@@ -60,6 +84,9 @@ services:
     volumes:
       - clickhouse_data1:/var/lib/clickhouse
       - clickhouse_logs1:/var/log/clickhouse-server
+      # mTLS: HTTPS/native-secure ports with verified client certs (PP02)
+      - ./ha/clickhouse-tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - certs_clickhouse:/etc/clickhouse-server/certs:ro
       # HA DDL with ReplicatedMergeTree engines
       - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
@@ -86,6 +113,9 @@ services:
     image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
     user: "101:101"
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       CLICKHOUSE_DB: observability
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
@@ -95,6 +125,9 @@ services:
     volumes:
       - clickhouse_data2:/var/lib/clickhouse
       - clickhouse_logs2:/var/log/clickhouse-server
+      # mTLS: HTTPS/native-secure ports with verified client certs (PP02)
+      - ./ha/clickhouse-tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - certs_clickhouse:/etc/clickhouse-server/certs:ro
       # HA DDL with ReplicatedMergeTree engines
       - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
@@ -121,6 +154,9 @@ services:
     image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
     user: "101:101"
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       CLICKHOUSE_DB: observability
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
@@ -130,6 +166,9 @@ services:
     volumes:
       - clickhouse_data3:/var/lib/clickhouse
       - clickhouse_logs3:/var/log/clickhouse-server
+      # mTLS: HTTPS/native-secure ports with verified client certs (PP02)
+      - ./ha/clickhouse-tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - certs_clickhouse:/etc/clickhouse-server/certs:ro
       # HA DDL with ReplicatedMergeTree engines
       - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
@@ -156,6 +195,9 @@ services:
     image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
     user: "101:101"
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       CLICKHOUSE_DB: observability
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
@@ -165,6 +207,9 @@ services:
     volumes:
       - clickhouse_data4:/var/lib/clickhouse
       - clickhouse_logs4:/var/log/clickhouse-server
+      # mTLS: HTTPS/native-secure ports with verified client certs (PP02)
+      - ./ha/clickhouse-tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
+      - certs_clickhouse:/etc/clickhouse-server/certs:ro
       # HA DDL with ReplicatedMergeTree engines
       - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
@@ -284,6 +329,9 @@ services:
   pg-primary:
     image: postgres:17
     restart: unless-stopped
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-langfuse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
@@ -301,10 +349,32 @@ services:
       REPMGR_SERVICE: "primary"
       REPMGR_DATA_DIRECTORY: "/var/lib/postgresql/data"
       REPMGR_LOG_LEVEL: INFO
+      # mTLS client identity for repmgr/libpq connections (PP02): CN=repmgr
+      # matches the database role required by `cert clientcert=verify-full`
+      PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
+      PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
+      PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
     volumes:
       - postgres_primary_data:/var/lib/postgresql/data
       - ./ha/postgres/docker-entrypoint-ha.sh:/docker-entrypoint-initdb.d/01-repmgr.sh:ro
       - ./ha/postgres/repmgr.conf:/etc/repmgr.conf:ro
+      # mTLS (PP02): server cert + cert-only pg_hba
+      - ./ha/postgres/pg_hba_mtls.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs_postgres:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -322,6 +392,9 @@ services:
   pg-replica-1:
     image: postgres:17
     restart: unless-stopped
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-langfuse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
@@ -343,10 +416,31 @@ services:
       POSTGRES_REPLICATION_USER: repmgr
       POSTGRES_REPLICATION_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
       POSTGRES_PRIMARY_CONNINFO: "host=pg-primary port=5432 user=repmgr password=${REPMGR_PASSWORD:-repmgr} dbname=${POSTGRES_DB:-langfuse}"
+      # mTLS client identity for repmgr/libpq connections (PP02)
+      PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
+      PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
+      PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
     volumes:
       - postgres_replica1_data:/var/lib/postgresql/data
       - ./ha/postgres/docker-entrypoint-ha.sh:/docker-entrypoint-initdb.d/01-repmgr.sh:ro
       - ./ha/postgres/repmgr.conf:/etc/repmgr.conf:ro
+      # mTLS (PP02): server cert + cert-only pg_hba
+      - ./ha/postgres/pg_hba_mtls.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs_postgres:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -362,6 +456,9 @@ services:
   pg-replica-2:
     image: postgres:17
     restart: unless-stopped
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-langfuse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
@@ -383,10 +480,31 @@ services:
       POSTGRES_REPLICATION_USER: repmgr
       POSTGRES_REPLICATION_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
       POSTGRES_PRIMARY_CONNINFO: "host=pg-primary port=5432 user=repmgr password=${REPMGR_PASSWORD:-repmgr} dbname=${POSTGRES_DB:-langfuse}"
+      # mTLS client identity for repmgr/libpq connections (PP02)
+      PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
+      PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
+      PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
     volumes:
       - postgres_replica2_data:/var/lib/postgresql/data
       - ./ha/postgres/docker-entrypoint-ha.sh:/docker-entrypoint-initdb.d/01-repmgr.sh:ro
       - ./ha/postgres/repmgr.conf:/etc/repmgr.conf:ro
+      # mTLS (PP02): server cert + cert-only pg_hba
+      - ./ha/postgres/pg_hba_mtls.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs_postgres:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -403,12 +521,19 @@ services:
   pgbouncer:
     image: eduardoborba/pgbouncer:1.22-alpine
     restart: unless-stopped
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      pg-primary:
+        condition: service_healthy
     environment:
       PGBOUNCER_AUTH_FILE: /etc/pgbouncer/users.txt
       PGBOUNCER_HBA_FILE: /etc/pgbouncer/pg_hba.conf
     volumes:
       - ./ha/postgres/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - ./ha/postgres/pgbouncer-users.txt:/etc/pgbouncer/users.txt:ro
+      # mTLS (PP02): client-side verify-ca, upstream verify-full as langfuse
+      - certs_pgbouncer:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "pgbounce -c /etc/pgbouncer/pgbouncer.ini --check"]
       interval: 30s
@@ -427,11 +552,18 @@ services:
   redis-master:
     image: redis:7
     restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+    # mTLS listener on 6380 (tls-auth-clients require); 6379 stays for
+    # in-cluster app clients that cannot present client certs (PP02)
+    command: redis-server /etc/redis/redis-tls.conf --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
     environment:
       REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
     volumes:
       - redis_master_data:/data
+      - ./ha/redis/redis-tls.conf:/etc/redis/redis-tls.conf:ro
+      - certs_redis:/etc/redis/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
       interval: 10s
@@ -447,11 +579,18 @@ services:
   redis-replica-1:
     image: redis:7
     restart: unless-stopped
-    command: redis-server --replicaof redis-master 6379 --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+    command: redis-server /etc/redis/redis-tls.conf --replicaof redis-master 6379 --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
     environment:
       REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
     volumes:
       - redis_replica1_data:/data
+      - ./ha/redis/redis-tls.conf:/etc/redis/redis-tls.conf:ro
+      - certs_redis:/etc/redis/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
       interval: 10s
@@ -467,11 +606,18 @@ services:
   redis-replica-2:
     image: redis:7
     restart: unless-stopped
-    command: redis-server --replicaof redis-master 6379 --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      redis-master:
+        condition: service_healthy
+    command: redis-server /etc/redis/redis-tls.conf --replicaof redis-master 6379 --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
     environment:
       REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
     volumes:
       - redis_replica2_data:/data
+      - ./ha/redis/redis-tls.conf:/etc/redis/redis-tls.conf:ro
+      - certs_redis:/etc/redis/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
       interval: 10s
@@ -543,11 +689,20 @@ services:
     image: hashicorp/vault:1.18
     restart: unless-stopped
     cap_add: ["IPC_LOCK"]
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     environment:
-      VAULT_LOCAL_CONFIG: '{"storage":{"file":{"path":"/vault/data"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+      # mTLS listener (PP02): the transit vault also requires client certs
+      VAULT_LOCAL_CONFIG: '{"storage":{"file":{"path":"/vault/data"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_cert_file":"/vault/certs/vault-unseal.pem","tls_key_file":"/vault/certs/vault-unseal-key.pem","tls_ca_cert_file":"/vault/certs/ca.pem","tls_disable_client_certs":false}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+      VAULT_ADDR: https://localhost:8200
+      VAULT_CACERT: /vault/certs/ca.pem
+      VAULT_CLIENT_CERT: /vault/certs/vault-unseal.pem
+      VAULT_CLIENT_KEY: /vault/certs/vault-unseal-key.pem
     volumes:
       - vault_unseal_data:/vault/data
       - ./ha/vault/unseal-init.sh:/vault/unseal-init.sh:ro
+      - certs_vault_unseal:/vault/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "vault status -format=json || true"]
       interval: 10s
@@ -566,12 +721,25 @@ services:
     image: hashicorp/vault:1.18
     restart: unless-stopped
     cap_add: ["IPC_LOCK"]
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      vault-unseal:
+        condition: service_started
     environment:
-      VAULT_LOCAL_CONFIG: '{"storage":{"raft":{"path":"/vault/data","node_id":"vault-1"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"seal":{"transit":{"address":"http://vault-unseal:8200","token":"vault-transit-token","disable_renewal":"false"}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
-      VAULT_ADDR: http://localhost:8200
-      VAULT_API_ADDR: http://localhost:8200
+      VAULT_NODE_ID: vault-1
+      VAULT_ADDR: https://localhost:8200
+      VAULT_API_ADDR: https://vault-1:8200
+      VAULT_CACERT: /vault/certs/ca.pem
+      VAULT_CLIENT_CERT: /vault/certs/vault.pem
+      VAULT_CLIENT_KEY: /vault/certs/vault-key.pem
+      VAULT_TRANSIT_TOKEN: ${VAULT_TRANSIT_TOKEN:-vault-transit-token}
     volumes:
       - vault_1_data:/vault/data
+      # mTLS raft config (PP02): TLS listener + verified client certs
+      - ./ha/vault/vault-raft.hcl:/vault/config/vault-raft.hcl:ro
+      - certs_vault:/vault/certs:ro
+    command: server -config=/vault/config/vault-raft.hcl
     healthcheck:
       test: ["CMD-SHELL", "vault status -format=json || true"]
       interval: 10s
@@ -588,23 +756,25 @@ services:
     image: hashicorp/vault:1.18
     restart: unless-stopped
     cap_add: ["IPC_LOCK"]
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      vault-unseal:
+        condition: service_started
     environment:
-      VAULT_LOCAL_CONFIG: '{"storage":{"raft":{"path":"/vault/data","node_id":"vault-2"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"seal":{"transit":{"address":"http://vault-unseal:8200","token":"vault-transit-token","disable_renewal":"false"}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
-      VAULT_ADDR: http://localhost:8200
-      VAULT_API_ADDR: http://localhost:8200
+      VAULT_NODE_ID: vault-2
+      VAULT_ADDR: https://localhost:8200
+      VAULT_API_ADDR: https://vault-2:8200
+      VAULT_CACERT: /vault/certs/ca.pem
+      VAULT_CLIENT_CERT: /vault/certs/vault.pem
+      VAULT_CLIENT_KEY: /vault/certs/vault-key.pem
+      VAULT_TRANSIT_TOKEN: ${VAULT_TRANSIT_TOKEN:-vault-transit-token}
     volumes:
       - vault_2_data:/vault/data
-    healthcheck:
-      test: ["CMD-SHELL", "vault status -format=json || true"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 10s
-    deploy:
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
+      # mTLS raft config (PP02): TLS listener + verified client certs
+      - ./ha/vault/vault-raft.hcl:/vault/config/vault-raft.hcl:ro
+      - certs_vault:/vault/certs:ro
+    command: server -config=/vault/config/vault-raft.hcl
 
   # --- MinIO distributed HA: 4 nodes with erasure coding ---
   minio1:
@@ -725,16 +895,22 @@ services:
     image: otel/opentelemetry-collector-contrib:0.128.0
     restart: unless-stopped
     depends_on:
-      langfuse:
+      langfuse-1:
         condition: service_healthy
+      nginx-langfuse:
+        condition: service_started
+      certs-init:
+        condition: service_completed_successfully
     environment:
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://localhost:3000}
       TAIL_SAMPLER_NORMAL_RATE: ${TAIL_SAMPLER_NORMAL_RATE:-10}
       TAIL_SAMPLER_COST_THRESHOLD: ${TAIL_SAMPLER_COST_THRESHOLD:-0.05}
     volumes:
-      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # mTLS (PP02): TLS receivers + mTLS exporter via nginx-LB
+      - ./ha/otel-tls-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - certs_otel:/etc/otelcol-contrib/certs:ro
     command: ["--config", "/etc/otelcol-contrib/config.yaml"]
     ports:
       - "43171:4317"
@@ -756,16 +932,22 @@ services:
     image: otel/opentelemetry-collector-contrib:0.128.0
     restart: unless-stopped
     depends_on:
-      langfuse:
+      langfuse-1:
         condition: service_healthy
+      nginx-langfuse:
+        condition: service_started
+      certs-init:
+        condition: service_completed_successfully
     environment:
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://localhost:3000}
       TAIL_SAMPLER_NORMAL_RATE: ${TAIL_SAMPLER_NORMAL_RATE:-10}
       TAIL_SAMPLER_COST_THRESHOLD: ${TAIL_SAMPLER_COST_THRESHOLD:-0.05}
     volumes:
-      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # mTLS (PP02): TLS receivers + mTLS exporter via nginx-LB
+      - ./ha/otel-tls-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - certs_otel:/etc/otelcol-contrib/certs:ro
     command: ["--config", "/etc/otelcol-contrib/config.yaml"]
     ports:
       - "43172:4317"
@@ -787,16 +969,22 @@ services:
     image: otel/opentelemetry-collector-contrib:0.128.0
     restart: unless-stopped
     depends_on:
-      langfuse:
+      langfuse-1:
         condition: service_healthy
+      nginx-langfuse:
+        condition: service_started
+      certs-init:
+        condition: service_completed_successfully
     environment:
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://localhost:3000}
       TAIL_SAMPLER_NORMAL_RATE: ${TAIL_SAMPLER_NORMAL_RATE:-10}
       TAIL_SAMPLER_COST_THRESHOLD: ${TAIL_SAMPLER_COST_THRESHOLD:-0.05}
     volumes:
-      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # mTLS (PP02): TLS receivers + mTLS exporter via nginx-LB
+      - ./ha/otel-tls-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - certs_otel:/etc/otelcol-contrib/certs:ro
     command: ["--config", "/etc/otelcol-contrib/config.yaml"]
     ports:
       - "43173:4317"
@@ -825,13 +1013,18 @@ services:
         condition: service_healthy
       otel-collector-3:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     volumes:
       - ./ha/nginx/nginx-otel.conf:/etc/nginx/nginx.conf:ro
+      # mTLS (PP02): LB requires client certs, proxies to collectors via mTLS
+      - certs_nginx:/etc/nginx/certs:ro
     ports:
-      - "4317:4317"  # OTLP gRPC
-      - "4318:4318"  # OTLP HTTP
+      - "4317:4317"  # OTLP gRPC (mTLS)
+      - "4318:4318"  # OTLP HTTP (mTLS)
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/nginx_status || exit 1"]
+      # localhost-only plaintext status endpoint (no client cert in probe)
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4319/nginx_status || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -857,6 +1050,8 @@ services:
         condition: service_healthy
       minio1:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     environment:
       <<: *langfuse-env
       LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
@@ -868,6 +1063,9 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+    volumes:
+      # mTLS (PP02): langfuse mesh cert for the Postgres connection
+      - certs_langfuse:/var/lib/postgresql/certs:ro
     ports:
       - "30001:3000"
     healthcheck:
@@ -896,8 +1094,13 @@ services:
         condition: service_healthy
       minio1:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     environment:
       <<: *langfuse-env
+    volumes:
+      # mTLS (PP02): langfuse mesh cert for the Postgres connection
+      - certs_langfuse:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0 if sys.stdin.fileno() != -1 else 1)"]
       interval: 30s
@@ -924,6 +1127,8 @@ services:
         condition: service_healthy
       minio1:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     environment:
       <<: *langfuse-env
       LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
@@ -935,6 +1140,9 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+    volumes:
+      # mTLS (PP02): langfuse mesh cert for the Postgres connection
+      - certs_langfuse:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://'+process.env.HOSTNAME+':3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -961,8 +1169,13 @@ services:
         condition: service_healthy
       minio1:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     environment:
       <<: *langfuse-env
+    volumes:
+      # mTLS (PP02): langfuse mesh cert for the Postgres connection
+      - certs_langfuse:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0 if sys.stdin.fileno() != -1 else 1)"]
       interval: 30s
@@ -989,6 +1202,8 @@ services:
         condition: service_healthy
       minio1:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     environment:
       <<: *langfuse-env
       LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
@@ -1000,6 +1215,9 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+    volumes:
+      # mTLS (PP02): langfuse mesh cert for the Postgres connection
+      - certs_langfuse:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://'+process.env.HOSTNAME+':3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -1026,8 +1244,13 @@ services:
         condition: service_healthy
       minio1:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     environment:
       <<: *langfuse-env
+    volumes:
+      # mTLS (PP02): langfuse mesh cert for the Postgres connection
+      - certs_langfuse:/var/lib/postgresql/certs:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0 if sys.stdin.fileno() != -1 else 1)"]
       interval: 30s
@@ -1051,12 +1274,17 @@ services:
         condition: service_healthy
       langfuse-3:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     volumes:
       - ./ha/nginx/nginx-langfuse.conf:/etc/nginx/nginx.conf:ro
+      # mTLS (PP02): public listener requires client certs
+      - certs_nginx:/etc/nginx/certs:ro
     ports:
-      - "3000:3000"
+      - "3000:3000"  # Langfuse UI/API (mTLS)
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost/nginx_status || exit 1"]
+      # localhost-only plaintext status endpoint (no client cert in probe)
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3001/nginx_status || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -1071,13 +1299,28 @@ services:
   ha-test-client:
     image: python:3.11-slim
     restart: unless-stopped
+    depends_on:
+      nginx-langfuse:
+        condition: service_started
+      nginx-otel:
+        condition: service_started
+      certs-init:
+        condition: service_completed_successfully
     environment:
-      LANGFUSE_HOST: http://nginx-langfuse:3000
+      LANGFUSE_HOST: https://nginx-langfuse:3000
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-your-public-key-here}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-your-secret-key-here}
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://nginx-otel:4318
+      OTEL_EXPORTER_OTLP_ENDPOINT: https://nginx-otel:4318
+      # SDK mTLS identity (PP02): AGENT_OBS_TLS_CA + AGENT_OBS_TLS_CERT/KEY
+      AGENT_OBS_TLS_CA: /certs/ca.pem
+      AGENT_OBS_TLS_CERT: /certs/sdk.pem
+      AGENT_OBS_TLS_KEY: /certs/sdk-key.pem
+      OTEL_EXPORTER_OTLP_CERTIFICATE: /certs/ca.pem
+      OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE: /certs/sdk.pem
+      OTEL_EXPORTER_OTLP_CLIENT_KEY: /certs/sdk-key.pem
     volumes:
       - ../:/app:ro
+      - certs_sdk:/certs:ro
     command: >
       sh -c "pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp &&
              python -m http.server 8777 --bind 0.0.0.0 & 
@@ -1124,3 +1367,14 @@ volumes:
   minio3_data2:
   minio4_data1:
   minio4_data2:
+  # mTLS certificate volumes (PP02), populated by the certs-init service
+  certs_postgres:
+  certs_pgbouncer:
+  certs_redis:
+  certs_vault:
+  certs_vault_unseal:
+  certs_clickhouse:
+  certs_nginx:
+  certs_otel:
+  certs_langfuse:
+  certs_sdk:

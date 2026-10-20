@@ -216,6 +216,10 @@ class LangfuseExporter(BaseExporter):
         tls_ca: Optional path to a CA bundle for self-signed TLS certs.
             TLS verification stays enabled by default; ``verify=False`` is
             never a supported option.
+        tls_cert: Optional path to the client certificate (PEM) for mTLS.
+            The file may also bundle the private key; otherwise pass
+            ``tls_key``.
+        tls_key: Optional path to the client private key (PEM) for mTLS.
         pending_cap: Maximum number of undelivered batches kept for flush.
     """
 
@@ -227,6 +231,8 @@ class LangfuseExporter(BaseExporter):
         timeout_s: float = 5.0,
         max_retries: int = 5,
         tls_ca: str | None = None,
+        tls_cert: str | None = None,
+        tls_key: str | None = None,
         pending_cap: int = 128,
     ) -> None:
         endpoint = (endpoint or "").strip().rstrip("/")
@@ -238,14 +244,21 @@ class LangfuseExporter(BaseExporter):
         self._url = f"{self._endpoint}/api/public/otel/v1/traces"
         self._max_retries = max_retries
         self._tls_ca = tls_ca
+        self._tls_cert = tls_cert
+        self._tls_key = tls_key
         self._auth = base64.b64encode(
             f"{public_key}:{secret_key}".encode()
         ).decode()
         verify: bool | ssl.SSLContext = True
-        if tls_ca:
-            # Self-signed certs supported only through an explicit CA bundle;
-            # keep TLS verification on (verify=False is never an option).
-            verify = ssl.create_default_context(cafile=tls_ca)
+        if tls_ca or tls_cert:
+            # Self-signed / internal CA supported only through an explicit CA
+            # bundle; keep TLS verification on (verify=False is never an
+            # option). mTLS (PP02): load the client cert chain into the same
+            # SSLContext (httpx >= 0.28 prefers verify=<context> over cert=).
+            ctx = ssl.create_default_context(cafile=tls_ca)
+            if tls_cert:
+                ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key or None)
+            verify = ctx
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_s),
             headers={
@@ -266,7 +279,8 @@ class LangfuseExporter(BaseExporter):
         """Build an exporter from environment variables (P19).
 
         Reads ``LANGFUSE_HOST``, ``LANGFUSE_PUBLIC_KEY``,
-        ``LANGFUSE_SECRET_KEY`` and optionally ``AGENT_OBS_TLS_CA``.
+        ``LANGFUSE_SECRET_KEY`` and optionally ``AGENT_OBS_TLS_CA``,
+        ``AGENT_OBS_TLS_CERT`` and ``AGENT_OBS_TLS_KEY`` (mTLS, PP02).
         If keys/host are missing the behaviour depends on
         ``AGENT_OBS_FAIL_ON_CONFIG``: default ``1`` raises
         :class:`ConfigError`; ``0`` degrades to a :class:`StdoutExporter`
@@ -280,6 +294,8 @@ class LangfuseExporter(BaseExporter):
         public_key = env.get("LANGFUSE_PUBLIC_KEY", "").strip()
         secret_key = env.get("LANGFUSE_SECRET_KEY", "").strip()
         tls_ca = env.get("AGENT_OBS_TLS_CA", "").strip() or None
+        tls_cert = env.get("AGENT_OBS_TLS_CERT", "").strip() or None
+        tls_key = env.get("AGENT_OBS_TLS_KEY", "").strip() or None
 
         missing = [
             name
@@ -313,6 +329,8 @@ class LangfuseExporter(BaseExporter):
             secret_key=secret_key,
             max_retries=max_retries,
             tls_ca=tls_ca,
+            tls_cert=tls_cert,
+            tls_key=tls_key,
         )
 
     async def _post_once(self, body: bytes) -> _PostOutcome:
@@ -326,6 +344,9 @@ class LangfuseExporter(BaseExporter):
             httpx.WriteTimeout,
             httpx.PoolTimeout,
             httpx.NetworkError,
+            # mTLS handshake failures (PP02): expired/ rejected client certs
+            # surface as raw ssl.SSLError rather than an httpx error.
+            ssl.SSLError,
         ) as exc:
             return _PostOutcome(retryable=True, error=str(exc))
 
