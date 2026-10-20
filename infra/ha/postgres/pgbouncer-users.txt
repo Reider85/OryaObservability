@@ -1,0 +1,15 @@
+; PgBouncer user authentication configuration
+; Format: "username" "password"
+; Passwords are stored as MD5 hashes
+
+; Langfuse application user
+"langfuse" "md5"$(echo -n "langfuse" | md5sum | cut -d' ' -f1)
+
+; repmgr user for cluster management
+"repmgr" "md5"$(echo -n "repmgr" | md5sum | cut -d' ' -f1)
+
+; PgBouncer admin user
+"pgbouncer" "md5"$(echo -n "pgbouncer" | md5sum | cut -d' ' -f1)
+
+; Additional users for different applications
+; "warm" "md5"$(echo -n "warm" | md5sum | cut -d' ' -f1)

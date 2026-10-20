@@ -1,0 +1,188 @@
+# HA Environment Variables for Observability Infrastructure
+# Copy this file to .env.ha and modify the values as needed
+
+# General HA settings
+COMPOSE_PROJECT_NAME=observability-ha
+AGENT_OBS_ENABLED=true
+AGENT_OBS_CONTENT_RATE=10
+AGENT_OBS_GUARDRAIL_ENABLED=true
+AGENT_OBS_PII_DETECTORS=email,phone,inn,passport,payment
+AGENT_OBS_PII_ML_ENABLED=false
+AGENT_OBS_INJECTION_MODEL=deepset/deberta-v3-base-prompt-injection
+AGENT_OBS_FAIL_ON_CONFIG=1
+TAIL_SAMPLER_COST_THRESHOLD=0.05
+TAIL_SAMPLER_NORMAL_RATE=10
+AGENT_OBS_COMPLIANCE_PG=auto
+COMPLIANCE_PG_DSN=postgresql://warm:warm@localhost:5433/warm_store
+
+# ClickHouse HA settings
+CLICKHOUSE_REPLICAS=2
+CLICKHOUSE_SHARDS=2
+CLICKHOUSE_KEEPER_NODES=3
+CLICKHOUSE_CLUSTER_NAME=observability_cluster
+
+# PostgreSQL HA settings
+POSTGRES_PRIMARY=pg-primary
+POSTGRES_STANDBYS=pg-standby1,pg-standby2
+POSTGRES_USER=langfuse
+POSTGRES_PASSWORD=langfuse_password
+POSTGRES_DB=langfuse
+REPMGR_USER=repmgr
+REPMGR_PASSWORD=repmgr_password
+PGBOUNCER_PORT=6432
+
+# Redis HA settings
+REDIS_MASTER=redis-master
+REDIS_REPLICAS=redis-replica1,redis-replica2
+REDIS_SENTINELS=redis-sentinel1,redis-sentinel2,redis-sentinel3
+REDIS_PORT=6379
+SENTINEL_PORT=26379
+REDIS_AUTH=orya-local-redis-secret
+
+# Vault HA settings
+VAULT_NODES=vault-1,vault-2
+VAULT_PORT=8200
+VAULT_ROOT_TOKEN=s.root-token
+VAULT_TRANSIT_TOKEN=vault-transit-token
+VAULT_UNSEAL_TOKEN=vault-unseal-token
+VAULT_NODE_ID=vault-1
+
+# MinIO distributed settings
+MINIO_NODES=minio1,minio2,minio3,minio4
+MINIO_PORT=9000
+MINIO_CONSOLE_PORT=9001
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=minioadmin
+MINIO_BUCKETS=langfuse,otel-collector,vault
+
+# OTel Collector HA settings
+OTEL_NODES=otel-collector-1,otel-collector-2,otel-collector-3
+OTEL_PORT=4317
+OTEL_HTTP_PORT=8888
+
+# nginx load balancer settings
+NGINX_LANGFUZE_PORT=3000
+NGINX_OTEL_PORT=4317
+
+# Langfuse HA settings
+LANGFUZE_NODES=langfuse-1,langfuse-2,langfuse-3
+LANGFUZE_PORT=3000
+
+# Infrastructure settings
+INFRA_DIR=infra
+HA_DIR=infra/ha
+LOG_LEVEL=info
+MONITORING_ENABLED=true
+METRICS_ENABLED=true
+TRACING_ENABLED=true
+
+# Performance tuning
+CLICKHOUSE_MEMORY_LIMIT=4g
+CLICKHOUSE_CPU_LIMIT=2
+POSTGRES_MEMORY_LIMIT=4g
+POSTGRES_CPU_LIMIT=2
+REDIS_MEMORY_LIMIT=2g
+REDIS_CPU_LIMIT=1
+VAULT_MEMORY_LIMIT=2g
+VAULT_CPU_LIMIT=1
+MINIO_MEMORY_LIMIT=4g
+MINIO_CPU_LIMIT=2
+OTEL_MEMORY_LIMIT=2g
+OTEL_CPU_LIMIT=1
+LANGFUZE_MEMORY_LIMIT=4g
+LANGFUZE_CPU_LIMIT=2
+
+# Network settings
+NETWORK_NAME=observability-ha
+EXTERNAL_NETWORK=observability-ha-external
+ENABLE_IPV6=false
+
+# Storage settings
+CLICKHOUSE_DATA_DIR=/var/lib/clickhouse
+POSTGRES_DATA_DIR=/var/lib/postgresql/data
+REDIS_DATA_DIR=/data
+VAULT_DATA_DIR=/vault/data
+MINIO_DATA_DIR=/data
+OTEL_DATA_DIR=/etc/otel
+LANGFUZE_DATA_DIR=/var/lib/langfuse
+
+# Backup and recovery settings
+BACKUP_ENABLED=true
+BACKUP_SCHEDULE=0 2 * * *
+BACKUP_RETENTION=30
+BACKUP_COMPRESSION=true
+
+# Security settings
+ENABLE_TLS=true
+TLS_CERT_PATH=/etc/ssl/certs
+TLS_KEY_PATH=/etc/ssl/private
+ENABLE_AUTH=true
+AUTH_METHOD=oauth2
+JWT_SECRET=your-jwt-secret-here
+API_KEYS=your-api-keys-here
+
+# Monitoring and logging
+LOG_LEVEL=info
+LOG_FORMAT=json
+LOG_RETENTION=30
+METRICS_RETENTION=30
+TRACING_RETENTION=30
+
+# Chaos testing settings
+CHAOS_ENABLED=false
+CHAOS_DURATION=300
+CHAOS_FAILURE_RATE=0.1
+CHAOS_NETWORK_LATENCY=1000
+CHAOS_CPU_STRESS=false
+CHAOS_MEMORY_STRESS=false
+
+# Health check settings
+HEALTH_CHECK_INTERVAL=30
+HEALTH_CHECK_TIMEOUT=10
+HEALTH_CHECK_RETRIES=3
+HEALTH_CHECK_LOG_LEVEL=info
+
+# Auto-scaling settings
+AUTO_SCALE_ENABLED=false
+AUTO_SCALE_MIN_REPLICAS=1
+AUTO_SCALE_MAX_REPLICAS=5
+AUTO_SCALE_CPU_THRESHOLD=80
+AUTO_SCALE_MEMORY_THRESHOLD=80
+
+# Database migration settings
+MIGRATION_ENABLED=true
+MIGRATION_SCHEDULE=0 3 * * *
+MIGRATION_TIMEOUT=3600
+MIGRATION_RETRY_COUNT=3
+
+# Performance monitoring
+PERFORMANCE_MONITORING_ENABLED=true
+PERFORMANCE_INTERVAL=60
+PERFORMANCE_METRICS=cpu,memory,disk,network
+PERFORMANCE_ALERTS=true
+
+# Security monitoring
+SECURITY_MONITORING_ENABLED=true
+SECURITY_SCAN_INTERVAL=3600
+SECURITY_ALERTS=true
+SECURITY_LOG_LEVEL=info
+
+# Compliance monitoring
+COMPLIANCE_MONITORING_ENABLED=true
+COMPLIANCE_SCAN_INTERVAL=3600
+COMPLIANCE_ALERTS=true
+COMPLIANCE_LOG_LEVEL=info
+
+# Disaster recovery settings
+DR_ENABLED=true
+DR_SCHEDULE=0 4 * * *
+DR_REPLICATION=true
+DR_BACKUP=true
+DR_TEST_INTERVAL=86400
+
+# Load balancing settings
+LOAD_BALANCER_ENABLED=true
+LOAD_BALANCER_ALGORITHM=round_robin
+LOAD_BALANCER_STICKY_SESSIONS=false
+LOAD_BALANCER_HEALTH_CHECK_INTERVAL=30
+LOAD_BALANCER_HEALTH_CHECK_TIMEOUT=5

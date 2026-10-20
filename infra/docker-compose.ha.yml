@@ -1,0 +1,1126 @@
+name: orya-observability-ha
+
+# Production-ready HA stack with multi-AZ replicas and automatic failover
+# Uses docker-compose deploy.replicas for 3× services, separate infrastructure from base stack
+# Run: docker compose -f docker-compose.ha.yml up -d
+
+# Shared environment for langfuse-web and langfuse-worker (Langfuse v3 HA)
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: ${LANGFUSE_HOST:-http://localhost:3000}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-my-observability-session-secret}
+  DATABASE_URL: ${DATABASE_URL:-postgresql://langfuse:langfuse@pg-primary:5432/langfuse}
+  SALT: ${LANGFUSE_SALT}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+  TELEMETRY_ENABLED: "false"
+
+  # ClickHouse cluster for HA replication
+  CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse1:8123}
+  CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse1:9000}
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+  CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-true}
+
+  # Redis Sentinel for HA
+  REDIS_HOST: ${REDIS_HOST:-redis-master}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
+
+  # S3-compatible storage for Langfuse (MinIO distributed HA)
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+services:
+  # --- ClickHouse HA: 2 shards × 2 replicas + Keeper quorum ---
+  clickhouse1:
+    # Pinned: 26.9 verified live against this DDL (JSON columns, UUID,
+    # DateTime64, TTL INTERVAL). PC24: embeddings stored in span_embeddings
+    # sidecar table (see clickhouse_ddl_ha.sql); spans_hot.response_embedding kept
+    # for compatibility. Run docker compose run --rm clickhouse-init-ha to heal
+    # existing volumes with ALTER migrations.
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: observability
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - clickhouse_data1:/var/lib/clickhouse
+      - clickhouse_logs1:/var/log/clickhouse-server
+      # HA DDL with ReplicatedMergeTree engines
+      - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Cluster config for shard 1, replica 1
+      - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "8123:8123"  # HTTP — host tools / DoD verification
+      - "9001:9000"  # Native TCP (not 9000 to avoid conflicts)
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  clickhouse2:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: observability
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_SHARD_NUM: 1
+      CLICKHOUSE_REPLICA_NUM: 2
+    volumes:
+      - clickhouse_data2:/var/lib/clickhouse
+      - clickhouse_logs2:/var/log/clickhouse-server
+      # HA DDL with ReplicatedMergeTree engines
+      - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Cluster config for shard 1, replica 2
+      - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "8124:8123"  # HTTP — host tools / DoD verification
+      - "9002:9000"  # Native TCP
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  clickhouse3:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: observability
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_SHARD_NUM: 2
+      CLICKHOUSE_REPLICA_NUM: 1
+    volumes:
+      - clickhouse_data3:/var/lib/clickhouse
+      - clickhouse_logs3:/var/log/clickhouse-server
+      # HA DDL with ReplicatedMergeTree engines
+      - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Cluster config for shard 2, replica 1
+      - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "8125:8123"  # HTTP — host tools / DoD verification
+      - "9003:9000"  # Native TCP
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  clickhouse4:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: observability
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_SHARD_NUM: 2
+      CLICKHOUSE_REPLICA_NUM: 2
+    volumes:
+      - clickhouse_data4:/var/lib/clickhouse
+      - clickhouse_logs4:/var/log/clickhouse-server
+      # HA DDL with ReplicatedMergeTree engines
+      - ./storage/clickhouse_ddl_ha.sql:/docker-entrypoint-initdb.d/clickhouse_ddl.sql:ro
+      - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Cluster config for shard 2, replica 2
+      - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "8126:8123"  # HTTP — host tools / DoD verification
+      - "9004:9000"  # Native TCP
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # ClickHouse Keeper quorum (3 nodes)
+  clickhouse-keeper1:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    command: clickhouse-keeper --config /etc/clickhouse-server/config.d/keeper.xml
+    volumes:
+      - keeper_data1:/var/lib/clickhouse/keeper
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-keeper --check-config --config /etc/clickhouse-server/config.d/keeper.xml"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  clickhouse-keeper2:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    command: clickhouse-keeper --config /etc/clickhouse-server/config.d/keeper.xml
+    volumes:
+      - keeper_data2:/var/lib/clickhouse/keeper
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-keeper --check-config --config /etc/clickhouse-server/config.d/keeper.xml"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  clickhouse-keeper3:
+    image: clickhouse/clickhouse-server:26.9
+    restart: unless-stopped
+    user: "101:101"
+    command: clickhouse-keeper --config /etc/clickhouse-server/config.d/keeper.xml
+    volumes:
+      - keeper_data3:/var/lib/clickhouse/keeper
+      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-keeper --check-config --config /etc/clickhouse-server/config.d/keeper.xml"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # HA initialization for ClickHouse schema
+  clickhouse-init-ha:
+    image: clickhouse/clickhouse-server:26.9
+    restart: on-failure
+    depends_on:
+      clickhouse1:
+        condition: service_healthy
+      clickhouse2:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      clickhouse4:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: clickhouse1
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_HOST2: clickhouse2
+      CLICKHOUSE_PORT2: "9000"
+      CLICKHOUSE_HOST3: clickhouse3
+      CLICKHOUSE_PORT3: "9000"
+      CLICKHOUSE_HOST4: clickhouse4
+      CLICKHOUSE_PORT4: "9000"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      DDL_PATH: /init/clickhouse_ddl_ha.sql
+    volumes:
+      - ./storage/clickhouse_ddl_ha.sql:/init/clickhouse_ddl_ha.sql:ro
+      - ./storage/clickhouse_init.sh:/init/clickhouse_init.sh:ro
+      - ./ha/clickhouse-cluster.xml:/init/cluster.xml:ro
+      - ./ha/keeper.xml:/init/keeper.xml:ro
+    entrypoint: ["/bin/bash", "/init/clickhouse_init.sh"]
+
+  # --- Postgres HA: 1 primary + 2 replicas + repmgr + pgBouncer ---
+  pg-primary:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
+      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
+      REPMGR_PRIMARY: "true"
+      REPMGR_PARTNER_NODES: "pg-primary,pg-replica-1,pg-replica-2"
+      REPMGR_NODE_NAME: "pg-primary"
+      REPMGR_HOST: pg-primary
+      REPMGR_PORT: 5432
+      REPMGR_USER: repmgr
+      REPMGR_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
+      REPMGR_CONNECT_TIMEOUT: 2
+      REPMGR_RECONNECT_ATTEMPTS: 3
+      REPMGR_RECONNECT_INTERVAL: 5
+      REPMGR_SERVICE: "primary"
+      REPMGR_DATA_DIRECTORY: "/var/lib/postgresql/data"
+      REPMGR_LOG_LEVEL: INFO
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./ha/postgres/docker-entrypoint-ha.sh:/docker-entrypoint-initdb.d/01-repmgr.sh:ro
+      - ./ha/postgres/repmgr.conf:/etc/repmgr.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    ports:
+      - "5433:5432"  # Primary accessible directly (not recommended for production)
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  pg-replica-1:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
+      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
+      REPMGR_PRIMARY: "false"
+      REPMGR_PARTNER_NODES: "pg-primary,pg-replica-1,pg-replica-2"
+      REPMGR_NODE_NAME: "pg-replica-1"
+      REPMGR_HOST: pg-replica-1
+      REPMGR_PORT: 5432
+      REPMGR_USER: repmgr
+      REPMGR_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
+      REPMGR_CONNECT_TIMEOUT: 2
+      REPMGR_RECONNECT_ATTEMPTS: 3
+      REPMGR_RECONNECT_INTERVAL: 5
+      REPMGR_SERVICE: "standby"
+      REPMGR_DATA_DIRECTORY: "/var/lib/postgresql/data"
+      REPMGR_LOG_LEVEL: INFO
+      # Streaming replication config
+      POSTGRES_REPLICATION_USER: repmgr
+      POSTGRES_REPLICATION_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
+      POSTGRES_PRIMARY_CONNINFO: "host=pg-primary port=5432 user=repmgr password=${REPMGR_PASSWORD:-repmgr} dbname=${POSTGRES_DB:-langfuse}"
+    volumes:
+      - postgres_replica1_data:/var/lib/postgresql/data
+      - ./ha/postgres/docker-entrypoint-ha.sh:/docker-entrypoint-initdb.d/01-repmgr.sh:ro
+      - ./ha/postgres/repmgr.conf:/etc/repmgr.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  pg-replica-2:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
+      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
+      REPMGR_PRIMARY: "false"
+      REPMGR_PARTNER_NODES: "pg-primary,pg-replica-1,pg-replica-2"
+      REPMGR_NODE_NAME: "pg-replica-2"
+      REPMGR_HOST: pg-replica-2
+      REPMGR_PORT: 5432
+      REPMGR_USER: repmgr
+      REPMGR_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
+      REPMGR_CONNECT_TIMEOUT: 2
+      REPMGR_RECONNECT_ATTEMPTS: 3
+      REPMGR_RECONNECT_INTERVAL: 5
+      REPMGR_SERVICE: "standby"
+      REPMGR_DATA_DIRECTORY: "/var/lib/postgresql/data"
+      REPMGR_LOG_LEVEL: INFO
+      # Streaming replication config
+      POSTGRES_REPLICATION_USER: repmgr
+      POSTGRES_REPLICATION_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
+      POSTGRES_PRIMARY_CONNINFO: "host=pg-primary port=5432 user=repmgr password=${REPMGR_PASSWORD:-repmgr} dbname=${POSTGRES_DB:-langfuse}"
+    volumes:
+      - postgres_replica2_data:/var/lib/postgresql/data
+      - ./ha/postgres/docker-entrypoint-ha.sh:/docker-entrypoint-initdb.d/01-repmgr.sh:ro
+      - ./ha/postgres/repmgr.conf:/etc/repmgr.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # pgBouncer for connection pooling
+  pgbouncer:
+    image: eduardoborba/pgbouncer:1.22-alpine
+    restart: unless-stopped
+    environment:
+      PGBOUNCER_AUTH_FILE: /etc/pgbouncer/users.txt
+      PGBOUNCER_HBA_FILE: /etc/pgbouncer/pg_hba.conf
+    volumes:
+      - ./ha/postgres/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./ha/postgres/pgbouncer-users.txt:/etc/pgbouncer/users.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pgbounce -c /etc/pgbouncer/pgbouncer.ini --check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    ports:
+      - "6432:6432"  # Connection pool port
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # --- Redis HA: master + 2 replicas + 3 sentinel ---
+  redis-master:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    environment:
+      REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
+    volumes:
+      - redis_master_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  redis-replica-1:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-server --replicaof redis-master 6379 --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    environment:
+      REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
+    volumes:
+      - redis_replica1_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  redis-replica-2:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-server --replicaof redis-master 6379 --requirepass ${REDIS_AUTH:-orya-local-redis-secret} --maxmemory-policy noeviction
+    environment:
+      REDIS_AUTH: ${REDIS_AUTH:-orya-local-redis-secret}
+    volumes:
+      - redis_replica2_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_AUTH} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  redis-sentinel-1:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./ha/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  redis-sentinel-2:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./ha/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  redis-sentinel-3:
+    image: redis:7
+    restart: unless-stopped
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./ha/redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # --- Vault HA: 2 nodes + auto-unseal via transit ---
+  vault-unseal:
+    image: hashicorp/vault:1.18
+    restart: unless-stopped
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_LOCAL_CONFIG: '{"storage":{"file":{"path":"/vault/data"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+    volumes:
+      - vault_unseal_data:/vault/data
+      - ./ha/vault/unseal-init.sh:/vault/unseal-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "vault status -format=json || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    command: >
+      sh -c "/vault/unseal-init.sh"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  vault-1:
+    image: hashicorp/vault:1.18
+    restart: unless-stopped
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_LOCAL_CONFIG: '{"storage":{"raft":{"path":"/vault/data","node_id":"vault-1"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"seal":{"transit":{"address":"http://vault-unseal:8200","token":"vault-transit-token","disable_renewal":"false"}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+      VAULT_ADDR: http://localhost:8200
+      VAULT_API_ADDR: http://localhost:8200
+    volumes:
+      - vault_1_data:/vault/data
+    healthcheck:
+      test: ["CMD-SHELL", "vault status -format=json || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  vault-2:
+    image: hashicorp/vault:1.18
+    restart: unless-stopped
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_LOCAL_CONFIG: '{"storage":{"raft":{"path":"/vault/data","node_id":"vault-2"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"seal":{"transit":{"address":"http://vault-unseal:8200","token":"vault-transit-token","disable_renewal":"false"}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+      VAULT_ADDR: http://localhost:8200
+      VAULT_API_ADDR: http://localhost:8200
+    volumes:
+      - vault_2_data:/vault/data
+    healthcheck:
+      test: ["CMD-SHELL", "vault status -format=json || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # --- MinIO distributed HA: 4 nodes with erasure coding ---
+  minio1:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data1 /data2 && minio server --address ":9000" --console-address ":9001" http://minio1/data1 http://minio1/data2 http://minio2/data1 http://minio2/data2 http://minio3/data1 http://minio3/data2 http://minio4/data1 http://minio4/data2'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - minio1_data1:/data1
+      - minio1_data2:/data2
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  minio2:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data1 /data2 && minio server --address ":9000" --console-address ":9001" http://minio1/data1 http://minio1/data2 http://minio2/data1 http://minio2/data2 http://minio3/data1 http://minio3/data2 http://minio4/data1 http://minio4/data2'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - minio2_data1:/data1
+      - minio2_data2:/data2
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  minio3:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data1 /data2 && minio server --address ":9000" --console-address ":9001" http://minio1/data1 http://minio1/data2 http://minio2/data1 http://minio2/data2 http://minio3/data1 http://minio3/data2 http://minio4/data1 http://minio4/data2'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - minio3_data1:/data1
+      - minio3_data2:/data2
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  minio4:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data1 /data2 && minio server --address ":9000" --console-address ":9001" http://minio1/data1 http://minio1/data2 http://minio2/data1 http://minio2/data2 http://minio3/data1 http://minio3/data2 http://minio4/data1 http://minio4/data2'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - minio4_data1:/data1
+      - minio4_data2:/data2
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio1:
+        condition: service_healthy
+      minio2:
+        condition: service_healthy
+      minio3:
+        condition: service_healthy
+      minio4:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    volumes:
+      - ./ha/storage/minio_init.sh:/init/minio_init.sh:ro
+    entrypoint: ["/bin/sh", "/init/minio_init.sh"]
+    restart: on-failure
+    deploy:
+      replicas: 1
+
+  # --- OTel Collector HA: 3 replicas + nginx LB ---
+  otel-collector-1:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    restart: unless-stopped
+    depends_on:
+      langfuse:
+        condition: service_healthy
+    environment:
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+      TAIL_SAMPLER_NORMAL_RATE: ${TAIL_SAMPLER_NORMAL_RATE:-10}
+      TAIL_SAMPLER_COST_THRESHOLD: ${TAIL_SAMPLER_COST_THRESHOLD:-0.05}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "43171:4317"
+      - "43181:4318"
+      - "88881:8888"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/debug/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  otel-collector-2:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    restart: unless-stopped
+    depends_on:
+      langfuse:
+        condition: service_healthy
+    environment:
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+      TAIL_SAMPLER_NORMAL_RATE: ${TAIL_SAMPLER_NORMAL_RATE:-10}
+      TAIL_SAMPLER_COST_THRESHOLD: ${TAIL_SAMPLER_COST_THRESHOLD:-0.05}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "43172:4317"
+      - "43182:4318"
+      - "88882:8888"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/debug/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  otel-collector-3:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    restart: unless-stopped
+    depends_on:
+      langfuse:
+        condition: service_healthy
+    environment:
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://localhost:3000}
+      TAIL_SAMPLER_NORMAL_RATE: ${TAIL_SAMPLER_NORMAL_RATE:-10}
+      TAIL_SAMPLER_COST_THRESHOLD: ${TAIL_SAMPLER_COST_THRESHOLD:-0.05}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "43173:4317"
+      - "43183:4318"
+      - "88883:8888"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/debug/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # nginx load balancer for OTel collectors
+  nginx-otel:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      otel-collector-1:
+        condition: service_healthy
+      otel-collector-2:
+        condition: service_healthy
+      otel-collector-3:
+        condition: service_healthy
+    volumes:
+      - ./ha/nginx/nginx-otel.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/nginx_status || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # --- Langfuse HA: 3 replicas + nginx LB ---
+  langfuse-1:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Orya Observability}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-prj-agent-obs}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-agent-obs}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-your-public-key-here}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-your-secret-key-here}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+    ports:
+      - "30001:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://'+process.env.HOSTNAME+':3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  langfuse-worker-1:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0 if sys.stdin.fileno() != -1 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  langfuse-2:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Orya Observability}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-prj-agent-obs}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-agent-obs}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-your-public-key-here}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-your-secret-key-here}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://'+process.env.HOSTNAME+':3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  langfuse-worker-2:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0 if sys.stdin.fileno() != -1 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  langfuse-3:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-org-agent-obs}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Orya Observability}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-prj-agent-obs}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-agent-obs}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-your-public-key-here}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-your-secret-key-here}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-change-me-admin-password}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://'+process.env.HOSTNAME+':3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  langfuse-worker-3:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      clickhouse3:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0 if sys.stdin.fileno() != -1 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # nginx load balancer for Langfuse
+  nginx-langfuse:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      langfuse-1:
+        condition: service_healthy
+      langfuse-2:
+        condition: service_healthy
+      langfuse-3:
+        condition: service_healthy
+    volumes:
+      - ./ha/nginx/nginx-langfuse.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/nginx_status || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+  # --- Test client for HA validation ---
+  ha-test-client:
+    image: python:3.11-slim
+    restart: unless-stopped
+    environment:
+      LANGFUSE_HOST: http://nginx-langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-your-public-key-here}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-your-secret-key-here}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://nginx-otel:4318
+    volumes:
+      - ../:/app:ro
+    command: >
+      sh -c "pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp &&
+             python -m http.server 8777 --bind 0.0.0.0 & 
+             python -c 'from test_ha_client import send_test_span; send_test_span()' &&
+             python -m http.server 8777 --bind 0.0.0.0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8777', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+
+volumes:
+  clickhouse_data1:
+  clickhouse_logs1:
+  clickhouse_data2:
+  clickhouse_logs2:
+  clickhouse_data3:
+  clickhouse_logs3:
+  clickhouse_data4:
+  clickhouse_logs4:
+  keeper_data1:
+  keeper_data2:
+  keeper_data3:
+  postgres_primary_data:
+  postgres_replica1_data:
+  postgres_replica2_data:
+  redis_master_data:
+  redis_replica1_data:
+  redis_replica2_data:
+  vault_unseal_data:
+  vault_1_data:
+  vault_2_data:
+  minio1_data1:
+  minio1_data2:
+  minio2_data1:
+  minio2_data2:
+  minio3_data1:
+  minio3_data2:
+  minio4_data1:
+  minio4_data2:
