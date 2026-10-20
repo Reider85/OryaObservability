@@ -5,9 +5,10 @@ average faithfulness score over 5-minute window.
 """
 
 import asyncio
-import pytest
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from agent_obs.exporters.tail_sampler import FeedbackLoopPolicy
 
@@ -23,7 +24,9 @@ class TestFeedbackLoopPolicy:
             cache_ttl=10.0,
             normal_rate=0.10,
             degradation_rate=0.25,
-            heavy_degradation_rate=0.40
+            heavy_degradation_rate=0.40,
+            hot_store=MagicMock(),
+            enable_audit=True
         )
         # Mock the logger to avoid debug calls in tests
         policy._logger = MagicMock()
@@ -125,11 +128,11 @@ class TestFeedbackLoopPolicy:
             assert policy.get_current_rate() == 0.10
         
         # Transition to degradation
-        with patch.object(policy, 'get_eval_score', return_value=0.75):
-            with patch.object(policy, '_report_rate_change') as mock_report:
-                rate = await policy.evaluate_rate()
-                assert rate == 0.25
-                mock_report.assert_called_once_with(0.10, 0.25, "degradation", 0.75)
+        with patch.object(policy, 'get_eval_score', return_value=0.75), \
+             patch.object(policy, '_report_rate_change') as mock_report:
+            rate = await policy.evaluate_rate()
+            assert rate == 0.25
+            mock_report.assert_called_once_with(0.10, 0.25, "degradation", 0.75)
     
     @pytest.mark.asyncio
     async def test_evaluate_rate_transition_degradation_to_heavy(self, policy):
@@ -140,11 +143,11 @@ class TestFeedbackLoopPolicy:
             assert policy.get_current_rate() == 0.25
         
         # Transition to heavy degradation
-        with patch.object(policy, 'get_eval_score', return_value=0.55):
-            with patch.object(policy, '_report_rate_change') as mock_report:
-                rate = await policy.evaluate_rate()
-                assert rate == 0.40
-                mock_report.assert_called_once_with(0.25, 0.40, "heavy_degradation", 0.55)
+        with patch.object(policy, 'get_eval_score', return_value=0.55), \
+             patch.object(policy, '_report_rate_change') as mock_report:
+            rate = await policy.evaluate_rate()
+            assert rate == 0.40
+            mock_report.assert_called_once_with(0.25, 0.40, "heavy_degradation", 0.55)
     
     @pytest.mark.asyncio
     async def test_evaluate_rate_transition_heavy_to_normal(self, policy):
@@ -155,11 +158,11 @@ class TestFeedbackLoopPolicy:
             assert policy.get_current_rate() == 0.40
         
         # Transition back to normal
-        with patch.object(policy, 'get_eval_score', return_value=0.85):
-            with patch.object(policy, '_report_rate_change') as mock_report:
-                rate = await policy.evaluate_rate()
-                assert rate == 0.10
-                mock_report.assert_called_once_with(0.40, 0.10, "normal", 0.85)
+        with patch.object(policy, 'get_eval_score', return_value=0.85), \
+             patch.object(policy, '_report_rate_change') as mock_report:
+            rate = await policy.evaluate_rate()
+            assert rate == 0.10
+            mock_report.assert_called_once_with(0.40, 0.10, "normal", 0.85)
     
     def test_get_reason_for_rate(self, policy):
         """Test reason label mapping for rates."""
@@ -167,7 +170,8 @@ class TestFeedbackLoopPolicy:
         assert policy._get_reason_for_rate(0.25) == "degradation"
         assert policy._get_reason_for_rate(0.40) == "heavy_degradation"
     
-    def test_report_rate_change(self, policy):
+    @pytest.mark.asyncio
+    async def test_report_rate_change(self, policy):
         """Test rate change reporting to metrics (simplified test)."""
         # This test verifies the logic without complex mocking
         # In real usage, metrics would be properly registered
@@ -184,12 +188,86 @@ class TestFeedbackLoopPolicy:
         
         # Test that the method doesn't crash
         try:
-            policy._report_rate_change(old_rate, new_rate, reason, score)
+            await policy._report_rate_change(old_rate, new_rate, reason, score)
             # If we get here, the method executed without error
             assert True
         except Exception as e:
             # For testing purposes, we expect this to work without metrics
             assert "metrics" in str(e).lower() or "not defined" in str(e).lower()
+    
+    @pytest.mark.asyncio
+    async def test_audit_write_on_rate_change(self, policy):
+        """Test that rate changes are written to audit trail."""
+        # Mock the hot store to capture audit events
+        policy.hot_store.write_audit_event = MagicMock()
+        
+        # Test normal to degradation rate change
+        policy._current_rate = 0.10
+        policy._current_reason = "normal"
+        
+        with patch.object(policy, 'get_eval_score', return_value=0.75):
+            await policy.evaluate_rate()
+        
+        # Verify audit event was written
+        policy.hot_store.write_audit_event.assert_called_once()
+        event = policy.hot_store.write_audit_event.call_args[0][0]
+        from agent_obs.guardrail.audit import SamplerRateChangeAuditEvent
+        assert isinstance(event, SamplerRateChangeAuditEvent)
+        assert event.prev_rate == 0.10
+        assert event.new_rate == 0.25
+        assert event.prev_reason == "eval_feedback_normal"
+        assert event.new_reason == "eval_feedback_degradation"
+        assert "eval_score=0.75" in event.reason
+    
+    @pytest.mark.asyncio
+    async def test_audit_fail_open(self, policy):
+        """Test that audit failure doesn't block rate changes."""
+        # Mock hot store to raise exception
+        policy.hot_store.write_audit_event = MagicMock(side_effect=Exception("ClickHouse down"))
+        
+        # Test rate change despite audit failure
+        policy._current_rate = 0.10
+        policy._current_reason = "normal"
+        
+        with patch.object(policy, 'get_eval_score', return_value=0.75):
+            new_rate = await policy.evaluate_rate()
+        
+        # Rate should change despite audit failure
+        assert new_rate == 0.25
+        # Audit should have been attempted
+        policy.hot_store.write_audit_event.assert_called_once()
+    
+    @pytest.mark.asyncio
+    async def test_audit_disabled(self, policy):
+        """Test that audit is skipped when disabled."""
+        policy.enable_audit = False
+        policy.hot_store.write_audit_event = MagicMock()
+        
+        policy._current_rate = 0.10
+        policy._current_reason = "normal"
+        
+        with patch.object(policy, 'get_eval_score', return_value=0.75):
+            await policy.evaluate_rate()
+        
+        # Audit should not be called when disabled
+        policy.hot_store.write_audit_event.assert_not_called()
+    
+    @pytest.mark.asyncio
+    async def test_eval_score_in_audit_event(self, policy):
+        """Test that eval score is included in audit event when available."""
+        policy.hot_store.write_audit_event = MagicMock()
+        
+        policy._current_rate = 0.10
+        policy._current_reason = "normal"
+        
+        with patch.object(policy, 'get_eval_score', return_value=0.55):
+            await policy.evaluate_rate()
+        
+        event = policy.hot_store.write_audit_event.call_args[0][0]
+        from agent_obs.guardrail.audit import SamplerRateChangeAuditEvent
+        assert isinstance(event, SamplerRateChangeAuditEvent)
+        assert "eval_score=0.55" in event.reason
+        assert event.resource.get("eval_score") == 0.55
     
     @pytest.mark.asyncio
     async def test_concurrent_access(self, policy):

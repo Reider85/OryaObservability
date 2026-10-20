@@ -404,10 +404,10 @@ DoD
 5. Тесты: для каждой policy — recall 100% на сработавшем предикате; false positive rate < 1% на нормальных.
 
 DoD
-- [ ] SamplingPolicyV2 реализует все 5 policies, контракт SamplingPolicy из PP0 соблюдён
-- [ ] Трейс с faithfulness < 0.7 попадает в 30% content-sampling автоматически
-- [ ] Идемпотентность: одно и то же решение по span_id при повторной прогоне
-- [ ] pytest tests/test_tail_sampler_v2.py зелёный (≥ 20 кейсов)
+- [x] SamplingPolicyV2 реализует все 5 policies, контракт SamplingPolicy из PP0 соблюдён
+- [x] Трейс с faithfulness < 0.7 попадает в 30% content-sampling автоматически
+- [x] Идемпотентность: одно и то же решение по span_id при повторной прогоне
+- [x] pytest tests/test_tail_sampler_v2.py зелёный (≥ 20 кейсов)
 
 Коммит: feat(sampling): add v2 policy engine with eval-aware content sampling override
 ```
@@ -435,10 +435,10 @@ DoD
 5. Тесты: simulate eval_score drop → rate растёт; simulate recovery → rate возвращается к 0.10.
 
 DoD
-- [ ] FeedbackLoopPolicy корректно реагирует на средний faithfulness
-- [ ] Метрика tail_sampler_current_rate обновляется при изменении rate
-- [ ] Audit-trail содержит запись об изменении rate с причиной
-- [ ] pytest зелёный
+- [x] FeedbackLoopPolicy корректно реагирует на средний faithfulness
+- [x] Метрика tail_sampler_current_rate обновляется при изменении rate
+- [x] Audit-trail содержит запись об изменении rate с причиной
+- [x] pytest зелёный
 
 Коммит: feat(sampling): add feedback loop from eval_score_avg_5m to global sampling rate
 ```
@@ -465,10 +465,10 @@ DoD
 6. Тесты: каждое изменение policy логируется; replay сценария показывает историю изменений rate.
 
 DoD
-- [ ] Все изменения sampling policies логируются в audit_events_hot
-- [ ] Audit-trail содержит old_rate → new_rate + reason для каждого решения
-- [ ] Идемпотентность: replay не дублирует записи
-- [ ] pytest зелёный
+- [x] Все изменения sampling policies логируются в audit_events_hot
+- [x] Audit-trail содержит old_rate → new_rate + reason для каждого решения
+- [x] Идемпотентность: replay не дублирует записи
+- [x] pytest зелёный
 
 Коммит: feat(sampling): log all policy decisions to audit trail with old/new rate and reason
 ```

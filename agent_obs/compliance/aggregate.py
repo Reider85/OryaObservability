@@ -110,6 +110,9 @@ async def aggregate_compliance_catalog(
             errors=cleaned_count,
             new_rows_24h=new_rows_24h,
         )
+    except Exception as e:
+        logger.error("Compliance catalog aggregation failed: %s", str(e))
+        raise
 
 
 # Job name constant for scheduler

@@ -344,6 +344,7 @@ class SamplerRateChangeAuditEvent:
         actor_id: str = "policy-engine",
         agent_id: str = "*",
         triggering_agent_id: str = "*",
+        eval_score: float | None = None,
     ) -> "SamplerRateChangeAuditEvent":
         """Create an audit event for one sampling-rate transition.
 
@@ -364,7 +365,10 @@ class SamplerRateChangeAuditEvent:
             )
         elif new_reason.startswith("eval_feedback_"):
             eval_type = new_reason.split("_", 2)[-1]
-            detail = f"eval_feedback_{eval_type}"
+            if eval_score is not None:
+                detail = f"eval_score={eval_score:.2f}"
+            else:
+                detail = f"eval_feedback_{eval_type}"
         elif new_reason in ("error_keep", "cost_high_keep", "security_keep", "random"):
             detail = f"policy={new_reason}"
         else:
@@ -378,7 +382,7 @@ class SamplerRateChangeAuditEvent:
             audit_id=f"sra-{uuid.uuid4().hex[:12]}",
             timestamp=time.time(),
             actor={"type": "system", "id": actor_id},
-            resource={"type": "sampler_policy", "id": "normal-trace"},
+            resource={"type": "sampler_policy", "id": "normal-trace", "eval_score": eval_score if eval_score is not None else 0.0},
             reason=(
                 f"policy changed from {prev_rate:.2f} to {new_rate:.2f}, "
                 f"reason={new_reason} ({detail})"

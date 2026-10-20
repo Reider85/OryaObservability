@@ -9,16 +9,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from agent_obs.eval.base import EvalResult
+from agent_obs.guardrail.audit import SamplerRateChangeAuditEvent
 from agent_obs.metrics import (
     tail_sampler_current_rate,
     tail_sampler_rate_changes_total,
-    tail_sampler_traces_sampled_total,
 )
 from agent_obs.observability import Span
 
@@ -306,11 +306,14 @@ class FeedbackLoopPolicy:
     normal_rate: float = 0.10
     degradation_rate: float = 0.25
     heavy_degradation_rate: float = 0.40
+    hot_store: Any = None
+    enable_audit: bool = True
     
     def __post_init__(self):
         self._cache_time: float = 0.0
         self._cached_score: float | None = None
         self._current_rate: float = self.normal_rate
+        self._current_reason: str = "normal"
         self._lock = asyncio.Lock()
         self._logger = logging.getLogger(__name__)
     
@@ -366,13 +369,16 @@ class FeedbackLoopPolicy:
             self._current_rate = self.heavy_degradation_rate
             reason = "heavy_degradation"
         
+        # Update current reason
+        self._current_reason = reason
+        
         # Report rate change if different
         if old_rate != self._current_rate:
-            self._report_rate_change(old_rate, self._current_rate, reason, score)
+            await self._report_rate_change(old_rate, self._current_rate, reason, score)
         
         return self._current_rate
     
-    def _report_rate_change(self, old_rate: float, new_rate: float, reason: str, score: float) -> None:
+    async def _report_rate_change(self, old_rate: float, new_rate: float, reason: str, score: float) -> None:
         """Report rate change to metrics and audit trail."""
         # Update metrics
         tail_sampler_current_rate.labels(policy_reason=f"eval_feedback_{reason}").set(new_rate)
@@ -386,6 +392,13 @@ class FeedbackLoopPolicy:
             f"Feedback loop: rate changed from {old_rate:.2f} to {new_rate:.2f} "
             f"(reason: {reason}, eval_score: {score:.2f})"
         )
+        
+        # Schedule audit write (off-thread to avoid blocking)
+        if self.enable_audit and self.hot_store is not None:
+            try:
+                await asyncio.to_thread(self.record_audit, old_rate, new_rate, reason, score)
+            except Exception as exc:
+                self._logger.error("Failed to write audit event: %s", exc)
     
     def _get_reason_for_rate(self, rate: float) -> str:
         """Get reason label for a given rate."""
@@ -399,3 +412,33 @@ class FeedbackLoopPolicy:
     def get_current_rate(self) -> float:
         """Get current rate (for testing)."""
         return self._current_rate
+    
+    def record_audit(self, old_rate: float, new_rate: float, reason: str, score: float) -> None:
+        """Write a rate-change audit event to ClickHouse, if configured.
+        
+        Never raises: a failing audit write must not stop the sampler from
+        changing rate, so the failure is logged and counted instead.
+        """
+        if not self.enable_audit or self.hot_store is None:
+            return
+        
+        # Build audit event with eval feedback reason
+        new_reason = f"eval_feedback_{reason}"
+        prev_reason = f"eval_feedback_{self._get_reason_for_rate(old_rate)}"
+        
+        event = SamplerRateChangeAuditEvent.for_rate_change(
+            prev_rate=old_rate,
+            new_rate=new_rate,
+            prev_reason=prev_reason,
+            new_reason=new_reason,
+            system_cpu_ratio=0.0,  # Not applicable for eval feedback
+            agent_error_rate_5m=0.0,  # Not applicable for eval feedback
+            actor_id="feedback-loop",
+            eval_score=score,
+        )
+        
+        try:
+            self.hot_store.write_audit_event(event)
+        except Exception as exc:
+            self._logger.error("Failed to write sampler rate-change audit event: %s", exc)
+            # Do not raise - audit failure should not block rate changes
