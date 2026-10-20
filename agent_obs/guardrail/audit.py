@@ -27,11 +27,15 @@ REASON_CATEGORIES = frozenset(
     }
 )
 
-# PC30: bounded set of reasons a sampling rate can change to. Used as the
+# PP03-PP04: bounded set of reasons a sampling rate can change to. Used as the
 # ``policy_reason`` label on agent_obs_tail_sampler_current_rate and as the
 # ``new_reason``/``prev_reason`` labels on the change counter, so metric
 # cardinality never grows with the float value of the rate itself.
-SAMPLER_POLICY_REASONS = ("cpu_high", "error_high", "default")
+SAMPLER_POLICY_REASONS = (
+    "cpu_high", "error_high", "default",  # PP0 (PC30)
+    "eval_feedback_normal", "eval_feedback_degradation", "eval_feedback_heavy_degradation",  # PP04
+    "error_keep", "cost_high_keep", "security_keep", "random",  # PP03
+)
 
 # PC30 rule thresholds, quoted into the audit reason so a row is self-contained.
 # Kept here (not in the policy engine) because the audit layer must be able to
@@ -358,6 +362,11 @@ class SamplerRateChangeAuditEvent:
                 f"agent_error_rate_5m={agent_error_rate_5m:.3f} > "
                 f"{ERROR_RATE_THRESHOLD:.3f}"
             )
+        elif new_reason.startswith("eval_feedback_"):
+            eval_type = new_reason.split("_", 2)[-1]
+            detail = f"eval_feedback_{eval_type}"
+        elif new_reason in ("error_keep", "cost_high_keep", "security_keep", "random"):
+            detail = f"policy={new_reason}"
         else:
             detail = (
                 f"system_cpu_ratio={system_cpu_ratio:.2f} <= {CPU_HIGH_THRESHOLD:.2f} "
