@@ -626,6 +626,20 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # PP06 (T3.1.4): the rate-change annotations are read straight from the
+      # ClickHouse audit trail (audit_events_hot), which needs the official
+      # ClickHouse datasource plugin. Pinned to 4.14.0 — the last release
+      # whose grafanaDependency is still ">=9.5.0"; 4.15.0+ requires
+      # Grafana >= 11.6.0, which would force a Grafana image bump. Grafana
+      # 11.2 splits GF_INSTALL_PLUGINS on whitespace, so the version is a
+      # separate token ("<id> <version>", not "<id>==<version>").
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource 4.14.0
+      # Consumed by infra/grafana/provisioning/datasources/clickhouse.yml.
+      # The native protocol (9000) matches what the SDK's HotStore uses.
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-observability}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -634,6 +648,7 @@ services:
       - "${GRAFANA_PORT:-3001}:3000"
     depends_on:
       - prometheus
+      - clickhouse
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
       interval: 30s

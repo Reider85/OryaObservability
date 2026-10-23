@@ -154,10 +154,13 @@ class TestGrafanaDashboard:
 
     def test_dashboard_plots_current_rate_with_reason_legend(self):
         dashboard = json.loads(DASHBOARD_PATH.read_text(encoding="utf-8"))
+        # PP06 plots the metric twice (gauge + graph); the graph is the one
+        # with the reason legend this PC32 check is about.
         rate_panels = [
             p
             for p in dashboard["panels"]
-            if "agent_obs_tail_sampler_current_rate" in json.dumps(p)
+            if p.get("type") == "timeseries"
+            and "agent_obs_tail_sampler_current_rate" in json.dumps(p)
         ]
         assert rate_panels, "a panel must plot agent_obs_tail_sampler_current_rate"
         panel = rate_panels[0]

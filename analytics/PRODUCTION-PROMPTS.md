@@ -498,10 +498,10 @@ error_spike). Каждое изменение rate — vertical annotation с п
 сценариях (eval_drop → проверить LLM; cpu_high → scale; error_spike → page on-call).
 
 DoD
-- [ ] Дашборд импортируется в Grafana без ошибок
-- [ ] Аннотации причин rate-change видны на графике
-- [ ] Drill-down в trace-viewer работает
-- [ ] README с runbook-инструкциями создан
+- [x] Дашборд импортируется в Grafana без ошибок
+- [x] Аннотации причин rate-change видны на графике
+- [x] Drill-down в trace-viewer работает
+- [x] README с runbook-инструкциями создан
 
 Коммит: feat(grafana): add sampler policy history dashboard with reason annotations
 ```

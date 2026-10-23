@@ -1,0 +1,34 @@
+# PP06 (T3.1.4): ClickHouse datasource for the "Sampler Policy History"
+# dashboard. The rate-change annotations are read from the audit trail in
+# ClickHouse (audit_events_hot), so the dashboard needs a SQL datasource next
+# to Prometheus.
+#
+# The uid is fixed to "clickhouse" so the provisioned dashboard JSON can
+# reference it without import-time input. Credentials come from the
+# environment (see the grafana service in infra/docker-compose.yml) and match
+# what the SDK's HotStore uses.
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    uid: clickhouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    orgId: 1
+    url: $__env{CLICKHOUSE_HOST}:9000
+    isDefault: false
+    editable: false
+    jsonData:
+      host: $__env{CLICKHOUSE_HOST}
+      # Native protocol port — same default as the SDK's HotStore
+      # (CLICKHOUSE_PORT=9000). The plugin expects a number here, so it is
+      # not templated from the environment.
+      port: 9000
+      protocol: native
+      # The plugin (4.14.x) names the connection's default database
+      # `defaultDatabase` — without it the queries run in `default` and
+      # `audit_events_hot` is not found.
+      defaultDatabase: $__env{CLICKHOUSE_DB}
+      username: $__env{CLICKHOUSE_USER}
+    secureJsonData:
+      password: $__env{CLICKHOUSE_PASSWORD}

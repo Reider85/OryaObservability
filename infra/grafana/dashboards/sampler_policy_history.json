@@ -5,10 +5,46 @@
   "tags": ["agent-obs", "sampler", "pc32", "pp03", "pp04", "pp05", "pp06"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": false,
   "refresh": "30s",
   "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h"],
+    "time_options": ["1h", "6h", "24h", "7d"]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "trace_viewer_url",
+        "label": "Trace-viewer URL",
+        "description": "Base URL of the trace-viewer used by the drill-down links. Default is Langfuse (E1.5) on :3000 — set it to http://localhost:6006 to drill into Phoenix instead.",
+        "type": "textbox",
+        "query": "http://localhost:3000",
+        "current": {
+          "text": "http://localhost:3000",
+          "value": "http://localhost:3000"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "http://localhost:3000",
+            "value": "http://localhost:3000"
+          }
+        ]
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Open trace-viewer",
+      "url": "${var:trace_viewer_url}",
+      "icon": "external link",
+      "type": "link",
+      "targetBlank": true,
+      "tooltip": "Trace-viewer (Langfuse by default). Set the 'Trace-viewer URL' variable to point it elsewhere."
+    }
+  ],
   "annotations": {
     "list": [
       {
@@ -18,6 +54,7 @@
         "iconColor": "red",
         "expr": "changes(agent_obs_tail_sampler_current_rate[2m]) > 0",
         "titleFormat": "rate → {{policy_reason}}",
+        "textFormat": "sampling rate changed (policy_reason={{policy_reason}})",
         "target": {
           "limit": 100,
           "matchAny": false,
@@ -27,16 +64,21 @@
       },
       {
         "name": "Sampling decisions",
-        "datasource": { "type": "clickhouse", "uid": "clickhouse" },
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
         "enable": true,
         "iconColor": "orange",
-        "expr": "SELECT timestamp, reason FROM audit_events_hot WHERE action = 'sampler.rate_change' AND timestamp > now() - 6h ORDER BY timestamp DESC LIMIT 50",
-        "titleFormat": "{{reason}}",
+        "titleFormat": "{{new_reason}}",
+        "textFormat": "{{reason}}",
         "target": {
-          "limit": 50,
-          "matchAny": false,
-          "tags": [],
-          "type": "dashboard"
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  timestamp AS time,\n  JSONExtractString(resource, 'new_reason') AS new_reason,\n  concat('rate ', toString(JSONExtractFloat(resource, 'prev_rate')), ' -> ', toString(JSONExtractFloat(resource, 'new_rate'))) AS text,\n  reason AS reason\nFROM audit_events_hot\nWHERE action = 'sampler.rate_change'\n  AND $__timeFilter(timestamp)\nORDER BY timestamp DESC\nLIMIT 100",
+          "refId": "A"
         }
       }
     ]
@@ -44,16 +86,68 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "Sampler rate over time",
-      "description": "agent_obs_tail_sampler_current_rate, one series per policy_reason (cpu_high=0.05, error_high=0.30, default=0.10, eval_feedback*=0.25/0.40, error_keep=1.0, cost_high_keep=1.0, security_keep=1.0, random=0.10). Annotations mark every rate change.",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "type": "gauge",
+      "title": "Current sampling rate",
+      "description": "agent_obs_tail_sampler_current_rate — one gauge per policy_reason. The policy that fired last holds the rate currently applied to normal traces; stale series keep the value of the previous policy until they are replaced.",
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "min": 0,
           "max": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.05 },
+              { "color": "green", "value": 0.1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_obs_tail_sampler_current_rate",
+          "legendFormat": "{{policy_reason}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Sampler rate over time",
+      "description": "agent_obs_tail_sampler_current_rate, one series per policy_reason (cpu_high=0.05, error_high=0.30, default=0.10, eval_feedback*=0.25/0.40, error_keep=1.0, cost_high_keep=1.0, security_keep=1.0, random=0.10). Annotations mark every rate change. Click a point to drill down into the trace-viewer at that moment.",
+      "gridPos": { "h": 7, "w": 18, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Open trace-viewer at this moment",
+              "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+            }
+          ],
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,
@@ -84,11 +178,11 @@
       ]
     },
     {
-      "id": 2,
+      "id": 3,
       "type": "piechart",
-      "title": "Sampling decisions by reason",
-      "description": "Distribution of sampling decisions by policy reason (PP03-PP04). Shows which policies are triggering most often.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "title": "Policy evaluation outcomes",
+      "description": "Distribution of policy-engine evaluations by outcome (changed | unchanged | audit_failed) from agent_obs_tail_sampler_policy_evaluations_total. A rising 'audit_failed' share means rate changes are no longer reaching the audit trail.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 7 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -109,34 +203,111 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(agent_obs_tail_sampler_policy_evaluations_total[5m])) by (reason)",
-          "legendFormat": "{{reason}}",
+          "expr": "sum(rate(agent_obs_tail_sampler_policy_evaluations_total[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code"
         }
       ]
     },
     {
-      "id": 3,
+      "id": 4,
+      "type": "table",
+      "title": "Sampling decisions by reason",
+      "description": "Audit trail of every sampling-rate decision (ClickHouse audit_events_hot, action='sampler.rate_change'): reason, old rate -> new rate and the human-readable cause. Click a timestamp to drill down into the trace-viewer at that moment.",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 7 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "timestamp" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "targetBlank": true,
+                    "title": "Open trace-viewer at this moment",
+                    "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+        "sortBy": [{ "desc": false, "displayName": "timestamp" }]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  timestamp,\n  JSONExtractString(resource, 'prev_reason') AS prev_reason,\n  JSONExtractString(resource, 'new_reason') AS new_reason,\n  JSONExtractFloat(resource, 'prev_rate') AS prev_rate,\n  JSONExtractFloat(resource, 'new_rate') AS new_rate,\n  reason\nFROM audit_events_hot\nWHERE action = 'sampler.rate_change'\n  AND $__timeFilter(timestamp)\nORDER BY timestamp DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "timestamp": "time",
+              "prev_reason": "previous reason",
+              "new_reason": "new reason",
+              "prev_rate": "old rate",
+              "new_rate": "new rate",
+              "reason": "cause"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
       "type": "barchart",
       "title": "Kept spans by reason",
-      "description": "Number of spans kept by each policy reason (stacked). Shows impact of different sampling policies.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "description": "Spans kept by the sampler per decision (stacked): impact of the different sampling policies on data retention.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 7 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "custom": {
-            "hideFrom": { "tooltip": false, "viz": false }
+            "hideFrom": { "tooltip": false, "viz": false },
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "lineWidth": 1,
+            "scaleDistribution": { "type": "linear" }
           }
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "hidden"
-        },
-        "tooltip": { "mode": "single" }
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
       },
       "targets": [
         {
@@ -149,11 +320,11 @@
       ]
     },
     {
-      "id": 4,
+      "id": 6,
       "type": "timeseries",
       "title": "Eval score correlation",
-      "description": "Average faithfulness score over 5-minute window (PP04 feedback loop). Correlate with sampling rate changes.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "description": "Average faithfulness score over a 5-minute window — the same query the PP04 feedback loop uses. Correlate with sampling rate changes.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
@@ -190,11 +361,11 @@
       ]
     },
     {
-      "id": 5,
+      "id": 7,
       "type": "timeseries",
       "title": "System correlation",
-      "description": "System CPU ratio and agent error rate (PP0 baseline). Correlate with sampling rate changes.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "description": "System CPU ratio and agent error rate. Correlate with sampling rate changes: CPU > 0.80 drops the rate to 5% (cpu_high), error rate > 0.05 raises it to 30% (error_high).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
