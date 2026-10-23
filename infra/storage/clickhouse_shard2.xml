@@ -32,7 +32,9 @@
     <user_files_path>/var/lib/clickhouse/user_files</user_files_path>
     <access_log>/var/log/clickhouse-server/access.log</access_log>
     <error_log>/var/log/clickhouse-server/error.log</error_log>
-    <log_level>info</log_level>
+    <!-- "information" is the valid level name; "info" aborts the server
+         start on clickhouse/clickhouse-server 26.x. -->
+    <log_level>information</log_level>
 
     <users>
         <clickhouse>
