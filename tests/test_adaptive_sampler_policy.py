@@ -198,6 +198,8 @@ class TestPolicyRules:
             cpu_ratio=0.92,
             error_rate_5m=0.01,
             changed=True,
+            agent_id="test-agent",
+            triggering_agent_id="test-agent",
         )
         assert "system_cpu_ratio=0.92" in decision.reason_text
         assert "cpu_high" in decision.reason_text
@@ -211,7 +213,7 @@ class TestPolicyRules:
 class TestPolicyEngineScraping:
     async def test_reads_both_metrics(self):
         engine = PolicyEngine(client=_prom_client(cpu=0.42, error=0.01))
-        cpu, error = await engine.read_signals()
+        cpu, error, _ = await engine.read_signals()
         assert cpu == pytest.approx(0.42)
         assert error == pytest.approx(0.01)
         await engine.close()
@@ -220,14 +222,17 @@ class TestPolicyEngineScraping:
         """No series (pilot-agent not up yet) must not raise — it routes the
         policy to its default rate."""
         engine = PolicyEngine(client=_prom_client(cpu=None, error=None))
-        assert await engine.read_signals() == (0.0, 0.0)
+        cpu, error, triggering_agent_id = await engine.read_signals()
+        assert cpu == 0.0
+        assert error == 0.0
+        assert triggering_agent_id == "*"
         await engine.close()
 
     async def test_error_rate_uses_worst_agent(self):
         """One unhealthy agent must be able to lift the whole sampling rate,
         so the aggregation over per-agent series is a max, not a mean."""
         engine = PolicyEngine(client=_prom_client(cpu=0.1, error=[0.01, 0.09, 0.03]))
-        _, error = await engine.read_signals()
+        _, error, _ = await engine.read_signals()
         assert error == pytest.approx(0.09)
         await engine.close()
 
@@ -241,7 +246,10 @@ class TestPolicyEngineScraping:
             transport=httpx.MockTransport(_boom), base_url="http://prom"
         )
         engine = PolicyEngine(client=client)
-        assert await engine.read_signals() == (0.0, 0.0)
+        cpu, error, triggering_agent_id = await engine.read_signals()
+        assert cpu == 0.0
+        assert error == 0.0
+        assert triggering_agent_id == "*"
         await engine.close()
 
     async def test_http_error_status_degrades(self):
@@ -252,7 +260,10 @@ class TestPolicyEngineScraping:
             transport=httpx.MockTransport(_fatal), base_url="http://prom"
         )
         engine = PolicyEngine(client=client)
-        assert await engine.read_signals() == (0.0, 0.0)
+        cpu, error, triggering_agent_id = await engine.read_signals()
+        assert cpu == 0.0
+        assert error == 0.0
+        assert triggering_agent_id == "*"
         await engine.close()
 
 
@@ -728,7 +739,7 @@ class TestSamplerRateChangeAudit:
         assert event.action == "sampler.rate_change"
         assert event.decision == "applied"
         assert event.actor == {"type": "system", "id": "policy-engine"}
-        assert event.resource == {"type": "sampler_policy", "id": "normal-trace"}
+        assert event.resource == {"type": "sampler_policy", "id": "normal-trace", "eval_score": 0.0}
         assert event.prev_rate == pytest.approx(0.10)
         assert event.new_rate == pytest.approx(0.05)
         assert event.prev_reason == "default"
