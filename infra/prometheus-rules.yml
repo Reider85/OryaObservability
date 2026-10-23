@@ -188,3 +188,29 @@ groups:
             investigate the load. Rate history: Grafana dashboard
             "Sampler Policy History" (http://localhost:3001/d/sampler-policy-history);
             audit rows via GET /audit/sampler-rate-history.
+
+      - alert: SamplerRateUnstable
+        expr: sum(changes(agent_obs_tail_sampler_current_rate[10m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: sampler
+        annotations:
+          summary: "Sampler rate is unstable (>5 changes in 10m)"
+          description: >-
+            The sampling rate has changed more than 5 times in the last 10 minutes,
+            indicating feedback loop instability. Check eval score stability and
+            policy engine health. Current rate: {{ $value }} changes.
+
+      - alert: SamplerDecisionLatencyHigh
+        expr: histogram_quantile(0.99, sum by (le) (rate(tail_sampler_decision_latency_seconds_bucket[5m]))) > 0.005
+        for: 5m
+        labels:
+          severity: warning
+          component: sampler
+        annotations:
+          summary: "Sampler decision latency p99 > 5ms"
+          description: >-
+            The p99 latency of sampling policy decisions exceeds 5ms. This may
+            impact throughput. Check policy engine complexity and optimize if needed.
+            Current p99: {{ $value }} seconds.

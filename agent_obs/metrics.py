@@ -285,3 +285,38 @@ tail_sampler_phoenix_annotations_total = Counter(
     "Phoenix annotations sent for sampler rate changes",
     ["outcome"],
 )
+
+# --- PP07 Tail sampler metrics by reason (T3.1.5) ---
+
+# Counts spans kept by the sampling policy engine, labelled by reason
+tail_sampler_kept_spans_total = Counter(
+    "tail_sampler_kept_spans_total",
+    "Spans kept by sampling policy, by reason (error|cost|eval_fail|security|random)",
+    ["reason", "agent_id", "tenant_id"],
+)
+
+# Counts spans dropped by the sampling policy engine (normal traces not sampled)
+tail_sampler_dropped_spans_total = Counter(
+    "tail_sampler_dropped_spans_total",
+    "Normal spans dropped by sampling policy (not matching any keep policy)",
+    ["agent_id", "tenant_id"],
+)
+
+# Current content sampling rate (default or eval_fail override)
+# Seeded at import: default=10%, eval_fail_override=30%
+tail_sampler_content_rate = Gauge(
+    "tail_sampler_content_rate",
+    "Current content sampling rate by policy (default=10%, eval_fail_override=30%)",
+    ["policy"],
+)
+
+# Histogram of sampling decision latency (p99 < 1ms)
+tail_sampler_decision_latency_seconds = Histogram(
+    "tail_sampler_decision_latency_seconds",
+    "Latency of sampling policy decisions in seconds",
+    buckets=[0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05],
+)
+
+# Seed content rates at import (matches AGENT_OBS_CONTENT_RATE default and override)
+tail_sampler_content_rate.labels(policy="default").set(10)
+tail_sampler_content_rate.labels(policy="eval_fail_override").set(30)

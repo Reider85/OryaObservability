@@ -533,10 +533,10 @@ Prometheus-метрика с лейблом reason: показывает, по �
 - alert: SamplerDecisionLatencyHigh — если p99 latency > 5 мс
 
 DoD
-- [ ] Метрики с лейблом reason экспортируются в Prometheus
-- [ ] PromQL-queries документированы
-- [ ] Alerting rules добавлены в prometheus-rules.yml
-- [ ] pytest + интеграционный тест /metrics — зелёный
+- [x] Метрики с лейблом reason экспортируются в Prometheus
+- [x] PromQL-queries документированы
+- [x] Alerting rules добавлены в prometheus-rules.yml
+- [x] pytest + интеграционный тест /metrics — зелёный
 
 Коммит: feat(metrics): add tail_sampler_kept_ratio_by_reason counter with reason labels
 ```

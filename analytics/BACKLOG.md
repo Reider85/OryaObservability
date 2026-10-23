@@ -408,7 +408,7 @@
 | T3.1.2 | Feedback loop: метрика eval_score_avg_5m → в policy engine | **PLANNED** | — |
 | T3.1.3 | Логировать все изменения политики в audit trail | **PLANNED** | — |
 | T3.1.4 | Дашборд «Sampler Policy History» — график rate по времени с аннотациями причин | **DONE** | PP06 (дашборд + ClickHouse-аннотации + drill-down + runbook) |
-| T3.1.5 | Метрика tail_sampler_kept_ratio_by_reason{reason="error|cost|eval_fail|random"} | **PLANNED** | — |
+| T3.1.5 | Метрика tail_sampler_kept_ratio_by_reason{reason="error|cost|eval_fail|security|random"} | **DONE** | PP07 |
 #### E3.2 — Span-aggregation в SDK (micro-spans внутри одного span)
 
 **ТРИЗ-обоснование.** Принцип 25 (самообслуживание): SDK сам агрегирует микроспаны. Принцип 28: вместо множества мелких sync-вызовов — один batched-агрегат.

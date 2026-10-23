@@ -53,7 +53,12 @@ import httpx
 from prometheus_client import start_http_server
 
 from agent_obs.guardrail.audit import SAMPLER_RATES
-from agent_obs.metrics import tail_sampler_current_rate, tail_sampler_traces_sampled_total
+from agent_obs.metrics import (
+    tail_sampler_current_rate,
+    tail_sampler_traces_sampled_total,
+    tail_sampler_kept_spans_total,
+    tail_sampler_dropped_spans_total,
+)
 from scripts.sampler.policy_engine import (
     PolicyDecision,
     PolicyEngine,
@@ -155,6 +160,33 @@ def group_spans_by_trace(spans: list[dict[str, Any]]) -> dict[str, list[dict[str
     for span in spans:
         grouped.setdefault(span.get("traceId", "") or "", []).append(span)
     return grouped
+
+
+def classify_reason(spans: list[dict[str, Any]]) -> str:
+    """Classify kept trace by reason (error|cost|security|random).
+    
+    PP07: Returns one of "error", "cost", "security" for kept_interesting,
+    "random" for kept_probabilistic. Order: error > cost > security.
+    """
+    for span in spans:
+        attributes = _attribute_map(span)
+        # Check error status first
+        status = span.get("status")
+        if isinstance(status, dict):
+            code = status.get("code")
+            if code == OTLP_STATUS_ERROR or code == "STATUS_CODE_ERROR":
+                return "error"
+        # Check cost attributes
+        if attributes.get("cost.over_budget") == "true":
+            return "cost"
+        if attributes.get("cost.usd") and float(attributes.get("cost.usd", 0)) > 0.05:
+            return "cost"
+        if attributes.get("cost.usd_sum") and float(attributes.get("cost.usd_sum", 0)) > 0.05:
+            return "cost"
+        # Check security incident
+        if attributes.get("security.incident") == "true":
+            return "security"
+    return "random"
 
 
 class AdaptiveSampler:
@@ -348,6 +380,11 @@ class SamplerProxy:
         for resource_index, resource_span in enumerate(resource_spans):
             if not isinstance(resource_span, dict):
                 continue
+            # Extract agent_id and tenant_id from resource attributes
+            resource_attrs = _attribute_map(resource_span.get("resource", {"attributes": []}))
+            agent_id = resource_attrs.get("service.name", resource_attrs.get("agent.id", ""))
+            tenant_id = resource_attrs.get("tenant_id", "")
+            
             for scope_span in resource_span.get("scopeSpans") or []:
                 if not isinstance(scope_span, dict):
                     continue
@@ -356,6 +393,27 @@ class SamplerProxy:
                     decision = self.sampler.decide_trace(trace_id, trace_spans)
                     counts[decision] += 1
                     tail_sampler_traces_sampled_total.labels(decision=decision).inc()
+                    
+                    # PP07: Increment kept/dropped counters with reason
+                    if decision == "kept_interesting":
+                        reason = classify_reason(trace_spans)
+                        tail_sampler_kept_spans_total.labels(
+                            reason=reason,
+                            agent_id=agent_id,
+                            tenant_id=tenant_id,
+                        ).inc(len(trace_spans))
+                    elif decision == "kept_probabilistic":
+                        tail_sampler_kept_spans_total.labels(
+                            reason="random",
+                            agent_id=agent_id,
+                            tenant_id=tenant_id,
+                        ).inc(len(trace_spans))
+                    elif decision == "dropped":
+                        tail_sampler_dropped_spans_total.labels(
+                            agent_id=agent_id,
+                            tenant_id=tenant_id,
+                        ).inc(len(trace_spans))
+                    
                     if decision == "dropped":
                         continue
                     kept_by_resource.setdefault(resource_index, []).extend(trace_spans)

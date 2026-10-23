@@ -19,6 +19,10 @@ from agent_obs.guardrail.audit import SamplerRateChangeAuditEvent
 from agent_obs.metrics import (
     tail_sampler_current_rate,
     tail_sampler_rate_changes_total,
+    tail_sampler_kept_spans_total,
+    tail_sampler_dropped_spans_total,
+    tail_sampler_content_rate,
+    tail_sampler_decision_latency_seconds,
 )
 from agent_obs.observability import Span
 
@@ -176,7 +180,12 @@ class SamplingPolicyV2:
         Iterates policies in order; first matching policy decides.
         Returns decision with content_rate override for eval_fail_keep.
         """
+        import time
+        
+        start = time.perf_counter()
         span_id = span.context.span_id
+        agent_id = span.context.agent_id or ""
+        tenant_id = str(span.attributes.get("tenant_id") or "")
         
         for policy in self.policies:
             if policy.predicate(span, evals):
@@ -186,6 +195,27 @@ class SamplingPolicyV2:
                 # PP03: Content-sampling override for eval_fail_keep
                 if policy.name == "eval_fail_keep":
                     content_rate = 30  # 30% instead of default 10%
+                
+                # PP07: Record decision latency
+                elapsed = time.perf_counter() - start
+                tail_sampler_decision_latency_seconds.observe(elapsed)
+                
+                # PP07: Increment kept/dropped counters
+                if keep:
+                    tail_sampler_kept_spans_total.labels(
+                        reason=policy.reason_label,
+                        agent_id=agent_id,
+                        tenant_id=tenant_id,
+                    ).inc()
+                else:
+                    tail_sampler_dropped_spans_total.labels(
+                        agent_id=agent_id,
+                        tenant_id=tenant_id,
+                    ).inc()
+                
+                # PP07: Set content rate gauge
+                policy_label = "eval_fail_override" if content_rate else "default"
+                tail_sampler_content_rate.labels(policy=policy_label).set(content_rate or 10)
                 
                 return SamplingDecision(
                     keep=keep,
@@ -197,6 +227,14 @@ class SamplingPolicyV2:
                 )
         
         # No policy matched (shouldn't happen with random policy)
+        # PP07: Record latency and increment dropped counter
+        elapsed = time.perf_counter() - start
+        tail_sampler_decision_latency_seconds.observe(elapsed)
+        tail_sampler_dropped_spans_total.labels(
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+        ).inc()
+        
         return SamplingDecision(
             keep=False,
             policy_name="none",
@@ -270,7 +308,13 @@ def content_rate_for_decision(
     
     If decision has content_rate override, use it; otherwise use env_default.
     """
-    return decision.content_rate if decision.content_rate is not None else env_default
+    rate = decision.content_rate if decision.content_rate is not None else env_default
+    
+    # PP07: Set content rate gauge
+    policy_label = "eval_fail_override" if decision.content_rate else "default"
+    tail_sampler_content_rate.labels(policy=policy_label).set(rate)
+    
+    return rate
 
 
 def should_keep_content_with_decision(
