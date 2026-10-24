@@ -34,6 +34,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# PP11 metrics imports
+from agent_obs.metrics import (
+    cost_per_request_usd,
+    cost_total_usd,
+    spans_total,
+    spans_aggregated_total,
+    spans_micro_input_total,
+    bytes_saved_total,
+    aggregation_ratio,
+)
+
+# Global references to PP11 metrics for use in _record_aggregation_metrics
+_PP11_SPANS_AGGREGATED_TOTAL = spans_aggregated_total
+_PP11_SPANS_MICRO_INPUT_TOTAL = spans_micro_input_total
+_PP11_BYTES_SAVED_TOTAL = bytes_saved_total
+_PP11_AGGREGATION_RATIO = aggregation_ratio
+
+def get_pp11_metrics():
+    """Get PP11 metrics for testing."""
+    return {
+        'spans_aggregated_total': spans_aggregated_total,
+        'spans_micro_input_total': spans_micro_input_total,
+        'bytes_saved_total': bytes_saved_total,
+        'aggregation_ratio': aggregation_ratio,
+    }
+
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TRACE_ID_CHARS = 26
 
@@ -397,6 +423,7 @@ class ObservabilitySDK:
             )
             logger.info("Span aggregation enabled (PP09)")
         self._aggregation_src_ctx: Optional[SpanContext] = None
+        self._aggregation_src_tenant_id: Optional[str] = None
         self.cost_threshold = self._load_cost_threshold(config)
         self._guardrail: "GuardrailEngine | None" = None
         # PC24: dedicated ring buffer for response embeddings → ClickHouse.
@@ -695,12 +722,23 @@ class ObservabilitySDK:
                     if self._aggregation_src_ctx is None:
                         # First micro-span: track its context for aggregate
                         self._aggregation_src_ctx = span.context
+                        # Store tenant_id separately
+                        self._aggregation_src_tenant_id = span.attributes.get("tenant_id", "")
+                        
+                    # Record micro-span input (PP11)
+                    spans_micro_input_total.labels(agent_id=span.context.agent_id, tenant_id=span.attributes.get("tenant_id", "")).inc()
                     aggregate = await self._span_aggregator.add(span)
                     if aggregate is not None:
                         # Buffer full: convert to aggregated span and continue
                         span = self._aggregate_to_span(aggregate)
+                        # Record aggregation metrics (PP11)
+                        self._record_aggregation_metrics(aggregate, span)
                         # Reset aggregation source context after flush
                         self._aggregation_src_ctx = None
+                        self._aggregation_src_tenant_id = None
+                        # Reset aggregator buffer to continue collecting new spans
+                        self._span_aggregator._buffer = []
+                        self._span_aggregator._first_span_time = None
                 # If it's already an aggregate or no aggregate produced, continue
             elif span.span_type == SpanType.AGENT_LOOP:
                 # Root span: flush any remaining micro-spans
@@ -710,12 +748,7 @@ class ObservabilitySDK:
             self._ring_buffer.put_nowait(span)
             self.last_spans.append(span)
             self._accumulate_trace_aggregates(span)
-            from agent_obs.metrics import (
-                cost_per_request_usd,
-                cost_total_usd,
-                spans_total,
-            )
-
+            
             spans_total.labels(agent_id=span.context.agent_id).inc()
 
             is_error = span.attributes.get("status") == "error"
@@ -761,6 +794,15 @@ class ObservabilitySDK:
             session_id=src_ctx.session_id,
             tool_name=src_ctx.tool_name,
         )
+        
+        # Preserve tenant_id from the original micro-spans
+        # Use the stored tenant_id if available
+        tenant_id = self._aggregation_src_tenant_id if self._aggregation_src_tenant_id else ""
+        # Fallback: get tenant_id from the first micro-span in the aggregate
+        if not tenant_id and aggregate.events:
+            first_event_attrs = aggregate.events[0].get('attrs', {})
+            tenant_id = first_event_attrs.get('tenant_id', '')
+        
 
         # Build events with sorted timestamps and ISO format
         events = []
@@ -784,6 +826,7 @@ class ObservabilitySDK:
                 "aggregation.children_count": aggregate.children_count,
                 "aggregation.bytes_saved": aggregate.bytes_saved,
                 "aggregation.source": "span_aggregator",
+                "tenant_id": tenant_id,
             },
             events=events,
         )
@@ -795,13 +838,14 @@ class ObservabilitySDK:
         aggregate = await self._span_aggregator.flush()
         if aggregate is not None:
             span = self._aggregate_to_span(aggregate)
+            # Record aggregation metrics (PP11)
+            self._record_aggregation_metrics(aggregate, span)
             # Enqueue the aggregated span (same path as regular spans)
             try:
                 self._ring_buffer.put_nowait(span)
                 self.last_spans.append(span)
                 self._accumulate_trace_aggregates(span)
-                from agent_obs.metrics import spans_total
-
+                
                 spans_total.labels(agent_id=span.context.agent_id).inc()
             except asyncio.QueueFull:
                 from agent_obs.metrics import dropped_spans_total
@@ -814,6 +858,65 @@ class ObservabilitySDK:
                 )
         # Reset aggregation source context
         self._aggregation_src_ctx = None
+        self._aggregation_src_tenant_id = None
+
+    def _record_aggregation_metrics(self, aggregate, span):
+        """Record aggregation metrics and audit event (PP11).
+        
+        Args:
+            aggregate: SpanAggregate with children_count, bytes_saved
+            span: resulting aggregated span (for agent_id, tenant_id)
+        """
+        
+        agent_id = span.context.agent_id
+        # Use the tenant_id from the aggregated span attributes
+        tenant_id = span.attributes.get("tenant_id", "")
+        
+        span_type = "agent.reasoning"
+
+        # Use get_pp11_metrics to ensure we're using the same metric instances
+        metrics = get_pp11_metrics()
+        aggregated_metric = metrics['spans_aggregated_total'].labels(agent_id=agent_id, tenant_id=tenant_id, span_type=span_type)
+        micro_metric = metrics['spans_micro_input_total'].labels(agent_id=agent_id, tenant_id=tenant_id)
+        bytes_saved_metric = metrics['bytes_saved_total'].labels(agent_id=agent_id, tenant_id=tenant_id)
+        
+        # Increment counters
+        aggregated_metric.inc()
+        bytes_saved_metric.inc(aggregate.bytes_saved)
+
+        # Update ratio gauge
+        aggregated_value = aggregated_metric._value.get()
+        micro_value = micro_metric._value.get()
+        if micro_value > 0:
+            metrics['aggregation_ratio'].labels(agent_id=agent_id).set(aggregated_value / micro_value)
+
+        # Log audit event (never raises)
+        try:
+            from agent_obs.guardrail.audit import AggregationFlushAuditEvent
+            
+            event = AggregationFlushAuditEvent.for_aggregation_flush(
+                children_count=aggregate.children_count,
+                bytes_saved=aggregate.bytes_saved,
+                span_type=span_type,
+                agent_id=agent_id,
+                trace_id=span.context.trace_id,
+            )
+            
+            # Log structured audit record (always)
+            logger.info(
+                "Aggregation flushed: audit_id=%s children_count=%d bytes_saved=%d agent_id=%s trace_id=%s",
+                event.audit_id,
+                aggregate.children_count,
+                aggregate.bytes_saved,
+                agent_id,
+                span.context.trace_id,
+            )
+            
+            # TODO: Optional HotStore write when audit_store configured (PP11 audit sink extension)
+            
+        except Exception as e:
+            logger.error("Failed to create aggregation audit event: %s", str(e))
+            # Never raises - continue with metrics
 
     @asynccontextmanager
     async def reasoning(

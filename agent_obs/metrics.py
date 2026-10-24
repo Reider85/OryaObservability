@@ -320,3 +320,33 @@ tail_sampler_decision_latency_seconds = Histogram(
 # Seed content rates at import (matches AGENT_OBS_CONTENT_RATE default and override)
 tail_sampler_content_rate.labels(policy="default").set(10)
 tail_sampler_content_rate.labels(policy="eval_fail_override").set(30)
+
+# --- PP11 Span aggregation metrics ---
+
+# Counter for aggregated spans produced by the SDK
+spans_aggregated_total = Counter(
+    "spans_aggregated_total",
+    "Spans aggregated into one span with events",
+    ["agent_id", "tenant_id", "span_type"],
+)
+
+# Counter for micro-spans that were input to aggregation
+spans_micro_input_total = Counter(
+    "spans_micro_input_total",
+    "Micro-spans input to span aggregation buffer",
+    ["agent_id", "tenant_id"],
+)
+
+# Counter for total bytes saved by aggregation
+bytes_saved_total = Counter(
+    "bytes_saved_total",
+    "Total bytes saved by span aggregation (sum of all flushes)",
+    ["agent_id", "tenant_id"],
+)
+
+# Gauge for current aggregation ratio (aggregated / micro-input)
+aggregation_ratio = Gauge(
+    "aggregation_ratio",
+    "Ratio of aggregated spans to micro-spans input (expected 0.02–0.05)",
+    ["agent_id"],
+)

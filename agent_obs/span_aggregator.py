@@ -144,7 +144,7 @@ class SpanAggregator:
                 len(self._buffer) >= self.max_count
                 or (
                     self._first_span_time
-                    and (self.clock() - self._first_span_time) >= self.max_window_seconds
+                    and (span.start_time - self._first_span_time) >= self.max_window_seconds
                 )
             ):
                 return await self.flush()

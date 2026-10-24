@@ -451,3 +451,106 @@ class SamplerRateChangeAuditEvent:
             self.ip_address,
             self.user_agent,
         )
+
+
+@dataclass
+class AggregationFlushAuditEvent:
+    """Audit event for span aggregation flush (PP11).
+
+    Records when the SDK aggregates micro-spans into one span with events,
+    tracking the efficiency of the aggregation process.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    trace_id: str     # Optional, empty if not trace-related
+    actor: dict[str, str]
+    action: str
+    resource: dict[str, str]
+    reason: str
+    ip_address: str
+    user_agent: str
+    decision: str = "aggregated"  # aggregated or dropped (if buffer full)
+    
+    @classmethod
+    def for_aggregation_flush(
+        cls,
+        children_count: int,
+        bytes_saved: int,
+        span_type: str,
+        agent_id: str,
+        trace_id: str = "",
+        ip_address: str = "",
+        user_agent: str = "sdk",
+    ) -> "AggregationFlushAuditEvent":
+        """Create audit event for aggregation flush.
+        
+        Parameters
+        ----------
+        children_count:
+            Number of micro-spans aggregated
+        bytes_saved:
+            Total bytes saved by this aggregation
+        span_type:
+            Type of span (e.g., "agent.reasoning")
+        agent_id:
+            Agent identifier
+        trace_id:
+            Optional trace_id for correlation
+        ip_address:
+            Client IP address (default "unknown")
+        user_agent:
+            Client user agent (default "sdk")
+        """
+        return cls(
+            audit_id=f"afe-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            trace_id=trace_id,
+            actor={"type": "system", "id": "span_aggregator"},
+            action="span.aggregate_flush",
+            resource={
+                "type": "span_aggregation",
+                "span_type": span_type,
+                "children_count": children_count,
+                "bytes_saved": bytes_saved,
+                "agent_id": agent_id,
+            },
+            reason=f"aggregated {children_count} micro-spans, bytes_saved={bytes_saved}",
+            ip_address=ip_address or "unknown",
+            user_agent=user_agent,
+            decision="aggregated",
+        )
+    
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+    
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row tuple (positional parameters).
+        
+        Matches audit_events_hot DDL columns:
+        (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+        """
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )

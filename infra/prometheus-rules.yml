@@ -214,3 +214,26 @@ groups:
             The p99 latency of sampling policy decisions exceeds 5ms. This may
             impact throughput. Check policy engine complexity and optimize if needed.
             Current p99: {{ $value }} seconds.
+
+  # PC35 (T3.2.4): span aggregation must not flush too frequently, which wastes
+  # CPU and reduces the compression ratio. >0.2 means 1 aggregate per 5 spans
+  # or less, indicating the buffer is too small or the agent is producing
+  # micro-spans faster than expected.
+  - name: span-aggregation
+    rules:
+      - alert: AggregationRatioTooLow
+        expr: aggregation_ratio > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          component: aggregation
+        annotations:
+          summary: "Aggregation ratio too high ({{ $value }} > 0.2)"
+          description: >-
+            The aggregation ratio (aggregated spans / micro-spans input) has been
+            above 0.2 for 15 minutes. This indicates the aggregation buffer is
+            flushing too frequently, reducing compression efficiency. Expected
+            range is 0.02–0.05 (1 aggregate per 20–50 micro-spans). Check if the
+            buffer size (max_count) is appropriate for your agent's reasoning
+            step frequency. Dashboard: Span Aggregation
+            (http://localhost:3001/d/span-aggregation); audit events via SDK logs.
