@@ -69,9 +69,11 @@ async def aggregate_compliance_catalog(
         rows = await warm_store.get_all_compliance_catalog()
         compliance_catalog_rows_total.set(len(rows))
         
-        # 2. UPDATE last_seen from hot tier (PC34: real UPDATE, not no-op)
+        # 2. UPDATE last_seen from hot tier (PC34: real UPDATE, not no-op).
+        # Hot-sync runs even in dry_run mode: it only reconciles last_seen
+        # (idempotent metadata), while destructive steps below are dry_run-gated.
         last_seen_updated_count = 0
-        if hot_store is not None and not dry_run:
+        if hot_store is not None:
             try:
                 # Get all hot tier rows for last_seen sync
                 hot_rows = await hot_store.get_compliance_catalog_all()

@@ -217,13 +217,18 @@ class TestComplianceHotToWarmMigrationIntegration:
     @pytest.mark.asyncio
     async def test_compliance_hot_to_warm_job_wrapper(self):
         """Test the job wrapper function."""
-        with patch('agent_obs.compliance.migrate_hot_to_warm.migrate_compliance_catalog_hot_to_warm') as mock_migrate, \
-             patch('agent_obs.storage.maintenance.build_hot_store') as mock_hot_build, \
-             patch('agent_obs.storage.maintenance.build_warm_store') as mock_warm_build:
+        # Patch scheduler's namespace: the wrapper binds these via
+        # `from ... import ...`, so source-module patches only take effect
+        # if scheduler happens to be imported for the first time inside them.
+        with patch('scripts.cron.scheduler.migrate_compliance_catalog_hot_to_warm') as mock_migrate, \
+             patch('scripts.cron.scheduler.build_hot_store') as mock_hot_build, \
+             patch('scripts.cron.scheduler.build_warm_store') as mock_warm_build:
             
             # Setup mocks
             mock_hot_store = MagicMock()
             mock_warm_store = MagicMock()
+            # The job wrapper does `await warm.close()` in its finally block
+            mock_warm_store.close = AsyncMock()
             mock_hot_build.return_value = mock_hot_store
             mock_warm_build.return_value = mock_warm_store
             mock_result = ComplianceHotToWarmResult(

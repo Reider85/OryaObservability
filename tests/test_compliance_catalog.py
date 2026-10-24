@@ -21,6 +21,7 @@ import pytest
 from agent_obs.compliance.catalog import (
     ENV_COMPLIANCE_PG,
     ENV_COMPLIANCE_PG_DSN,
+    ENV_COMPLIANCE_TIER,
     ComplianceCatalog,
     ComplianceRow,
     NullCatalogWriter,
@@ -400,6 +401,15 @@ class TestPostgresCatalogWriter:
 
 
 class TestBuildCatalog:
+    @pytest.fixture(autouse=True)
+    def _isolate_warm_tier(self, monkeypatch: pytest.MonkeyPatch):
+        """Pin tier to warm_only: these tests verify PG-mode selection only.
+
+        The default dual tier would add the ClickHouse hot writer and wrap
+        everything in a CompositeCatalogWriter, hiding the PG writer choice.
+        """
+        monkeypatch.setenv(ENV_COMPLIANCE_TIER, "warm_only")
+
     def test_off_selects_null_writer(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv(ENV_COMPLIANCE_PG, "off")
         catalog = build_compliance_catalog()

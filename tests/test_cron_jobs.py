@@ -35,6 +35,7 @@ from agent_obs.storage.maintenance import (
     JOB_CLEANUP_AUDIT_EVENTS,
     JOB_CLEANUP_EVAL_RESULTS,
     JOB_CLEANUP_VAULT,
+    JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
     JOB_MIGRATE_SPANS,
     JOB_MIGRATE_TRACES,
     JOB_CALIBRATE_DRIFT_THRESHOLD,
@@ -1248,10 +1249,11 @@ class TestSchedulerJobTable:
             JOB_CALIBRATE_DRIFT_THRESHOLD,
             JOB_EXPORT_EMBEDDINGS,
             JOB_AGGREGATE_COMPLIANCE_CATALOG,
+            JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
         }
 
     def test_job_count_is_explicit(self):
-        assert len(scheduler.build_jobs()) == 9
+        assert len(scheduler.build_jobs()) == 10
 
     def test_drift_calibration_is_monthly(self):
         """PC26: calibration is monthly, never on the 15-minute detection cadence."""

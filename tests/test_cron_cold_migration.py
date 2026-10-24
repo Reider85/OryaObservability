@@ -569,6 +569,7 @@ class TestInfraCronConfig:
             "ComplianceCatalogAggregationStale",
             "ComplianceCatalogZeroActivity",
             "CronMigrationHotToWarmFailed",
+            "ComplianceCatalogMigrationStale",
         }
 
     def test_staleness_rules_read_the_success_gauge(self, rules):

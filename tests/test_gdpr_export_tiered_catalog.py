@@ -47,27 +47,24 @@ class TestGDPRExportWithTieredCatalog:
             )
         ]
         mock_catalog.query_compliance_catalog = AsyncMock(return_value=test_rows)
-        
-        # Mock the export function
-        with patch('agent_obs.compliance.gdpr_export.export_data_map') as mock_export:
-            mock_export.return_value = b"test csv data"
-            
-            # Call export_data_map
-            result = await export_data_map(
-                catalog=mock_catalog,
-                as_of=datetime.now(timezone.utc),
-                lawful_basis="consent",
-                fmt="csv"
-            )
-            
-            # Verify that query_compliance_catalog was called with correct parameters
-            mock_catalog.query_compliance_catalog.assert_called_once()
-            call_args = mock_catalog.query_compliance_catalog.call_args
-            assert call_args.kwargs["last_seen_min"] is not None  # Should have cutoff date
-            
-            # Verify that export was successful
-            assert result == b"test csv data"
-            mock_export.assert_called_once()
+
+        # Call the real export_data_map against the mocked catalog: the
+        # serializer must produce a real BOM-prefixed CSV from tiered rows.
+        result = await export_data_map(
+            catalog=mock_catalog,
+            as_of=datetime.now(timezone.utc),
+            lawful_basis={"agent1": "consent"},
+            fmt="csv"
+        )
+
+        # Verify that query_compliance_catalog was called with correct parameters
+        mock_catalog.query_compliance_catalog.assert_called_once()
+        call_args = mock_catalog.query_compliance_catalog.call_args
+        assert call_args.kwargs["last_seen_min"] is not None  # Should have cutoff date
+
+        # Verify that export produced real CSV bytes (UTF-8 BOM + data)
+        assert result.startswith(b"\xef\xbb\xbf")
+        assert b"agent1" in result
 
     @pytest.mark.asyncio
     async def test_gdpr_export_hot_tier_only(self):
@@ -90,24 +87,21 @@ class TestGDPRExportWithTieredCatalog:
             )
         ]
         mock_catalog.query_compliance_catalog = AsyncMock(return_value=test_rows)
-        
-# Mock the export function
-        with patch('agent_obs.compliance.gdpr_export.export_data_map') as mock_export:
-            mock_export.return_value = b"warm tier csv data"
-            
-# Call export_data_map
-            result = await export_data_map(
-                catalog=mock_catalog,
-                as_of=datetime.now(timezone.utc),
-                lawful_basis={"agent1": "consent"},
-                fmt="csv"
-            )
-            
-            # Verify that query_compliance_catalog was called
-            mock_catalog.query_compliance_catalog.assert_called_once()
-            
-            # Verify that export was successful
-            assert result == b"hot tier csv data"
+
+        # Call the real export_data_map (query is mocked on the catalog)
+        result = await export_data_map(
+            catalog=mock_catalog,
+            as_of=datetime.now(timezone.utc),
+            lawful_basis={"agent1": "consent"},
+            fmt="csv"
+        )
+
+        # Verify that query_compliance_catalog was called
+        mock_catalog.query_compliance_catalog.assert_called_once()
+
+        # Verify that export produced real CSV bytes for the hot-tier row
+        assert result.startswith(b"\xef\xbb\xbf")
+        assert b"agent1" in result
 
     @pytest.mark.asyncio
     async def test_gdpr_export_warm_tier_only(self):
@@ -130,28 +124,25 @@ class TestGDPRExportWithTieredCatalog:
             )
         ]
         mock_catalog.query_compliance_catalog = AsyncMock(return_value=test_rows)
-        
-        # Mock the export function
-        with patch('agent_obs.compliance.gdpr_export.export_data_map') as mock_export:
-            mock_export.return_value = b"warm tier csv data"
-            
-            # Call export_data_map
-            result = await export_data_map(
-                catalog=mock_catalog,
-                as_of=datetime.now(timezone.utc),
-                lawful_basis="consent",
-                fmt="csv"
-            )
-            
-            # Verify that query_compliance_catalog was called
-            mock_catalog.query_compliance_catalog.assert_called_once()
-            
-            # Verify that export was successful
-            assert result == b"warm tier csv data"
+
+        # Call the real export_data_map (query is mocked on the catalog)
+        result = await export_data_map(
+            catalog=mock_catalog,
+            as_of=datetime.now(timezone.utc),
+            lawful_basis={"agent1": "consent"},
+            fmt="csv"
+        )
+
+        # Verify that query_compliance_catalog was called
+        mock_catalog.query_compliance_catalog.assert_called_once()
+
+        # Verify that export produced real CSV bytes for the warm-tier row
+        assert result.startswith(b"\xef\xbb\xbf")
+        assert b"agent1" in result
 
     @pytest.mark.asyncio
     async def test_gdpr_export_with_filters(self):
-        """Test GDPR export with filtering parameters."""
+        """Test GDPR export passes the as_of cutoff to the catalog query."""
         mock_catalog = MagicMock(spec=ComplianceCatalog)
         
         # Mock the query_compliance_catalog method
@@ -165,28 +156,24 @@ class TestGDPRExportWithTieredCatalog:
             )
         ]
         mock_catalog.query_compliance_catalog = AsyncMock(return_value=test_rows)
-        
-        # Mock the export function
-        with patch('agent_obs.compliance.gdpr_export.export_data_map') as mock_export:
-            mock_export.return_value = b"filtered csv data"
-            
-            # Call export_data_map - filters should be applied to query_compliance_catalog
-            result = await export_data_map(
-                catalog=mock_catalog,
-                as_of=datetime.now(timezone.utc),
-                lawful_basis={"agent1": "consent"},
-                fmt="csv"
-            )
-            
-            # Verify that query_compliance_catalog was called with filters
-            mock_catalog.query_compliance_catalog.assert_called_once()
-            call_args = mock_catalog.query_compliance_catalog.call_args
-            assert call_args.kwargs["agent_id"] == "agent1"
-            assert call_args.kwargs["tool"] == "tool1"
-            assert call_args.kwargs["pii_type"] == "email"
-            
-            # Verify that export was successful
-            assert result == b"filtered csv data"
+
+        # Call the real export_data_map - filters are the catalog's job,
+        # export_data_map only applies the last_seen_min cutoff.
+        result = await export_data_map(
+            catalog=mock_catalog,
+            as_of=datetime.now(timezone.utc),
+            lawful_basis={"agent1": "consent"},
+            fmt="csv"
+        )
+
+        # Verify the cutoff filter is forwarded to the catalog query
+        mock_catalog.query_compliance_catalog.assert_called_once()
+        call_args = mock_catalog.query_compliance_catalog.call_args
+        assert call_args.kwargs["last_seen_min"] is not None
+
+        # Verify that export produced real CSV bytes
+        assert result.startswith(b"\xef\xbb\xbf")
+        assert b"agent1" in result
 
     @pytest.mark.asyncio 
     async def test_gdpr_export_empty_results(self):
@@ -256,10 +243,10 @@ class TestComplianceCatalogQuerying:
         
         # Create a compliance catalog with hot tier
         catalog = ComplianceCatalog(HotCatalogWriter())
-        
-        # Mock the hot store query method
-        with patch.object(catalog._writer, '_get_hot_store') as mock_get_store:
-            mock_hot_store = AsyncMock()
+
+        # _query_hot_tier imports HotStore from agent_obs.storage.hot lazily
+        with patch('agent_obs.storage.hot.HotStore') as mock_hot_store_cls:
+            mock_hot_store = MagicMock()
             mock_hot_store.get_compliance_catalog_all = AsyncMock(return_value=[
                 {
                     "agent_id": "agent1",
@@ -271,11 +258,11 @@ class TestComplianceCatalogQuerying:
                 }
             ])
             mock_hot_store.close = AsyncMock()
-            mock_get_store.return_value = mock_hot_store
-            
+            mock_hot_store_cls.return_value = mock_hot_store
+
             # Query the compliance catalog
             results = await catalog.query_compliance_catalog()
-            
+
             # Verify results
             assert len(results) == 1
             assert results[0].agent_id == "agent1"
@@ -291,10 +278,10 @@ class TestComplianceCatalogQuerying:
         
         # Create a compliance catalog with hot tier
         catalog = ComplianceCatalog(HotCatalogWriter())
-        
-        # Mock the hot store query method
-        with patch.object(catalog._writer, '_get_hot_store') as mock_get_store:
-            mock_hot_store = AsyncMock()
+
+        # _query_hot_tier imports HotStore from agent_obs.storage.hot lazily
+        with patch('agent_obs.storage.hot.HotStore') as mock_hot_store_cls:
+            mock_hot_store = MagicMock()
             mock_hot_store.get_compliance_catalog_all = AsyncMock(return_value=[
                 {
                     "agent_id": "agent1",
@@ -314,18 +301,18 @@ class TestComplianceCatalogQuerying:
                 }
             ])
             mock_hot_store.close = AsyncMock()
-            mock_get_store.return_value = mock_hot_store
-            
+            mock_hot_store_cls.return_value = mock_hot_store
+
             # Query with agent_id filter
             results = await catalog.query_compliance_catalog(agent_id="agent1")
-            
+
             # Verify results are filtered
             assert len(results) == 1
             assert results[0].agent_id == "agent1"
-            
+
             # Query with pii_type filter
             results = await catalog.query_compliance_catalog(pii_type="phone")
-            
+
             # Verify results are filtered
             assert len(results) == 1
             assert results[0].pii_type == "phone"

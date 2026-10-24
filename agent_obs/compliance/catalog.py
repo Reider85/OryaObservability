@@ -636,22 +636,27 @@ def build_compliance_catalog(*, flush_interval: float = 60.0) -> ComplianceCatal
             if tier_mode == "hot_only":
                 raise RuntimeError("Hot tier required but not available") from e
     
-    # Add Postgres writer if PG mode allows and tier mode allows it
-    if pg_mode not in ("off", "0", "false", "no") and tier_mode in ("dual", "warm_only"):
-        if pg_mode in ("on", "1", "true", "yes"):
-            writer = PostgresCatalogWriter()
-        else:  # auto
-            dsn = os.environ.get(ENV_COMPLIANCE_PG_DSN)
-            try:
-                import asyncpg  # noqa: F401
-                has_asyncpg = True
-            except ImportError:
-                has_asyncpg = False
-            if has_asyncpg and dsn:
-                writer = PostgresCatalogWriter(dsn=dsn)
-            else:
-                writer = NullCatalogWriter()
-        writers.append(writer)
+    # Add Postgres writer if PG mode allows and tier mode allows it.
+    # pg_mode=off explicitly disables the warm tier, so a no-op writer keeps
+    # the documented contract "off -> NullCatalogWriter".
+    if tier_mode in ("dual", "warm_only"):
+        if pg_mode in ("off", "0", "false", "no"):
+            writers.append(NullCatalogWriter())
+        else:
+            if pg_mode in ("on", "1", "true", "yes"):
+                writer = PostgresCatalogWriter()
+            else:  # auto
+                dsn = os.environ.get(ENV_COMPLIANCE_PG_DSN)
+                try:
+                    import asyncpg  # noqa: F401
+                    has_asyncpg = True
+                except ImportError:
+                    has_asyncpg = False
+                if has_asyncpg and dsn:
+                    writer = PostgresCatalogWriter(dsn=dsn)
+                else:
+                    writer = NullCatalogWriter()
+            writers.append(writer)
     
     if not writers:
         raise RuntimeError(

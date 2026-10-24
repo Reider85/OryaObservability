@@ -161,16 +161,19 @@ class TestAdaptiveEvalSampler:
         """Test fallback to no incident on Prometheus error."""
         # Mock Prometheus error
         sampler._fetch_active_incident = AsyncMock(side_effect=Exception("Prometheus error"))
-        
-        mode = await sampler.detect_mode()
+
+        # Pin a daytime clock: the day/night fallback must not depend on when
+        # the test runs.
+        day_time = datetime.datetime(2024, 1, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        mode = await sampler.detect_mode(now=day_time)
         assert mode == "day"  # Default to day when incident fetch fails
     
     @pytest.mark.asyncio
     async def test_should_eval_day_mode(self, sampler, trace_normal):
         """Test should_eval in day mode (10% sampling)."""
-        # Set mode to day
-        sampler._current_mode = "day"
-        sampler._fetch_active_incident = AsyncMock(return_value=False)
+        # Pin the detected mode (symmetric with the night-mode test): without
+        # this, detect_mode() derives day/night from the current UTC hour.
+        sampler.detect_mode = AsyncMock(return_value="day")
         
         # Test multiple trace IDs to verify 10% rate
         eval_count = 0

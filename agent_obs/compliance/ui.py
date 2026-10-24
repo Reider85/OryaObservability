@@ -17,7 +17,11 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 import uvicorn
 from agent_obs.compliance.catalog import ComplianceCatalog, ComplianceRow
-from agent_obs.compliance.gdpr_export import export_data_map, GDPRDataRow
+from agent_obs.compliance.gdpr_export import (
+    GDPRDataRow,
+    _export_csv,
+    _export_xlsx,
+)
 from agent_obs.compliance.aggregate import aggregate_compliance_catalog, ComplianceAggregationResult
 from agent_obs.storage.warm import WarmStore
 
@@ -390,7 +394,7 @@ async def compliance_dashboard(
             <button onclick="window.location.href='/?page={{ page-1 }}{% for k, v in filters.items() %}{% if v %}&{{ k }}={{ v }}{% endif %}{% endfor %}'">Previous</button>
             {% endif %}
             
-            {% for p in range(max(1, page-2), min(total_pages + 1, page + 3)) %}
+            {% for p in range([1, page-2] | max, [total_pages + 1, page + 3] | min) %}
             <button {% if p == page %}class="active"{% endif %} onclick="window.location.href='/?page={{ p }}{% for k, v in filters.items() %}{% if v %}&{{ k }}={{ v }}{% endif %}{% endfor %}'">{{ p }}</button>
             {% endfor %}
             
@@ -491,7 +495,7 @@ async def export_gdpr_data(
     
     # Generate export
     if fmt == "csv":
-        csv_data = export_data_map(gdpr_rows, fmt="csv")
+        csv_data = _export_csv(gdpr_rows)
         return StreamingResponse(
             iter([csv_data]),
             media_type="text/csv",
@@ -499,7 +503,7 @@ async def export_gdpr_data(
         )
     else:  # xlsx
         # Generate XLSX in memory
-        output = export_data_map(gdpr_rows, fmt="xlsx")
+        output = _export_xlsx(gdpr_rows)
         return StreamingResponse(
             iter([output]),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

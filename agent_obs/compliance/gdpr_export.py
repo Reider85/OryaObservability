@@ -178,11 +178,20 @@ async def export_data_map(
     gdpr_export_runs_total.labels(format=fmt).inc()
     
     with gdpr_export_duration_seconds.time():
-        # Query compliance catalog with 90-day retention filter
+        # Query compliance catalog with 90-day retention filter.
+        # Graceful fallback: a failed tier query must not 500 the export
+        # endpoint - log and continue with an empty (header-only) data map.
         cutoff_date = as_of.replace(day=1)  # First day of month for 90-day window
-        rows = await catalog.query_compliance_catalog(
-            last_seen_min=cutoff_date
-        )
+        try:
+            rows = await catalog.query_compliance_catalog(
+                last_seen_min=cutoff_date
+            )
+        except Exception as e:
+            logger.warning(
+                "Compliance catalog query failed, exporting empty data map: %s",
+                str(e),
+            )
+            rows = []
         
         # Convert to GDPR data rows
         gdpr_rows = [

@@ -1,6 +1,7 @@
 """PC34: Tests for compliance catalog aggregation cron job."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -281,8 +282,11 @@ class TestComplianceAggregationIntegration:
     @pytest.mark.asyncio
     async def test_compliance_aggregation_job_wrapper(self):
         """Test the job wrapper function."""
-        with patch('agent_obs.compliance.aggregate.aggregate_compliance_catalog') as mock_agg, \
-             patch('agent_obs.storage.maintenance.build_warm_store') as mock_build:
+        # Patch the names in scheduler's namespace: scheduler binds them via
+        # `from ... import ...`, so patching the source module only works if
+        # scheduler happens to be imported for the first time inside the patch.
+        with patch('scripts.cron.scheduler.aggregate_compliance_catalog') as mock_agg, \
+             patch('scripts.cron.scheduler.build_warm_store') as mock_build:
             
             # Setup mocks
             mock_store = MagicMock()

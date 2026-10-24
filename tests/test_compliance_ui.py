@@ -137,42 +137,38 @@ class TestComplianceUI:
         assert data["filters"]["pii_type"] == "email"
 
     @patch('agent_obs.compliance.ui.get_compliance_catalog')
-    @patch('agent_obs.compliance.ui.export_data_map')
-    def test_export_csv(self, mock_export_data, mock_get_catalog):
+    @patch('agent_obs.compliance.ui._export_csv')
+    def test_export_csv(self, mock_export_csv, mock_get_catalog):
         """Test CSV export functionality"""
-        from io import StringIO
-        
         # Mock catalog
         mock_catalog = Mock()
         mock_catalog.get_filtered_rows.return_value = self.mock_compliance_rows
         mock_get_catalog.return_value = mock_catalog
-        
-        # Mock export function
-        mock_export_data.return_value = StringIO("agent_id,tool,field,pii_type,frequency\nagent-1,llm_call,user_message,email,5")
-        
+
+        # Mock export function (returns bytes, like the real serializer)
+        mock_export_csv.return_value = b"agent_id,tool,field,pii_type,frequency\nagent-1,llm_call,user_message,email,5"
+
         # Test export
         response = self.client.get(
             "/compliance/export?fmt=csv",
             auth=("admin", "admin123")
         )
         assert response.status_code == 200
-        assert response.headers["content-type"] == "text/csv"
+        assert response.headers["content-type"].startswith("text/csv")
         assert "attachment" in response.headers["content-disposition"]
         assert "gdpr_data_map" in response.headers["content-disposition"]
 
     @patch('agent_obs.compliance.ui.get_compliance_catalog')
-    @patch('agent_obs.compliance.ui.export_data_map')
-    def test_export_xlsx(self, mock_export_data, mock_get_catalog):
+    @patch('agent_obs.compliance.ui._export_xlsx')
+    def test_export_xlsx(self, mock_export_xlsx, mock_get_catalog):
         """Test XLSX export functionality"""
-        from io import BytesIO
-        
         # Mock catalog
         mock_catalog = Mock()
         mock_catalog.get_filtered_rows.return_value = self.mock_compliance_rows
         mock_get_catalog.return_value = mock_catalog
-        
-        # Mock export function
-        mock_export_data.return_value = BytesIO(b'PK\x03\x04')  # Mock XLSX content
+
+        # Mock export function (returns bytes, like the real serializer)
+        mock_export_xlsx.return_value = b'PK\x03\x04'  # Mock XLSX content
         
         # Test export
         response = self.client.get(
@@ -184,26 +180,26 @@ class TestComplianceUI:
         assert "attachment" in response.headers["content-disposition"]
 
     @patch('agent_obs.compliance.ui.get_compliance_catalog')
-    @patch('agent_obs.compliance.ui.export_data_map')
-    def test_export_with_date_filter(self, mock_export_data, mock_get_catalog):
+    @patch('agent_obs.compliance.ui._export_csv')
+    def test_export_with_date_filter(self, mock_export_csv, mock_get_catalog):
         """Test export with date filter"""
-        from io import StringIO
-        
         # Mock catalog
         mock_catalog = Mock()
         mock_catalog.get_filtered_rows.return_value = self.mock_compliance_rows
         mock_get_catalog.return_value = mock_catalog
-        
-        # Mock export function
-        mock_export_data.return_value = StringIO("test data")
-        
+
+        # Mock export function (returns bytes, like the real serializer)
+        mock_export_csv.return_value = b"test data"
+
         # Test export with date filter
         response = self.client.get(
             "/compliance/export?fmt=csv&as_of=2024-01-15",
             auth=("admin", "admin123")
         )
         assert response.status_code == 200
-        mock_export_data.assert_called_once()
+        mock_export_csv.assert_called_once()
+        # Rows were fetched with the requested as_of date as end_date filter
+        assert mock_catalog.get_filtered_rows.call_args.kwargs["end_date"] == "2024-01-15"
 
     def test_export_invalid_date(self):
         """Test export with invalid date format"""
@@ -398,9 +394,8 @@ class TestComplianceUIIntegration:
         )
         
         with patch('agent_obs.compliance.ui.get_dashboard_summary', return_value=mock_summary):
-            with patch('agent_obs.compliance.ui.export_data_map') as mock_export:
-                from io import StringIO
-                mock_export.return_value = StringIO("agent_id,tool,field,pii_type,frequency\nagent-1,llm_call,user_message,email,5")
+            with patch('agent_obs.compliance.ui._export_csv') as mock_export:
+                mock_export.return_value = b"agent_id,tool,field,pii_type,frequency\nagent-1,llm_call,user_message,email,5"
                 
                 # 1. View dashboard
                 dashboard_response = self.client.get("/", auth=("admin", "admin123"))

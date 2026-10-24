@@ -446,7 +446,7 @@ class SamplerRateChangeAuditEvent:
             json.dumps(self.actor),
             self.action,
             self.decision,
-            json.dumps(self.resource),
+            json.dumps(resource),
             self.reason,
             self.ip_address,
             self.user_agent,

@@ -172,14 +172,10 @@ class TestDriftAlertPhoenixLink:
 class TestExportEdgeCases:
     def test_empty_embeddings_list(self):
         """Export handles empty embeddings list gracefully."""
-        # Import the module's function
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "export_embeddings_to_phoenix", EXPORT_SCRIPT_PATH
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Import through the package (same sys.modules key the scheduler job
+        # uses): a second exec_module would re-register the module's
+        # Prometheus Counters and raise DuplicateTimeseries.
+        import scripts.cron.export_embeddings_to_phoenix as module
 
         # The function should handle empty list without error
         # (we're just testing the logic, not the actual HTTP call)

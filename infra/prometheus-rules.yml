@@ -126,9 +126,7 @@ groups:
             No new compliance catalog rows in last 24 hours. Check guardrail
             functionality and agent traffic. This may indicate broken PII masking.
 
-  # PC34: Weekly compliance catalog hot to warm migration
-  - name: compliance-migration
-    rules:
+      # PC34: Weekly compliance catalog hot to warm migration
       - alert: ComplianceCatalogMigrationStale
         expr: time() - agent_obs_cron_last_success_timestamp_seconds{job_name="migrate_compliance_catalog_hot_to_warm"} > 1209600
         for: 1h
