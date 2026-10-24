@@ -45,8 +45,8 @@ class TestSpanType:
         assert SpanType.LLM_CALL.value == "llm.call"
         assert SpanType.TOOL_CALL.value == "tool.call"
 
-    def test_all_three_types_present(self):
-        assert len(SpanType) == 3
+    def test_all_four_types_present(self):
+        assert len(SpanType) == 4
 
 
 # ---------------------------------------------------------------------------

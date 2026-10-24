@@ -30,6 +30,7 @@ from agent_obs.cost.price_book import PriceBook, PriceNotFoundError
 
 if TYPE_CHECKING:
     from agent_obs.guardrail.engine import GuardrailEngine, GuardrailVerdict
+    from agent_obs.span_aggregator import SpanAggregator
 
 logger = logging.getLogger(__name__)
 
@@ -158,12 +159,22 @@ def _to_iso8601(ts: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _parse_iso8601(iso_str: str) -> float:
+    """Parse ISO8601 string to POSIX timestamp (PP09 from_dict)."""
+    if iso_str.endswith("Z"):
+        iso_str = iso_str[:-1] + "+00:00"
+    return datetime.fromisoformat(iso_str).timestamp()
+
+
 class SpanType(Enum):
-    """Allowed span types on MVP (level 2 types are placeholders, must not be used)."""
+    """Allowed span types on MVP (level 2 types are placeholders, must not be used).
+    PROD-ready: AGENT_REASONING added for span-aggregation (PP09).
+    """
 
     AGENT_LOOP = "agent.loop"
     LLM_CALL = "llm.call"
     TOOL_CALL = "tool.call"
+    AGENT_REASONING = "agent.reasoning"
     # Level 2 placeholders — not implemented in MVP
     # TOOL_INPUT = "tool.input"
     # TOOL_OUTPUT = "tool.output"
@@ -241,6 +252,8 @@ class Span:
 
     def to_dict(self) -> dict:
         """Serialize to the §7.1 ARCHITECT.md schema."""
+        # Deduplicate events by (span_id, event_name, event_ts) for idempotency on retry (PP09)
+        deduped_events = self._deduped_events()
         return {
             "trace_id": self.context.trace_id,
             "span_id": self.context.span_id,
@@ -257,9 +270,52 @@ class Span:
                     "timestamp": e.timestamp,
                     "attributes": dict(e.attributes),
                 }
-                for e in self.events
+                for e in deduped_events
             ],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Span":
+        """Deserialize from dict (reverse of to_dict, PP09 round-trip)."""
+        ctx = SpanContext(
+            trace_id=data["trace_id"],
+            span_id=data["span_id"],
+            parent_span_id=data["parent_span_id"],
+            agent_id=data.get("agent_id", ""),
+            agent_version=data.get("agent_version", ""),
+            user_id=data.get("user_id", ""),
+            session_id=data.get("session_id", ""),
+            tool_name=data.get("tool_name", None),
+        )
+        span = cls(
+            name=data["name"],
+            span_type=data["span_type"],
+            context=ctx,
+            start_time=_parse_iso8601(data["start_time"]),
+            end_time=_parse_iso8601(data["end_time"]) if data["end_time"] else None,
+            attributes=dict(data["attributes"]),
+        )
+        # Tolerate both {name, timestamp, attributes} (OTLP) and {name, ts, attrs} (PP0 internal)
+        for event_data in data["events"]:
+            timestamp = event_data.get("timestamp", event_data.get("ts"))
+            attrs = event_data.get("attributes", event_data.get("attrs", {}))
+            span.add_event(event_data["name"], attrs)
+            # Set correct timestamp after add_event generates current time
+            for event in span.events:
+                if event.name == event_data["name"] and not event.timestamp.startswith("20"):
+                    event.timestamp = timestamp
+        return span
+
+    def _deduped_events(self) -> list[Event]:
+        """Return events deduplicated by (event_name, event_timestamp) within this span (PP09)."""
+        seen = set()
+        deduped = []
+        for event in self.events:
+            key = (event.name, event.timestamp)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(event)
+        return deduped
 
 
 class NullSpan:
@@ -328,6 +384,19 @@ class ObservabilitySDK:
         self._metrics_http_server = None
         self._trace_agg: dict[str, dict] = {}
         self._max_trace_agg = 100_000
+
+        # PP09: span aggregation configuration
+        self._aggregation_enabled = self._load_aggregation_enabled(config)
+        self._span_aggregator: "SpanAggregator | None" = None
+        if self._aggregation_enabled:
+            # Import SpanAggregator at runtime to avoid circular import
+            from agent_obs.span_aggregator import SpanAggregator
+            self._span_aggregator = SpanAggregator(
+                max_count=self._load_aggregation_max_count(config),
+                max_window_seconds=self._load_aggregation_window(config),
+            )
+            logger.info("Span aggregation enabled (PP09)")
+        self._aggregation_src_ctx: Optional[SpanContext] = None
         self.cost_threshold = self._load_cost_threshold(config)
         self._guardrail: "GuardrailEngine | None" = None
         # PC24: dedicated ring buffer for response embeddings → ClickHouse.
@@ -396,6 +465,72 @@ class ObservabilitySDK:
         Priority: ``config["cost_threshold"]`` > ``TAIL_SAMPLER_COST_THRESHOLD``
         env var > default ``0.05``.
         """
+        if config is not None and "cost_threshold" in config:
+            try:
+                return float(config["cost_threshold"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid config cost_threshold %r, using default",
+                    config["cost_threshold"],
+                )
+        env_threshold = os.environ.get("TAIL_SAMPLER_COST_THRESHOLD", "0.05")
+        try:
+            return float(env_threshold)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid TAIL_SAMPLER_COST_THRESHOLD, using default 0.05"
+            )
+            return 0.05
+
+    @staticmethod
+    def _load_aggregation_enabled(config: dict | None) -> bool:
+        """Read span aggregation enabled flag (PP09).
+
+        Priority: ``config["aggregation_enabled"]`` > ``AGENT_OBS_AGGREGATION_ENABLED``
+        env var > default ``true``.
+        """
+        if config is not None and "aggregation_enabled" in config:
+            return bool(config["aggregation_enabled"])
+        env_enabled = os.environ.get("AGENT_OBS_AGGREGATION_ENABLED", "true").strip().lower()
+        return env_enabled in ("true", "1", "yes", "on")
+
+    @staticmethod
+    def _load_aggregation_max_count(config: dict | None) -> int:
+        """Read span aggregation max count (PP09).
+
+        Priority: ``config["aggregation"]["max_count"]`` > ``AGENT_OBS_AGGREGATION_MAX_COUNT``
+        env var > default ``50``.
+        """
+        if config is not None and "aggregation" in config and "max_count" in config["aggregation"]:
+            try:
+                return int(config["aggregation"]["max_count"])
+            except (TypeError, ValueError):
+                logger.warning("Invalid aggregation max_count, using default 50")
+        env_max_count = os.environ.get("AGENT_OBS_AGGREGATION_MAX_COUNT", "50")
+        try:
+            return int(env_max_count)
+        except (TypeError, ValueError):
+            logger.warning("Invalid AGENT_OBS_AGGREGATION_MAX_COUNT, using default 50")
+            return 50
+
+    @staticmethod
+    def _load_aggregation_window(config: dict | None) -> float:
+        """Read span aggregation max window in seconds (PP09).
+
+        Priority: ``config["aggregation"]["window_seconds"]`` > ``AGENT_OBS_AGGREGATION_WINDOW_SECONDS``
+        env var > default ``1.0``.
+        """
+        if config is not None and "aggregation" in config and "window_seconds" in config["aggregation"]:
+            try:
+                return float(config["aggregation"]["window_seconds"])
+            except (TypeError, ValueError):
+                logger.warning("Invalid aggregation window_seconds, using default 1.0")
+        env_window = os.environ.get("AGENT_OBS_AGGREGATION_WINDOW_SECONDS", "1.0")
+        try:
+            return float(env_window)
+        except (TypeError, ValueError):
+            logger.warning("Invalid AGENT_OBS_AGGREGATION_WINDOW_SECONDS, using default 1.0")
+            return 1.0
         if config is not None and "cost_threshold" in config:
             try:
                 return float(config["cost_threshold"])
@@ -519,6 +654,10 @@ class ObservabilitySDK:
         Masking happens first so no plaintext PII can reach a container log or a
         backend (anti-pattern §8.3).  Enqueuing is fire-and-forget — never blocks
         the caller.  If the buffer is full, the span is dropped and counted.
+
+        PP09: if span_type is AGENT_REASONING and aggregation is enabled, route
+        through SpanAggregator. Aggregated spans are converted to Span and continue
+        normally.
         """
         await self._apply_guardrail(span)
         self._apply_rule_based_eval(span)
@@ -546,6 +685,26 @@ class ObservabilitySDK:
                     "Embedding queue full, dropping embedding for span %s",
                     span.context.span_id,
                 )
+
+        # PP09: handle span aggregation
+        if self._aggregation_enabled and self._span_aggregator is not None:
+            if span.span_type == SpanType.AGENT_REASONING:
+                # Check if this is not already an aggregated span
+                if "aggregation.children_count" not in span.attributes:
+                    # Micro-span: buffer it
+                    if self._aggregation_src_ctx is None:
+                        # First micro-span: track its context for aggregate
+                        self._aggregation_src_ctx = span.context
+                    aggregate = await self._span_aggregator.add(span)
+                    if aggregate is not None:
+                        # Buffer full: convert to aggregated span and continue
+                        span = self._aggregate_to_span(aggregate)
+                        # Reset aggregation source context after flush
+                        self._aggregation_src_ctx = None
+                # If it's already an aggregate or no aggregate produced, continue
+            elif span.span_type == SpanType.AGENT_LOOP:
+                # Root span: flush any remaining micro-spans
+                await self._flush_aggregation()
 
         try:
             self._ring_buffer.put_nowait(span)
@@ -582,6 +741,121 @@ class ObservabilitySDK:
                     span.context.span_id,
                     span.context.trace_id,
                 )
+
+    def _aggregate_to_span(self, aggregate: SpanAggregate) -> Span:
+        """Convert SpanAggregate to Span (PP09 wiring)."""
+        if self._aggregation_src_ctx is None:
+            # Fallback: use current span's context (should not happen with proper flush)
+            src_ctx = SpanContext.new(agent_id="unknown")
+        else:
+            src_ctx = self._aggregation_src_ctx
+
+        # Build new context for aggregate
+        ctx = SpanContext(
+            trace_id=src_ctx.trace_id,
+            span_id=_new_ulid(),
+            parent_span_id=aggregate.parent_span_id,
+            agent_id=src_ctx.agent_id,
+            agent_version=src_ctx.agent_version,
+            user_id=src_ctx.user_id,
+            session_id=src_ctx.session_id,
+            tool_name=src_ctx.tool_name,
+        )
+
+        # Build events with sorted timestamps and ISO format
+        events = []
+        for event_data in sorted(aggregate.events, key=lambda e: e["ts"]):
+            events.append(
+                Event(
+                    name=event_data["name"],
+                    timestamp=_to_iso8601(event_data["ts"]),
+                    attributes=dict(event_data["attrs"]),
+                )
+            )
+
+        return Span(
+            name=f"agent.reasoning:aggregated:{aggregate.children_count}",
+            span_type=SpanType.AGENT_REASONING,
+            context=ctx,
+            start_time=aggregate.events[0]["ts"] if aggregate.events else _now(),
+            end_time=_now(),
+            attributes={
+                "status": "ok",
+                "aggregation.children_count": aggregate.children_count,
+                "aggregation.bytes_saved": aggregate.bytes_saved,
+                "aggregation.source": "span_aggregator",
+            },
+            events=events,
+        )
+
+    async def _flush_aggregation(self) -> None:
+        """Flush any buffered micro-spans to aggregate (PP09)."""
+        if self._span_aggregator is None:
+            return
+        aggregate = await self._span_aggregator.flush()
+        if aggregate is not None:
+            span = self._aggregate_to_span(aggregate)
+            # Enqueue the aggregated span (same path as regular spans)
+            try:
+                self._ring_buffer.put_nowait(span)
+                self.last_spans.append(span)
+                self._accumulate_trace_aggregates(span)
+                from agent_obs.metrics import spans_total
+
+                spans_total.labels(agent_id=span.context.agent_id).inc()
+            except asyncio.QueueFull:
+                from agent_obs.metrics import dropped_spans_total
+
+                dropped_spans_total.labels(agent_id=span.context.agent_id).inc()
+                logger.warning(
+                    "Ring buffer full, dropping aggregated span %s (trace=%s)",
+                    span.context.span_id,
+                    span.context.trace_id,
+                )
+        # Reset aggregation source context
+        self._aggregation_src_ctx = None
+
+    @asynccontextmanager
+    async def reasoning(
+        self,
+        ctx: SpanContext,
+        *,
+        name: str = "reasoning",
+        attributes: dict | None = None,
+    ) -> AsyncIterator[Span]:
+        """Create a child ``agent.reasoning`` span for a reasoning step (PP09).
+
+        The span inherits ``trace_id`` from *ctx* and gets its own ``span_id``
+        with ``parent_span_id`` set to the active span.  On exit the span is
+        enqueued via the aggregator (if enabled) or directly.
+        """
+        if not self.enabled:
+            # Zero-overhead mode: yield a no-op NullSpan
+            yield NullSpan()
+            return
+
+        parent_ctx = _active_span_context.get()
+        child_ctx = SpanContext.new(
+            agent_id=ctx.agent_id,
+            agent_version=ctx.agent_version,
+            parent=parent_ctx if parent_ctx is not None else ctx,
+            user_id=ctx.user_id,
+            session_id=ctx.session_id,
+        )
+        span = Span(
+            name=f"agent.reasoning:{name}",
+            span_type=SpanType.AGENT_REASONING,
+            context=child_ctx,
+            attributes=attributes or {},
+        )
+        span.start_time = _now()
+        token = _active_span_context.set(child_ctx)
+        try:
+            yield span
+        finally:
+            span.end_time = _now()
+            _active_span_context.reset(token)
+            await self._enqueue(span)
 
     async def _apply_guardrail(self, span: Span) -> None:
         """Mask every text attribute of a span before it is exported (PC08).
@@ -1023,6 +1297,9 @@ class ObservabilitySDK:
         is exceeded the worker is cancelled and a warning is logged with the
         count of undelivered spans.
         """
+        # PP09: flush any remaining buffered micro-spans before shutdown
+        await self._flush_aggregation()
+
         self._shutdown.set()
 
         # PC24: drain the embedding worker first so pending embeddings are

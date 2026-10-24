@@ -31,6 +31,78 @@ class SpanAggregate:
             "name": f"agent.reasoning:aggregated:{self.children_count}",
         }
 
+    def to_span(self, context: SpanContext) -> Span:
+        """Convert SpanAggregate to a Span (PP09 wiring).
+        
+        Args:
+            context: SpanContext for the aggregate (trace_id, agent_id, etc.)
+        """
+        from agent_obs.observability import Span, SpanType, Event, _to_iso8601
+
+        # Build events with sorted timestamps and ISO format
+        events = []
+        for event_data in sorted(self.events, key=lambda e: e["ts"]):
+            events.append(
+                Event(
+                    name=event_data["name"],
+                    timestamp=_to_iso8601(event_data["ts"]),
+                    attributes=dict(event_data["attrs"]),
+                )
+            )
+
+        return Span(
+            name=f"agent.reasoning:aggregated:{self.children_count}",
+            span_type=SpanType.AGENT_REASONING,
+            context=context,
+            start_time=self.events[0]["ts"] if self.events else 0.0,
+            end_time=0.0,  # Will be set when span ends
+            attributes={
+                "status": "ok",
+                "aggregation.children_count": self.children_count,
+                "aggregation.bytes_saved": self.bytes_saved,
+                "aggregation.source": "span_aggregator",
+            },
+            events=events,
+        )
+
+    @classmethod
+    def from_span(cls, span: Span) -> "SpanAggregate":
+        """Convert Span back to SpanAggregate (PP09 reversibility).
+        
+        Requires span to have aggregation metadata and events representing micro-spans.
+        """
+        children_count = span.attributes.get("aggregation.children_count", 0)
+        bytes_saved = span.attributes.get("aggregation.bytes_saved", 0)
+        
+        # Convert events back to PP0 internal format {name, ts, attrs}
+        events = []
+        for event in span.events:
+            # Parse timestamp back to float (ISO -> POSIX)
+            ts = None
+            if event.timestamp:
+                from agent_obs.observability import _parse_iso8601
+                try:
+                    ts = _parse_iso8601(event.timestamp)
+                except (ValueError, AttributeError):
+                    # Fallback to current time if parsing fails
+                    ts = 0.0
+            events.append({
+                "name": event.name,
+                "ts": ts,
+                "attrs": dict(event.attributes),
+            })
+        
+        # Get parent_span_id from span context
+        parent_span_id = span.context.parent_span_id or ""
+        
+        return cls(
+            parent_span_id=parent_span_id,
+            span_type=span.span_type.value,
+            events=events,
+            children_count=children_count,
+            bytes_saved=bytes_saved,
+        )
+
 
 class SpanAggregator:
     """Accumulates micro-spans and flushes them into aggregated spans.
