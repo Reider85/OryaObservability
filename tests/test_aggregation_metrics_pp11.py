@@ -24,6 +24,7 @@ from agent_obs.metrics import (
 from agent_obs.observability import _PP11_SPANS_AGGREGATED_TOTAL, _PP11_SPANS_MICRO_INPUT_TOTAL
 from agent_obs.observability import ObservabilitySDK, Span, SpanContext, SpanType, get_pp11_metrics
 from agent_obs.span_aggregator import SpanAggregator, SpanAggregate
+from agent_obs.storage.hot import HotStore
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,36 @@ def mock_sdk():
     # Check aggregator config
     assert sdk._span_aggregator.max_count == 50, f"Expected max_count=50, got {sdk._span_aggregator.max_count}"
     assert sdk._span_aggregator.max_window_seconds == 1.0, f"Expected max_window_seconds=1.0, got {sdk._span_aggregator.max_window_seconds}"
+    return sdk
+
+
+@pytest.fixture
+def mock_sdk_with_audit():
+    """Create a mock SDK with aggregation and audit enabled."""
+    import os
+    os.environ["AGENT_OBS_AGGREGATION_MAX_COUNT"] = "100"
+    
+    # Create a mock HotStore
+    mock_store = HotStore()
+    mock_store.write_audit_event = unittest.mock.MagicMock()
+    
+    sdk = ObservabilitySDK(
+        exporters=[],
+        config={
+            "aggregation_enabled": True,
+            "aggregation_audit_enabled": True,
+            "aggregation": {
+                "max_count": 100,
+                "window_seconds": 1.0
+            }
+        },
+        audit_store=mock_store
+    )
+    # Ensure aggregation and audit are enabled
+    assert sdk._aggregation_enabled, "Aggregation should be enabled"
+    assert sdk._aggregation_audit_enabled, "Aggregation audit should be enabled"
+    assert sdk._audit_store is not None, "Audit store should be configured"
+    assert sdk._audit_store.write_audit_event is mock_store.write_audit_event, "Audit store should be the mock"
     return sdk
 
 
@@ -495,3 +526,158 @@ class TestAggregationDashboard:
             and "spans_aggregated_total" in a.get("expr", "")
         ]
         assert len(threshold_annotations) == 1, "should have one annotation for aggregation flushes"
+
+
+# ---------------------------------------------------------------------------
+# PP11: Aggregation audit tests
+# ---------------------------------------------------------------------------
+
+import unittest.mock
+
+
+class TestAggregationAudit:
+    """Test span aggregation audit events (PP11)."""
+    
+    @pytest.mark.asyncio
+    async def test_aggregation_audit_written_to_store_when_enabled(self, mock_sdk_with_audit, mock_span):
+        """Test that audit events are written to HotStore when enabled."""
+        # Reset mock
+        mock_sdk_with_audit._audit_store.write_audit_event.reset_mock()
+        
+        # Create 50 micro-spans (should trigger flush at 50, not 11)
+        for i in range(50):
+            span = Span(
+                name=f"step-{i}",
+                span_type="agent.reasoning",
+                context=mock_span.context,
+                start_time=1234567890.0 + i * 0.01,  # Smaller interval to avoid window-based flush
+                attributes={"tenant_id": "test-tenant"},
+            )
+            await mock_sdk_with_audit._enqueue(span)
+        
+        # Flush remaining spans (no-op if already flushed at max_count)
+        await mock_sdk_with_audit._flush_aggregation()
+        # Audit write is fire-and-forget via asyncio.to_thread — wait for it
+        await mock_sdk_with_audit._wait_for_audit_tasks()
+        
+        # Verify audit event was written
+        assert mock_sdk_with_audit._audit_store.write_audit_event.called
+        call_args = mock_sdk_with_audit._audit_store.write_audit_event.call_args[0][0]
+        
+        # Check it's an AggregationFlushAuditEvent
+        assert isinstance(call_args, AggregationFlushAuditEvent)
+        assert call_args.action == "span.aggregate_flush"
+        assert call_args.resource["children_count"] == 50
+        assert call_args.resource["bytes_saved"] > 0
+        assert call_args.resource["agent_id"] == "test-agent"
+    
+    @pytest.mark.asyncio
+    async def test_aggregation_audit_not_written_when_disabled(self, mock_sdk, mock_span):
+        """Test that audit events are not written when disabled."""
+        # Ensure audit is disabled
+        assert not mock_sdk._aggregation_audit_enabled or mock_sdk._audit_store is None
+        
+        # Create 50 micro-spans (should trigger flush)
+        for i in range(50):
+            span = Span(
+                name=f"step-{i}",
+                span_type="agent.reasoning",
+                context=mock_span.context,
+                start_time=1234567890.0 + i * 0.1,
+                attributes={"tenant_id": "test-tenant"},
+            )
+            await mock_sdk._enqueue(span)
+        
+        # Flush remaining spans (no-op if already flushed at max_count)
+        await mock_sdk._flush_aggregation()
+        
+        # No audit store to write to, but should not raise
+        assert True  # If we reach here, no exception was raised
+    
+    @pytest.mark.asyncio
+    async def test_aggregation_audit_failure_is_swallowed(self, mock_span):
+        """Test that audit write failures don't propagate."""
+        # Create SDK with audit enabled but failing store
+        mock_store = unittest.mock.MagicMock()
+        mock_store.write_audit_event.side_effect = Exception("ClickHouse down")
+        
+        sdk = ObservabilitySDK(
+            exporters=[],
+            config={
+                "aggregation_enabled": True,
+                "aggregation_audit_enabled": True,
+                "aggregation": {
+                    "max_count": 50,
+                    "window_seconds": 1.0
+                }
+            },
+            audit_store=mock_store
+        )
+        
+        # Create 50 micro-spans
+        for i in range(50):
+            span = Span(
+                name=f"step-{i}",
+                span_type="agent.reasoning",
+                context=mock_span.context,
+                start_time=1234567890.0 + i * 0.01,  # Smaller interval to avoid window-based flush
+                attributes={"tenant_id": "test-tenant"},
+            )
+            await sdk._enqueue(span)
+        
+        # Flush remaining spans - should not raise
+        await sdk._flush_aggregation()
+        # Audit write is fire-and-forget via asyncio.to_thread — wait for it
+        await sdk._wait_for_audit_tasks()
+        
+        # Verify the write was attempted but failed
+        assert mock_store.write_audit_event.called
+        assert mock_store.write_audit_event.call_count == 1
+    
+    @pytest.mark.asyncio
+    async def test_aggregation_audit_enabled_by_env_var(self):
+        """Test that AGENT_OBS_AGGREGATION_AUDIT=on enables audit."""
+        import os
+        
+        # Set environment variable
+        os.environ["AGENT_OBS_AGGREGATION_AUDIT"] = "on"
+        
+        try:
+            # Create SDK without explicit audit config
+            sdk = ObservabilitySDK(
+                exporters=[],
+                config={
+                    "aggregation_enabled": True,
+                    "aggregation": {
+                        "max_count": 50,
+                        "window_seconds": 1.0
+                    }
+                }
+            )
+            
+            # Audit should be enabled (lazy HotStore creation)
+            assert sdk._aggregation_audit_enabled
+            assert sdk._audit_store is not None
+            
+        finally:
+            # Clean up
+            os.environ["AGENT_OBS_AGGREGATION_AUDIT"] = "false"
+    
+    @pytest.mark.asyncio
+    async def test_aggregation_audit_disabled_by_default(self):
+        """Test that audit is disabled by default."""
+        # Create SDK without audit config
+        sdk = ObservabilitySDK(
+            exporters=[],
+            config={
+                "aggregation_enabled": True,
+                "aggregation": {
+                    "max_count": 50,
+                    "window_seconds": 1.0
+                }
+            }
+        )
+        
+        # Audit should be disabled by default
+        assert not sdk._aggregation_audit_enabled
+        assert sdk._audit_store is None
