@@ -350,3 +350,12 @@ aggregation_ratio = Gauge(
     "Ratio of aggregated spans to micro-spans input (expected 0.02–0.05)",
     ["agent_id"],
 )
+
+# --- PP12 Adaptive eval sampler metrics ---
+
+# Current adaptive eval sampler mode (day=1, night=1, incident=1, others=0)
+eval_sampler_mode = Gauge(
+    "eval_sampler_mode",
+    "Current adaptive eval sampler mode (day=1, night=1, incident=1, others=0)",
+    ["mode"],
+)

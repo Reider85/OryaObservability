@@ -72,6 +72,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `TAIL_SAMPLER_NORMAL_RATE` | `10` | Percent of normal traces kept by tail sampler. |
 | `AGENT_OBS_COMPLIANCE_PG` | `auto` | Compliance catalog Postgres writer: `on`/`off`/`auto`. `auto` = Postgres only if asyncpg importable **and** `COMPLIANCE_PG_DSN` set, else in-memory no-op. |
 | `COMPLIANCE_PG_DSN` | — | DSN for compliance catalog Postgres writes. Default when `AGENT_OBS_COMPLIANCE_PG=on`: warm-tier DSN (`postgresql://warm:warm@localhost:5433/warm_store`). |
+| `AGENT_OBS_AGGREGATION_AUDIT` | `false` | Enable writing span aggregation flush audit events to ClickHouse audit_events_hot table (PP11). Best-effort: never blocks business logic. |
 
 ## Code style
 

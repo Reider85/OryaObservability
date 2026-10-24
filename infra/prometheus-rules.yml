@@ -215,7 +215,7 @@ groups:
             impact throughput. Check policy engine complexity and optimize if needed.
             Current p99: {{ $value }} seconds.
 
-  # PC35 (T3.2.4): span aggregation must not flush too frequently, which wastes
+  # PP11 (T3.2.4): span aggregation must not flush too frequently, which wastes
   # CPU and reduces the compression ratio. >0.2 means 1 aggregate per 5 spans
   # or less, indicating the buffer is too small or the agent is producing
   # micro-spans faster than expected.

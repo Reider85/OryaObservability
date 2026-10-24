@@ -665,10 +665,10 @@ DoD
 5. Тесты: после 100 микро-spans → spans_aggregated_total ≥ 2; bytes_saved > 0.
 
 DoD
-- [ ] Метрики spans_aggregated_total и bytes_saved_total экспортируются
-- [ ] Grafana-график aggregation_ratio добавлен
-- [ ] Alert AggregationRatioTooLow работает
-- [ ] pytest + интеграционный тест зелёный
+- [x] Метрики spans_aggregated_total и bytes_saved_total экспортируются
+- [x] Grafana-график aggregation_ratio добавлен
+- [x] Alert AggregationRatioTooLow работает
+- [x] pytest + интеграционный тест зелёный
 
 Коммит: feat(metrics): add spans_aggregated_total and bytes_saved_total counters
 ```

@@ -446,7 +446,103 @@ class SamplerRateChangeAuditEvent:
             json.dumps(self.actor),
             self.action,
             self.decision,
-            json.dumps(resource),
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
+class EvalSamplerModeChangeAuditEvent:
+    """Audit event for eval sampler mode change (PP12).
+
+    Records when the adaptive eval sampler changes between day/night/incident
+    modes, allowing SRE to correlate eval frequency changes with time/incidents.
+    Maps to the same ``audit_events_hot`` DDL columns as other audit events.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    trace_id: str     # always "" — a mode change is not trace-scoped
+    actor: dict[str, str]
+    action: str
+    resource: dict[str, str]
+    reason: str
+    ip_address: str
+    user_agent: str
+    decision: str = "changed"  # "changed" or "no_change" (if mode didn't actually change)
+
+    @property
+    def reason_category(self) -> str:
+        """Reason category for Prometheus metrics."""
+        return classify_reason_category(self.reason)
+
+    @classmethod
+    def for_mode_change(
+        cls,
+        old_mode: str,
+        new_mode: str,
+        actor_id: str = "adaptive-eval-sampler",
+    ) -> "EvalSamplerModeChangeAuditEvent":
+        """Create audit event for eval sampler mode change.
+
+        Parameters
+        ----------
+        old_mode:
+            Previous mode ("day" | "night" | "incident")
+        new_mode:
+            New mode ("day" | "night" | "incident")
+        actor_id:
+            System component that detected the mode change
+        """
+        return cls(
+            audit_id=f"esm-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            trace_id="",
+            actor={"type": "system", "id": actor_id},
+            action="eval_sampler.mode_change",
+            resource={
+                "type": "eval_sampler_mode",
+                "old_mode": old_mode,
+                "new_mode": new_mode,
+            },
+            reason=f"sampler mode changed from {old_mode} to {new_mode}",
+            ip_address="unknown",
+            user_agent="adaptive-eval-sampler",
+            decision="changed",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "reason_category": self.reason_category,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row tuple (positional parameters).
+
+        Matches audit_events_hot DDL columns:
+        (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+        """
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
             self.reason,
             self.ip_address,
             self.user_agent,

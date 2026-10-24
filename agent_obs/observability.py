@@ -386,7 +386,7 @@ class ObservabilitySDK:
     ``config["guardrail_enabled"] = False``.
     """
 
-    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None, guardrail: "GuardrailEngine | None" = None, rule_based_evaluator: Any | None = None, llm_judge: Any | None = None):
+    def __init__(self, exporters: list, enabled: bool = None, config: dict | None = None, ring_buffer_maxsize: int = 100_000, metrics_port: int | None = None, guardrail: "GuardrailEngine | None" = None, rule_based_evaluator: Any | None = None, llm_judge: Any | None = None, audit_store: "HotStore | None" = None):
         self._exporters = exporters
 
         # Priority: explicit enabled parameter > config > environment variable
@@ -424,6 +424,28 @@ class ObservabilitySDK:
             logger.info("Span aggregation enabled (PP09)")
         self._aggregation_src_ctx: Optional[SpanContext] = None
         self._aggregation_src_tenant_id: Optional[str] = None
+        
+        # PP11: span aggregation audit configuration
+        self._aggregation_audit_enabled = self._load_aggregation_audit_enabled(config)
+        self._audit_store: "HotStore | None" = audit_store
+        if self._aggregation_audit_enabled:
+            # Lazily initialize audit store on first write if not provided
+            if self._audit_store is None:
+                try:
+                    from agent_obs.storage.hot import HotStore
+                    self._audit_store = HotStore()
+                    logger.info("Span aggregation audit enabled (PP11), HotStore will be initialized on first write")
+                except ImportError:
+                    logger.warning("ClickHouse driver not available, span aggregation audit disabled")
+                    self._aggregation_audit_enabled = False
+                except Exception as e:
+                    logger.warning("Failed to initialize HotStore for span aggregation audit: %s", str(e))
+                    self._aggregation_audit_enabled = False
+        if self._aggregation_audit_enabled:
+            logger.info("Span aggregation audit enabled (PP11)")
+        
+        # Track pending audit tasks for graceful shutdown
+        self._audit_tasks: set[asyncio.Task] = set()
         self.cost_threshold = self._load_cost_threshold(config)
         self._guardrail: "GuardrailEngine | None" = None
         # PC24: dedicated ring buffer for response embeddings → ClickHouse.
@@ -519,6 +541,17 @@ class ObservabilitySDK:
         if config is not None and "aggregation_enabled" in config:
             return bool(config["aggregation_enabled"])
         env_enabled = os.environ.get("AGENT_OBS_AGGREGATION_ENABLED", "true").strip().lower()
+        return env_enabled in ("true", "1", "yes", "on")
+
+    def _load_aggregation_audit_enabled(self, config: dict | None) -> bool:
+        """Read span aggregation audit enabled flag (PP11).
+
+        Priority: ``config["aggregation_audit_enabled"]`` > ``AGENT_OBS_AGGREGATION_AUDIT``
+        env var > default ``false``.
+        """
+        if config is not None and "aggregation_audit_enabled" in config:
+            return bool(config["aggregation_audit_enabled"])
+        env_enabled = os.environ.get("AGENT_OBS_AGGREGATION_AUDIT", "false").strip().lower()
         return env_enabled in ("true", "1", "yes", "on")
 
     @staticmethod
@@ -912,11 +945,44 @@ class ObservabilitySDK:
                 span.context.trace_id,
             )
             
-            # TODO: Optional HotStore write when audit_store configured (PP11 audit sink extension)
+            # Write audit event to HotStore if enabled (PP11)
+            if self._aggregation_audit_enabled and self._audit_store is not None:
+                try:
+                    # Schedule audit write in background thread (never blocks)
+                    task = asyncio.create_task(
+                        asyncio.to_thread(self._write_aggregation_audit, event)
+                    )
+                    self._audit_tasks.add(task)
+                    task.add_done_callback(self._audit_tasks.discard)
+                except Exception as e:
+                    logger.error("Failed to schedule aggregation audit write: %s", str(e))
             
         except Exception as e:
             logger.error("Failed to create aggregation audit event: %s", str(e))
             # Never raises - continue with metrics
+
+    def _write_aggregation_audit(self, event: "AggregationFlushAuditEvent") -> None:
+        """Write aggregation audit event to ClickHouse (PP11).
+        
+        Runs in a background thread to never block the async loop.
+        """
+        try:
+            self._audit_store.write_audit_event(event)
+            logger.debug(
+                "Aggregation audit written: audit_id=%s action=%s children_count=%d",
+                event.audit_id,
+                event.action,
+                event.resource.get("children_count", 0),
+            )
+        except Exception as e:
+            logger.error("Failed to write aggregation audit event: %s", str(e))
+            # Never raises - audit is best-effort
+
+    async def _wait_for_audit_tasks(self, timeout: float = 5.0) -> None:
+        """Wait for pending audit tasks to complete during shutdown."""
+        if self._audit_tasks:
+            logger.info("Waiting for %d pending audit tasks to complete...", len(self._audit_tasks))
+            await asyncio.wait(self._audit_tasks, timeout=timeout)
 
     @asynccontextmanager
     async def reasoning(
@@ -1441,6 +1507,9 @@ class ObservabilitySDK:
             except asyncio.CancelledError:
                 pass
             self._cpu_monitor_task = None
+
+        # PP11: wait for pending audit tasks to complete
+        await self._wait_for_audit_tasks(timeout=5.0)
 
         if self._worker_task is None:
             return
