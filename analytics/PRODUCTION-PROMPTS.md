@@ -633,11 +633,15 @@ DoD
 7. Тесты (e2e): открыть trace с агрегатом → expand events → найти event по имени.
 
 DoD
-- [ ] Expandable events в trace-viewer работают
-- [ ] Поиск по events фильтрует корректно
-- [ ] Error-events выделены красным
-- [ ] Lazy render предотвращает тормоза на больших трейсах
-- [ ] e2e-тесты зелёные
+- [x] Expandable events в trace-viewer работают
+- [x] Поиск по events фильтрует корректно
+- [x] Error-events выделены красным
+- [x] Lazy render предотвращает тормоза на больших трейсах
+- [x] e2e-тесты зелёные
+- [x] Langfuse event mapping implemented with child spans
+- [x] Custom trace viewer with vanilla JS AggregatedSpanView
+- [x] All unit tests passing (Langfuse mapping)
+- [x] Integration tests passing (trace viewer core functionality)
 
 Коммит: feat(ui): add expandable events view for aggregated spans in trace-viewer
 ```

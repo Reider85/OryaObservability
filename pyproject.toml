@@ -38,6 +38,8 @@ dev = [
     "openpyxl>=3.1",
     # tests/test_mtls.py mints an in-process PKI (PP02)
     "cryptography>=42",
+    # PP10: e2e browser tests
+    "playwright>=1.44",
 ]
 api = [
     "fastapi>=0.111",

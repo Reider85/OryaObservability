@@ -44,6 +44,12 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - Tests patching names that `scripts/cron/scheduler.py` binds via `from ... import ...` must patch `scripts.cron.scheduler.<name>`, not the source module.
 - `tests/fixtures/ca.pem` is a self-signed CA for TLS tests.
 
+## New test suites
+
+- `tests/test_langfuse_event_mapping.py`: Unit tests for PP10 Langfuse event mapping functionality
+- `tests/test_trace_viewer.py`: TestClient tests for trace viewer UI (requires ClickHouse mocking for full functionality)
+- `tests/e2e/test_trace_viewer_e2e.py`: Playwright e2e tests for trace viewer (requires `playwright install chromium` once)
+
 ## Lint / typecheck
 
 ```bash
@@ -128,3 +134,5 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 - The injection classifier loads the HuggingFace model lazily on first `classify()` call. First call is slow (cold-start). In tests, always mock `InjectionClassifier` — never let it download real weights.
 - ML PII detection (when `AGENT_OBS_PII_ML_ENABLED=true`) currently uses MockAnalyzer (keyword stub) with hardcoded ФИО/addresses/medical conditions. Real Presidio integration requires `presidio-analyzer` and `spacy` dependencies (currently declared but unused).
 - **PC24: Embedding storage sidecar.** Embeddings are stored in `span_embeddings` table, not `spans_hot.response_embedding`. The queue tuple is 5 elements: `(trace_id, span_id, agent_id, tenant_id, embedding)`. `embeddings_stored_total` increments only on successful ClickHouse writes; `embeddings_storage_failed_total` increments on queue-full or CH failure; `embeddings_redis_fallback_total` increments on Redis fallback. HotStore `get_spans()` returns `response_embedding` from spans_hot for compatibility, but drift/Phoenix query `span_embeddings` directly.
+
+- **PP10: Trace viewer e2e tests.** Run with `python -m pytest tests/e2e/ -q 2>&1`. Requires `playwright install chromium` once. Tests automatically skip if Playwright unavailable.

@@ -427,7 +427,7 @@
 |---|---|---|---|
 | T3.2.1 | SpanAggregator в SDK: собирает микроспаны до 50 штук или до 1 секунды, сливает в один | **PLANNED** | — |
 | T3.2.2 | Embedded events как массив events: [{name, ts, attrs}, ...] в агрегированном span'е | **PLANNED** | — |
-| T3.2.3 | UI: поддержка expandable events в trace-viewer | **PLANNED** | — |
+| T3.2.3 | UI: поддержка expandable events в trace-viewer | **DONE** | PP10 |
 | T3.2.4 | Метрика spans_aggregated_total и bytes_saved_total | **DONE** | PP11 |
 #### E3.3 — Adaptive eval-sampling (день/ночь/инцидент)
 

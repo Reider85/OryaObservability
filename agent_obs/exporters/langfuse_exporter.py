@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import hashlib
 import httpx
 
 from agent_obs.exporters.base import BaseExporter
@@ -51,6 +52,9 @@ _STATUS_CODE_MAP = {
     "unset": 0,    # STATUS_CODE_UNSET
 }
 
+# PP10: Cap on event child spans per span to avoid cardinality explosion
+MAX_EVENT_SPANS_PER_SPAN = 200
+
 
 class ConfigError(Exception):
     """Raised when the exporter's runtime configuration is invalid."""
@@ -70,6 +74,23 @@ def _timestamp_to_nanos(ts: float | None) -> str:
     if ts is None:
         return "0"
     return str(int(ts * 1_000_000_000))
+
+
+def _iso_to_epoch(iso_ts: str | None) -> float:
+    """Convert ISO 8601 timestamp to POSIX epoch (seconds)."""
+    if iso_ts is None:
+        return 0.0
+    from datetime import datetime
+    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    return dt.timestamp()
+
+
+def _generate_event_span_id(parent_span_id: str, event_name: str, event_ts: str) -> str:
+    """Generate a deterministic span ID for an event child span."""
+    # PP09 dedup key: (span_id, event_name, event_ts)
+    key = f"{parent_span_id}:{event_name}:{event_ts}"
+    sha = hashlib.sha256(key.encode()).hexdigest()
+    return sha[:16]  # 16 hex chars = 64 bits, matches OTLP span ID length
 
 
 def _attr_to_otlp_value(value: Any) -> dict[str, Any]:
@@ -111,8 +132,10 @@ def _span_to_otlp(span: Span) -> dict[str, Any]:
             {"key": k, "value": _attr_to_otlp_value(v)}
             for k, v in evt.attributes.items()
         ]
+        # PP10: Use event's own timestamp instead of current time
+        event_ts_epoch = _iso_to_epoch(evt.timestamp)
         events.append({
-            "timeUnixNano": _timestamp_to_nanos(time.time()),
+            "timeUnixNano": _timestamp_to_nanos(event_ts_epoch),
             "name": evt.name,
             "attributes": evt_attributes,
         })
@@ -152,13 +175,78 @@ def _span_to_otlp(span: Span) -> dict[str, Any]:
     }
 
 
+def _event_to_child_span(parent_span: Span, evt, index: int) -> dict[str, Any]:
+    """Convert an event to a child OTLP span with langfuse.observation.type=event.
+
+    PP10: Each event of a span becomes a child EVENT observation in Langfuse,
+    enabling expandable events in the trace viewer.
+    """
+    # Generate deterministic span ID for idempotency across retries
+    span_id = _generate_event_span_id(
+        parent_span.context.span_id, evt.name, evt.timestamp
+    )
+    
+    # Build attributes: langfuse.observation.type and event metadata
+    attributes = []
+    attributes.append({
+        "key": "langfuse.observation.type",
+        "value": {"stringValue": "event"},
+    })
+    
+    # Add event attributes as langfuse.observation.metadata.*
+    for key, value in evt.attributes.items():
+        attributes.append({
+            "key": f"langfuse.observation.metadata.{key}",
+            "value": _attr_to_otlp_value(value),
+        })
+    
+    # Check for error status
+    error_status = evt.attributes.get("status") == "error"
+    if error_status:
+        attributes.append({
+            "key": "langfuse.observation.level",
+            "value": {"stringValue": "ERROR"},
+        })
+    
+    # Convert ISO timestamp to nanoseconds
+    event_ts_epoch = _iso_to_epoch(evt.timestamp)
+    start_end_nanos = _timestamp_to_nanos(event_ts_epoch)
+    
+    return {
+        "traceId": _to_hex(parent_span.context.trace_id).zfill(32),
+        "spanId": span_id,
+        "parentSpanId": _to_hex(parent_span.context.span_id).zfill(16)[-16:],
+        "name": evt.name,
+        "kind": 1,  # INTERNAL
+        "startTimeUnixNano": start_end_nanos,
+        "endTimeUnixNano": start_end_nanos,
+        "attributes": attributes,
+        "status": {
+            "code": 2 if error_status else 0,  # ERROR or OK
+        },
+    }
+
+
 def _batch_to_otlp(spans: list[Span]) -> dict[str, Any]:
     """Convert a batch of spans into the OTLP ResourceSpans payload.
 
     Groups spans by trace_id into separate Span entries under a single
     ScopeSpans.  Resource attributes carry agent metadata.
+    PP10: Adds child EVENT spans for each event in the original spans.
     """
-    otlp_spans = [_span_to_otlp(s) for s in spans]
+    otlp_spans = []
+    child_event_spans = []
+    
+    for span in spans:
+        # Add the original span
+        otlp_spans.append(_span_to_otlp(span))
+        
+        # Add child event spans for each event (PP10)
+        if span.events:
+            for i, evt in enumerate(span.events[:MAX_EVENT_SPANS_PER_SPAN]):
+                child_event_spans.append(
+                    _event_to_child_span(span, evt, i)
+                )
 
     resource_attributes = []
     if spans:
@@ -186,7 +274,7 @@ def _batch_to_otlp(spans: list[Span]) -> dict[str, Any]:
                             "name": "agent_obs",
                             "version": "0.1.0",
                         },
-                        "spans": otlp_spans,
+                        "spans": otlp_spans + child_event_spans,
                     }
                 ],
             }
