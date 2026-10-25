@@ -215,7 +215,7 @@ class TestAdaptiveEvalSampler:
         
         should_eval, reason = await sampler.should_eval(trace_security)
         assert should_eval is True
-        assert reason == "incident_full"
+        assert reason == "incident_security"
     
     @pytest.mark.asyncio
     async def test_should_eval_incident_normal_trace(self, sampler, trace_normal):

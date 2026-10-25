@@ -104,6 +104,8 @@ class LLMJudgeEvaluator(BaseEvaluator):
         redis_url: str = "redis://localhost:6379/1",
         queue_name: str = "eval-queue",
         sample_rate: float = 0.1,
+        sampler: "AdaptiveEvalSampler | None" = None,
+        incident_queue_name: str = "eval-queue-incident",
     ) -> None:
         super().__init__(version="1.0.0")
         self.client = client
@@ -112,6 +114,8 @@ class LLMJudgeEvaluator(BaseEvaluator):
         self.redis_url = redis_url
         self.queue_name = queue_name
         self.sample_rate = sample_rate
+        self.sampler = sampler
+        self.incident_queue_name = incident_queue_name
         
         # Lazy initialization of Redis connection
         self._redis: Redis | None = None
@@ -169,6 +173,33 @@ class LLMJudgeEvaluator(BaseEvaluator):
         sample_rate = float(os.environ.get("AGENT_OBS_LLM_JUDGE_RATE", self.sample_rate))
         return random.random() > sample_rate
     
+    def _run_sync(self, coro):
+        """Run async coroutine in sync context.
+        
+        Uses asyncio.run() if no loop is running, otherwise spawns a new thread.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop - safe to use asyncio.run
+            return asyncio.run(coro)
+        
+        # Loop is running - spawn new thread
+        import concurrent.futures
+        import threading
+        
+        def run_in_thread():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(run_in_thread)
+            return future.result()
+    
     def _create_job(
         self, 
         span: Span, 
@@ -212,7 +243,12 @@ class LLMJudgeEvaluator(BaseEvaluator):
             flags=["pending"]
         )
     
-    def _create_skipped_result(self, span: Span, eval_id: str) -> EvalResult:
+    def _create_skipped_result(
+        self, 
+        span: Span, 
+        eval_id: str, 
+        reason: str = "sampling_skipped"
+    ) -> EvalResult:
         """Create skipped evaluation result due to sampling."""
         return EvalResult(
             trace_id=span.context.trace_id if span else "unknown",
@@ -222,7 +258,7 @@ class LLMJudgeEvaluator(BaseEvaluator):
             eval_timestamp=time.time(),
             eval_latency_seconds=0.0,
             scores={},
-            flags=["sampling_skipped"]
+            flags=[reason]
         )
     
     def evaluate(self, span: Span, full_trace: list[Span]) -> EvalResult:
@@ -241,12 +277,27 @@ class LLMJudgeEvaluator(BaseEvaluator):
         if not span or not full_trace:
             return self._create_skipped_result(span, f"skip_{int(time.time() * 1000)}")
         
-        # Override sample rate from environment if set
-        sample_rate = float(os.environ.get("AGENT_OBS_LLM_JUDGE_RATE", self.sample_rate))
-        
-        # Check if we should skip this evaluation
-        if self._should_skip():
-            return self._create_skipped_result(span, f"skip_{int(time.time() * 1000)}")
+        # Use adaptive sampler if provided
+        if self.sampler is not None:
+            from agent_obs.eval.adaptive_sampler import Trace
+            
+            trace = Trace.from_spans(full_trace)
+            should_eval, reason = self._run_sync(self.sampler.should_eval(trace))
+            
+            if not should_eval:
+                return self._create_skipped_result(span, f"skip_{int(time.time() * 1000)}", reason)
+            
+            # Determine priority: incident reasons get priority 10, others 1
+            priority = 10 if reason.startswith("incident_") else 1
+            queue_name = self.incident_queue_name if priority >= 10 else self.queue_name
+        else:
+            # Legacy random sampling
+            sample_rate = float(os.environ.get("AGENT_OBS_LLM_JUDGE_RATE", self.sample_rate))
+            if self._should_skip():
+                return self._create_skipped_result(span, f"skip_{int(time.time() * 1000)}")
+            
+            priority = 1
+            queue_name = self.queue_name
         
         # Create evaluation ID
         eval_id = f"llm_judge_{int(time.time() * 1000)}"
@@ -254,7 +305,12 @@ class LLMJudgeEvaluator(BaseEvaluator):
         # Create and enqueue job
         try:
             job = self._create_job(span, full_trace, eval_id)
-            self.queue.enqueue(
+            
+            # Get queue for priority
+            queue = rq.Queue(name=queue_name, connection=self.redis)
+            
+            # Enqueue with priority metadata
+            queue.enqueue(
                 "llm_judge_worker",
                 kwargs={
                     "trace_id": job.trace_id,
@@ -263,7 +319,8 @@ class LLMJudgeEvaluator(BaseEvaluator):
                     "model": job.model,
                     "eval_id": job.eval_id,
                     "judge_prompt_sha256": job.judge_prompt_sha256,
-                }
+                },
+                meta={"priority": priority}
             )
         except Exception as e:
             # If Redis is unavailable, return pending result anyway

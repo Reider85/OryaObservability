@@ -359,3 +359,10 @@ eval_sampler_mode = Gauge(
     "Current adaptive eval sampler mode (day=1, night=1, incident=1, others=0)",
     ["mode"],
 )
+
+# Incident evals granted by the adaptive eval sampler (PP14)
+eval_sampler_incident_evals_total = Counter(
+    "eval_sampler_incident_evals_total",
+    "Incident evals granted by the adaptive eval sampler, by reason (security|injection|cost|other)",
+    ["reason"],
+)

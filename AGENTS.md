@@ -100,6 +100,8 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_LOG_LEVEL` | `INFO` | Root logging level for SDK and cron scheduler. |
 | `AGENT_OBS_USER_HASH_SALT` | `""` | Salt for user hashing (empty = no salt). |
 | `AGENT_OBS_TLS_CA` / `_CERT` / `_KEY` | — | mTLS material for exporters (PP02). |
+| `AGENT_OBS_EVAL_ADAPTIVE_SAMPLER` | `false` | Enable adaptive eval sampler in LLM judge when a judge is supplied. PP14. |
+| `AGENT_OBS_EVAL_INCIDENT_RATE_LIMIT` | `100` | Max incident eval jobs per minute (Redis-based rate limiter). PP14. |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
 `AGENT_OBS_CRON_*` family (~30 vars: retention days, specs, batch sizes,

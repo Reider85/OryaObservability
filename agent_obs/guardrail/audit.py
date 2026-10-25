@@ -550,9 +550,116 @@ class EvalSamplerModeChangeAuditEvent:
 
 
 @dataclass
+class EvalIncidentEvalAuditEvent:
+    """Audit event for incident eval decision (PP14).
+    
+    Records when the adaptive eval sampler grants an eval job for a security
+    or prompt injection trace, allowing SRE to correlate incident evals
+    with security alerts.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    trace_id: str     # The trace being evaluated
+    actor: dict[str, str]
+    action: str
+    resource: dict[str, str]
+    reason: str
+    ip_address: str
+    user_agent: str
+    decision: str = "evaluated"  # evaluated or rate_limited
+
+    @property
+    def reason_category(self) -> str:
+        """Reason category for Prometheus metrics."""
+        return classify_reason_category(self.reason)
+
+    @classmethod
+    def for_incident_eval(
+        cls,
+        trace_id: str,
+        reason: str,
+        reason_label: str,
+        mode: str,
+        trigger: str,
+        actor_id: str = "adaptive-eval-sampler",
+    ) -> "EvalIncidentEvalAuditEvent":
+        """Create audit event for incident eval decision.
+
+        Parameters
+        ----------
+        trace_id:
+            The trace identifier being evaluated
+        reason:
+            Original reason from sampler (incident_security, incident_injection, etc.)
+        reason_label:
+            Metric label version (security, injection, cost, other)
+        mode:
+            Current eval sampler mode (day/night/incident)
+        trigger:
+            Which predicate triggered the decision (security.incident or error.type=prompt_injection)
+        actor_id:
+            System component that made the decision
+        """
+        return cls(
+            audit_id=f"eie-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            trace_id=trace_id,
+            actor={"type": "system", "id": actor_id},
+            action="eval_sampler.incident_eval",
+            resource={
+                "type": "incident_eval",
+                "reason": reason,
+                "reason_label": reason_label,
+                "mode": mode,
+                "trigger": trigger,
+            },
+            reason=f"incident eval granted: {reason} in {mode} mode",
+            ip_address="unknown",
+            user_agent="adaptive-eval-sampler",
+            decision="evaluated",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+            "reason_category": self.reason_category,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row tuple (positional parameters).
+
+        Matches audit_events_hot DDL columns:
+        (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+        """
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
 class AggregationFlushAuditEvent:
     """Audit event for span aggregation flush (PP11).
-
+    
     Records when the SDK aggregates micro-spans into one span with events,
     tracking the efficiency of the aggregation process.
     """

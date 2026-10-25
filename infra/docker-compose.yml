@@ -438,7 +438,7 @@ services:
       - ../:/app:ro
     command: >
       sh -c "python -m http.server 8777 --bind 0.0.0.0 & 
-             python -m rq worker eval-queue \
+             python -m rq worker eval-queue-incident eval-queue \
              --url redis://eval-redis:6379/1 \
              --worker-class 'rq.worker.SimpleWorker' \
              --name eval-worker-1"

@@ -18,15 +18,65 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, time as dt_time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import redis
 from prometheus_client import REGISTRY
 
 from agent_obs.guardrail.audit import AuditWriteError
-from agent_obs.metrics import eval_sampler_mode
+from agent_obs.metrics import eval_sampler_mode, eval_sampler_incident_evals_total
 
 if TYPE_CHECKING:
     from agent_obs.observability import Span
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class IncidentRateLimiter:
+    """Rate limiter for incident eval jobs.
+    
+    PP14: Limits incident evals to 100 per minute using Redis.
+    """
+    redis_url: str = "redis://localhost:6379/1"
+    limit: int = 100
+    window_seconds: int = 60
+    
+    def __init__(self, redis_url: str | None = None, limit: int | None = None):
+        self.redis_url = redis_url or self.redis_url
+        self.limit = limit or self.limit
+        self._client: redis.Redis | None = None
+    
+    @property
+    def client(self) -> redis.Redis:
+        """Lazy Redis client."""
+        if self._client is None:
+            self._client = redis.from_url(self.redis_url)
+        return self._client
+    
+    async def acquire(self) -> bool:
+        """Try to acquire an incident eval slot.
+        
+        Returns True if allowed, False if rate limited.
+        Fail-open: on Redis error, return True (allow eval).
+        """
+        try:
+            current_minute = int(time.time() // self.window_seconds)
+            key = f"agent_obs:eval:incident_rate:{current_minute}"
+            
+            # Increment in executor thread to avoid blocking
+            result = await asyncio.to_thread(
+                self.client.incr, key
+            )
+            
+            if result == 1:
+                # Set expiration on first increment
+                await asyncio.to_thread(
+                    self.client.expire, key, self.window_seconds * 2
+                )
+            
+            return result <= self.limit
+        except Exception as e:
+            logger.warning("Rate limiter Redis error: %s, allowing eval", e)
+            return True
 
 
 @dataclass
@@ -42,6 +92,31 @@ class Trace:
     def has_security_incident(self) -> bool:
         """Check if trace contains a security incident."""
         return self.attributes.get("security.incident") == "true"
+    
+    @property
+    def has_prompt_injection(self) -> bool:
+        """Check if trace contains a prompt injection."""
+        return self.attributes.get("error.type") == "prompt_injection"
+    
+    @classmethod
+    def from_spans(cls, spans: list[Any]) -> "Trace":
+        """Create Trace from list of spans.
+        
+        PP14: Extracts security incident and prompt injection attributes
+        from span attributes.
+        """
+        if not spans:
+            return cls("unknown", {})
+        
+        trace_id = spans[0].context.trace_id if hasattr(spans[0], 'context') else "unknown"
+        attributes = {}
+        
+        # Collect all span attributes
+        for span in spans:
+            if hasattr(span, 'attributes') and span.attributes:
+                attributes.update(span.attributes)
+        
+        return cls(trace_id, attributes)
     
     @classmethod
     def from_spans(cls, spans: list[Span]) -> Trace:
@@ -74,11 +149,19 @@ class AdaptiveEvalSampler:
         cache_ttl: float = 30.0,
         hot_store: Optional[Any] = None,
         enable_audit: bool = True,
+        redis_url: str | None = None,
+        incident_rate_limit: int | None = None,
     ):
         self.prometheus_url = prometheus_url
         self.cache_ttl = cache_ttl
         self.hot_store = hot_store
         self.enable_audit = enable_audit
+        
+        # Rate limiter for incident evals
+        self._rate_limiter = IncidentRateLimiter(
+            redis_url=redis_url,
+            limit=incident_rate_limit
+        )
         
         # Cache for active incident status
         self._incident_cache_time: float = 0.0
@@ -178,20 +261,45 @@ class AdaptiveEvalSampler:
         
         Returns tuple of (should_eval, reason).
         
-        PP12 Logic:
-        - incident mode + security incident -> (True, "incident_full")
-        - incident mode + non-security -> (False, "skip")
-        - night mode + hash(trace_id) % 100 < 50 -> (True, "night_50pct")
-        - day mode + hash(trace_id) % 100 < 10 -> (True, "day_10pct")
-        - otherwise -> (False, "skip")
+        PP14 Logic (all modes):
+        - security.incident="true" -> (True, "incident_security") [rate-limited]
+        - error.type="prompt_injection" -> (True, "incident_injection") [rate-limited]
+        - PP12 Logic for remaining traces:
+          - incident mode + non-security -> (False, "skip")
+          - night mode + hash(trace_id) % 100 < 50 -> (True, "night_50pct")
+          - day mode + hash(trace_id) % 100 < 10 -> (True, "day_10pct")
+          - otherwise -> (False, "skip")
         """
+        # PP14: Always evaluate security incident and prompt injection traces
+        reason_base = None
+        if trace.has_security_incident:
+            reason_base = "incident_security"
+        elif trace.has_prompt_injection:
+            reason_base = "incident_injection"
+        
+        if reason_base is not None:
+            # Rate limit for incident evals
+            if not await self._rate_limiter.acquire():
+                return (False, "rate_limited")
+            
+            # Record incident eval metric
+            reason_label = self._get_incident_reason_label(reason_base)
+            eval_sampler_incident_evals_total.labels(reason=reason_label).inc()
+            
+            # Record audit event
+            if self.enable_audit and self.hot_store is not None:
+                await self._record_incident_eval_audit(
+                    trace.trace_id, reason_base, reason_label
+                )
+            
+            return (True, reason_base)
+        
+        # PP12 Logic for non-incident-traces
         mode = await self.detect_mode()
         
         if mode == "incident":
-            if trace.has_security_incident:
-                return (True, "incident_full")
-            else:
-                return (False, "skip")
+            # Non-security traces in incident mode are skipped
+            return (False, "skip")
         
         # Use deterministic bucketing (sha256) instead of builtin hash
         # for cross-process determinism (content_sampling invariant)
@@ -208,6 +316,44 @@ class AdaptiveEvalSampler:
             return (True, "day_10pct")
         else:
             return (False, "skip")
+    
+    def _get_incident_reason_label(self, reason: str) -> str:
+        """Map incident reason to metric label."""
+        mapping = {
+            "incident_security": "security",
+            "incident_injection": "injection",
+            "incident_cost": "cost",
+        }
+        return mapping.get(reason, "other")
+    
+    async def _record_incident_eval_audit(
+        self, trace_id: str, reason: str, reason_label: str
+    ) -> None:
+        """Record incident eval audit event.
+        
+        Never raises: audit failure should not block eval decisions.
+        """
+        from agent_obs.guardrail.audit import EvalIncidentEvalAuditEvent
+        
+        mode = self._current_mode
+        trigger = "security.incident" if reason == "incident_security" else "error.type=prompt_injection"
+        
+        event = EvalIncidentEvalAuditEvent.for_incident_eval(
+            trace_id=trace_id,
+            reason=reason,
+            reason_label=reason_label,
+            mode=mode,
+            trigger=trigger,
+            actor_id="adaptive-eval-sampler",
+        )
+        
+        try:
+            await asyncio.to_thread(self.hot_store.write_audit_event, event)
+        except Exception as exc:
+            logger.error(
+                "Failed to write incident eval audit event: %s", exc
+            )
+            # Do not raise - audit failure should not block eval decisions
     
     async def _report_mode_change(self, old_mode: str, new_mode: str) -> None:
         """Report mode change to metrics and audit trail."""
