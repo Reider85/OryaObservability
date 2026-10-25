@@ -8,7 +8,7 @@ the ``resource`` JSON blob into top-level keys.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from unittest.mock import MagicMock, patch
 
 import pytest

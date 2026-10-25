@@ -375,3 +375,37 @@ eval_sampler_incident_evals_total = Counter(
     "Incident evals granted by the adaptive eval sampler, by reason (security|injection|cost|other)",
     ["reason"],
 )
+
+# PP15 Eval cost and budget metrics
+
+# Daily eval cost by mode (gauge, reset at 00:00 UTC)
+eval_cost_today_usd = Gauge(
+    "eval_cost_today_usd",
+    "Daily eval cost by mode (USD), resets at 00:00 UTC",
+    ["mode"],
+)
+
+# Daily eval count by mode (counter, monotonic)
+eval_count_by_mode = Counter(
+    "eval_count_by_mode",
+    "Daily eval count by mode (day|night|incident), incremented at decision time",
+    ["mode"],
+)
+
+# Average cost per eval (gauge, reset at 00:00 UTC)
+eval_cost_per_eval_usd = Gauge(
+    "eval_cost_per_eval_usd",
+    "Average cost per eval (USD), resets at 00:00 UTC",
+)
+
+# Budget utilization ratio (gauge, 0..1.2)
+budget_utilization_ratio = Gauge(
+    "budget_utilization_ratio",
+    "Budget utilization ratio (current_cost / budget), 0..1.2",
+)
+
+# Current budget state (gauge: 0=ok, 1=soft, 2=paused)
+eval_budget_state = Gauge(
+    "eval_budget_state",
+    "Current budget state (0=ok, 1=soft, 2=paused)",
+)

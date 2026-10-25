@@ -14,20 +14,196 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone, time as dt_time
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Awaitable
 
 import redis
-from prometheus_client import REGISTRY
 
-from agent_obs.guardrail.audit import AuditWriteError
-from agent_obs.metrics import eval_sampler_mode, eval_sampler_incident_evals_total
+from agent_obs.metrics import eval_sampler_incident_evals_total, eval_sampler_mode
 
 if TYPE_CHECKING:
     from agent_obs.observability import Span
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BudgetEnforcer:
+    """Budget enforcer for eval pipeline (PP15).
+    
+    Enforces daily budget with soft (80% → 5% rate) and hard (100% → paused) limits.
+    Reads cost from Redis and updates metrics.
+    """
+    redis_url: str = "redis://localhost:6379/1"
+    budget_usd: float = 20.0
+    cache_ttl: float = 15.0  # seconds between Redis reads
+    
+    def __init__(self, redis_url: str | None = None, budget_usd: float | None = None, cache_ttl: float | None = None):
+        self.redis_url = redis_url or self.redis_url
+        self.budget_usd = budget_usd or self.budget_usd
+        self.cache_ttl = cache_ttl or self.cache_ttl
+        self._client: redis.Redis | None = None
+        self._cache_time: float = 0.0
+        self._cache_value: dict[str, float] = {}  # {mode: cost}
+        self._state: int = 0  # 0=ok, 1=soft, 2=paused
+        self._state_lock = asyncio.Lock()
+    
+    @property
+    def client(self) -> redis.Redis:
+        """Lazy Redis client."""
+        if self._client is None:
+            self._client = redis.from_url(self.redis_url)
+        return self._client
+    
+    async def _read_daily_cost(self) -> dict[str, float]:
+        """Read daily cost from Redis, with caching.
+        
+        Returns dict of {mode: cost} for day/night/incident.
+        Returns empty dict if Redis unavailable.
+        """
+        now = time.time()
+        if self._cache_value and (now - self._cache_time) < self.cache_ttl:
+            return self._cache_value
+        
+        try:
+            from datetime import datetime
+            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
+            cost_key = f"agent_obs:eval:cost:{date_str}"
+            
+            # Read all mode costs
+            cost_data = await asyncio.to_thread(
+                self.client.hgetall, cost_key
+            )
+            
+            # Parse and sum costs per mode
+            result = {}
+            for mode, cost_bytes in cost_data.items():
+                if isinstance(cost_bytes, (bytes, str)):
+                    try:
+                        cost = float(cost_bytes)
+                        if cost > 0:
+                            result[mode] = cost
+                    except (ValueError, TypeError):
+                        continue
+            
+            self._cache_value = result
+            self._cache_time = now
+            return result
+            
+        except Exception as e:
+            logger.warning("Failed to read daily cost from Redis: %s, using cached", e)
+            return self._cache_value if self._cache_value else {}
+    
+    async def _update_gauges(self, costs: dict[str, float]) -> None:
+        """Update Prometheus gauges with current costs and ratios."""
+        from agent_obs.metrics import (
+            budget_utilization_ratio,
+            eval_budget_state,
+            eval_cost_today_usd,
+        )
+        
+        # Update cost gauges per mode
+        for mode, cost in costs.items():
+            eval_cost_today_usd.labels(mode=mode).set(cost)
+        
+        # Update budget utilization ratio
+        total_cost = sum(costs.values())
+        ratio = total_cost / self.budget_usd if self.budget_usd > 0 else 0.0
+        budget_utilization_ratio.set(ratio)
+        
+        # Update state gauge
+        eval_budget_state.set(self._state)
+    
+    async def _determine_state(self, costs: dict[str, float]) -> int:
+        """Determine budget state based on total cost.
+        
+        Returns: 0=ok, 1=soft, 2=paused
+        """
+        total_cost = sum(costs.values())
+        ratio = total_cost / self.budget_usd if self.budget_usd > 0 else 0.0
+        
+        if ratio >= 1.0:
+            return 2  # paused
+        elif ratio >= 0.8:
+            return 1  # soft
+        else:
+            return 0  # ok
+    
+    async def _check_state_transition(self, old_state: int, new_state: int) -> bool:
+        """Check if state transition requires audit and logging.
+        
+        Returns True if transition occurred.
+        """
+        if old_state == new_state:
+            return False
+        
+        # Log transition
+        state_names = {0: "ok", 1: "soft", 2: "paused"}
+        logger.info(
+            "Budget state changed from %s to %s (cost=%.2f, budget=%.2f)",
+            state_names[old_state],
+            state_names[new_state],
+            sum(self._cache_value.values()),
+            self.budget_usd,
+        )
+        
+        # Record audit event (never raise)
+        if self._client is not None:
+            try:
+                await asyncio.to_thread(
+                    self._record_state_change_audit,
+                    old_state,
+                    new_state
+                )
+            except Exception as exc:
+                logger.error("Failed to write budget state change audit: %s", exc)
+        
+        return True
+    
+    def _record_state_change_audit(self, old_state: int, new_state: int) -> None:
+        """Write budget state change audit event to ClickHouse.
+        
+        Never raises: audit failure should not block budget decisions.
+        """
+        from agent_obs.guardrail.audit import EvalBudgetStateChangeAuditEvent
+        
+        state_names = {0: "ok", 1: "soft", 2: "paused"}
+        event = EvalBudgetStateChangeAuditEvent.for_budget_state_change(
+            old_state=state_names[old_state],
+            new_state=state_names[new_state],
+            current_cost=sum(self._cache_value.values()),
+            budget=self.budget_usd,
+            actor_id="adaptive-eval-sampler",
+        )
+        
+        try:
+            if self._client is not None:
+                self._client.write_audit_event(event)
+        except Exception as exc:
+            logger.error("Failed to write budget state change audit event: %s", exc)
+            # Do not raise - audit failure should not block budget decisions
+    
+    async def refresh_budget(self) -> int:
+        """Refresh budget state from Redis and return current state.
+        
+        Returns: 0=ok, 1=soft, 2=paused
+        """
+        try:
+            costs = await self._read_daily_cost()
+            new_state = await self._determine_state(costs)
+            
+            async with self._state_lock:
+                if await self._check_state_transition(self._state, new_state):
+                    self._state = new_state
+                    await self._update_gauges(costs)
+            
+            return self._state
+            
+        except Exception as e:
+            logger.error("Error refreshing budget: %s, keeping current state %d", e, self._state)
+            return self._state  # Fail-open: keep current state
 
 
 @dataclass
@@ -98,25 +274,7 @@ class Trace:
         """Check if trace contains a prompt injection."""
         return self.attributes.get("error.type") == "prompt_injection"
     
-    @classmethod
-    def from_spans(cls, spans: list[Any]) -> "Trace":
-        """Create Trace from list of spans.
-        
-        PP14: Extracts security incident and prompt injection attributes
-        from span attributes.
-        """
-        if not spans:
-            return cls("unknown", {})
-        
-        trace_id = spans[0].context.trace_id if hasattr(spans[0], 'context') else "unknown"
-        attributes = {}
-        
-        # Collect all span attributes
-        for span in spans:
-            if hasattr(span, 'attributes') and span.attributes:
-                attributes.update(span.attributes)
-        
-        return cls(trace_id, attributes)
+    
     
     @classmethod
     def from_spans(cls, spans: list[Span]) -> Trace:
@@ -147,10 +305,11 @@ class AdaptiveEvalSampler:
         self,
         prometheus_url: str = "http://localhost:9090",
         cache_ttl: float = 30.0,
-        hot_store: Optional[Any] = None,
+        hot_store: Any | None = None,
         enable_audit: bool = True,
         redis_url: str | None = None,
         incident_rate_limit: int | None = None,
+        budget_usd: float | None = None,
     ):
         self.prometheus_url = prometheus_url
         self.cache_ttl = cache_ttl
@@ -161,6 +320,12 @@ class AdaptiveEvalSampler:
         self._rate_limiter = IncidentRateLimiter(
             redis_url=redis_url,
             limit=incident_rate_limit
+        )
+        
+        # Budget enforcer (PP15)
+        self._budget_enforcer = BudgetEnforcer(
+            redis_url=redis_url,
+            budget_usd=budget_usd
         )
         
         # Cache for active incident status
@@ -216,15 +381,15 @@ class AdaptiveEvalSampler:
     
     def _get_hour_from_time(self, dt: datetime) -> int:
         """Get hour from datetime in UTC."""
-        return dt.astimezone(timezone.utc).hour
+        return dt.astimezone(UTC).hour
     
-    async def detect_mode(self, now: Optional[datetime] = None) -> str:
+    async def detect_mode(self, now: datetime | None = None) -> str:
         """Detect current sampling mode.
         
         Returns one of: "day", "night", "incident"
         """
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
         
         # Check for active incident first (overrides day/night)
         # Check cache first before calling _fetch_active_incident
@@ -261,16 +426,21 @@ class AdaptiveEvalSampler:
         
         Returns tuple of (should_eval, reason).
         
-        PP14 Logic (all modes):
-        - security.incident="true" -> (True, "incident_security") [rate-limited]
-        - error.type="prompt_injection" -> (True, "incident_injection") [rate-limited]
-        - PP12 Logic for remaining traces:
-          - incident mode + non-security -> (False, "skip")
-          - night mode + hash(trace_id) % 100 < 50 -> (True, "night_50pct")
-          - day mode + hash(trace_id) % 100 < 10 -> (True, "day_10pct")
-          - otherwise -> (False, "skip")
+        PP15 Budget enforcement logic:
+        1. Check budget state: hard-pause (100%) blocks everything, including incident evals
+        2. PP14: Always evaluate security incident and prompt injection traces (unless budget paused)
+        3. PP12 Logic for non-incident-traces, with soft budget (80%) reducing day/night rates to 5%
+        
+        States: 0=ok, 1=soft (80% budget → day/night use 5%), 2=paused (100% → skip all)
         """
+        # PP15: Check budget state first (hard pause blocks everything)
+        budget_state = await self._budget_enforcer.refresh_budget()
+        
+        if budget_state == 2:  # paused
+            return (False, "budget_paused")
+        
         # PP14: Always evaluate security incident and prompt injection traces
+        # (unless budget is paused - already handled above)
         reason_base = None
         if trace.has_security_incident:
             reason_base = "incident_security"
@@ -306,16 +476,33 @@ class AdaptiveEvalSampler:
         trace_hash = int(hashlib.sha256(trace.trace_id.encode("utf-8")).hexdigest(), 16) % 100
         
         if mode == "night":
-            if trace_hash < 50:
-                return (True, "night_50pct")
+            # PP15: Apply budget soft limit (80% → reduce rate to 5%)
+            if budget_state == 1:  # soft
+                if trace_hash < 5:
+                    return (True, "night_5pct_soft")
+                else:
+                    return (False, "budget_soft")
+            else:  # ok
+                if trace_hash < 50:
+                    return (True, "night_50pct")
+                else:
+                    return (False, "skip")
+        
+        # mode == "day"
+        if budget_state == 1:  # soft
+            if trace_hash < 5:
+                return (True, "day_5pct_soft")
+            else:
+                return (False, "budget_soft")
+        else:  # ok
+            if trace_hash < 10:
+                return (True, "day_10pct")
             else:
                 return (False, "skip")
         
-        # mode == "day"
-        if trace_hash < 10:
-            return (True, "day_10pct")
-        else:
-            return (False, "skip")
+        # Increment eval count metric (only for positive decisions)
+        from agent_obs.metrics import eval_count_by_mode
+        eval_count_by_mode.labels(mode=mode).inc()
     
     def _get_incident_reason_label(self, reason: str) -> str:
         """Map incident reason to metric label."""

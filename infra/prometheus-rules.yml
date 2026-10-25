@@ -277,3 +277,22 @@ groups:
             the cron job is broken, the LLM judge API is down, or ClickHouse
             writes are failing. Check cron logs and the
             agent_obs_cron_errors_total{job_name="nightly_golden_eval"} counter.
+
+    - name: eval-budget
+      rules:
+        # Fires when eval budget is exhausted (100% or more)
+        - alert: EvalBudgetExhausted
+          expr: |
+            budget_utilization_ratio >= 1.0
+          for: 1m
+          labels:
+            severity: warning
+            component: eval-budget
+          annotations:
+            summary: "Eval budget exhausted - eval pipeline paused"
+            description: >-
+              Eval budget utilization is {{ $value }} (100%+ threshold), 
+              triggering hard pause of all eval jobs. Current cost: 
+              sum(eval_cost_today_usd) by (mode) | humanizeBytes. 
+              To resume, reduce eval frequency or increase EVAL_DAILY_BUDGET_USD.
+              Runbook: docs/eval-budget-runbook.md.

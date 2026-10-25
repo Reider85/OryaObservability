@@ -25,12 +25,21 @@ app.dependency_overrides[app.dependency_overrides.get("get_hot_store", lambda: N
 class MockHotStore:
     """Mock HotStore for testing"""
     
-    def __init__(self):
+    def __init__(self, host=None, port=None, database=None):
         self.spans_data = {}
         self.is_available_called = False
+        self.host = host
+        self.port = port
+        self.database = database
     
     def is_available(self):
         return True
+    
+    def write_audit_event(self, event):
+        pass
+    
+    def _get_client(self):
+        return self
     
     def get_spans(self, trace_id: str):
         if trace_id in self.spans_data:

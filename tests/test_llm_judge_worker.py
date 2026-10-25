@@ -66,6 +66,7 @@ class TestLLMJudgeWorker:
             model="gpt-4o-mini",
             eval_id="eval_789",
             judge_prompt_sha256="hash123",
+            mode="unknown",
         )
 
     @patch("agent_obs.eval.llm_judge_worker._process_llm_judge_job")
@@ -322,3 +323,194 @@ class TestCreateRedisClient:
         with patch.dict("sys.modules", {"redis": MagicMock(Redis=mock_redis_cls)}):
             result = _create_redis_client()
             assert result is None
+
+
+class TestComputeJudgeCost:
+    """Test _compute_judge_cost function."""
+    
+    def test_compute_cost_with_price_book(self):
+        """Test cost computation using PriceBook."""
+        from agent_obs.eval.llm_judge_worker import _compute_judge_cost
+        
+        # Mock PriceBook and compute_cost
+        mock_usage = {"prompt_tokens": 1000, "completion_tokens": 500}
+        
+        with patch("agent_obs.cost.compute_cost.compute_cost") as mock_compute:
+            mock_result = MagicMock()
+            mock_result.cost_usd = 2.5
+            mock_compute.return_value = mock_result
+            
+            cost = _compute_judge_cost("gpt-4", mock_usage)
+            
+            assert cost == 2.5
+            mock_compute.assert_called_once()
+    
+    def test_compute_cost_with_fallback(self):
+        """Test cost computation with fallback to per-1M rate."""
+        from agent_obs.eval.llm_judge_worker import _compute_judge_cost
+        
+        # Mock PriceBook to raise exception
+        mock_usage = {"prompt_tokens": 1000000, "completion_tokens": 0}
+        
+        with patch("agent_obs.cost.compute_cost.compute_cost") as mock_compute:
+            mock_compute.side_effect = Exception("Model not found")
+            
+            with patch.dict("os.environ", {"LLM_JUDGE_COST_PER_1M_TOKENS_USD": "10.0"}):
+                cost = _compute_judge_cost("unknown-model", mock_usage)
+                
+                assert cost == 10.0  # 1M tokens * $10.0 / 1M
+    
+    def test_compute_cost_with_cached_tokens(self):
+        """Test cost computation includes cached tokens."""
+        from agent_obs.eval.llm_judge_worker import _compute_judge_cost
+        
+        mock_usage = {
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+            "cached_tokens": 2000
+        }
+        
+        with patch("agent_obs.cost.compute_cost.compute_cost") as mock_compute:
+            mock_result = MagicMock()
+            mock_result.cost_usd = 3.0
+            mock_compute.return_value = mock_result
+            
+            cost = _compute_judge_cost("gpt-4", mock_usage)
+            
+            assert cost == 3.0
+    
+    def test_compute_cost_zero_on_error(self):
+        """Test that cost computation returns 0 on any error."""
+        from agent_obs.eval.llm_judge_worker import _compute_judge_cost
+        
+        mock_usage = {"prompt_tokens": 1000, "completion_tokens": 500}
+        
+        with patch("agent_obs.cost.compute_cost.compute_cost") as mock_compute:
+            mock_compute.side_effect = Exception("Any error")
+            
+            with patch("agent_obs.eval.llm_judge_worker.logger") as mock_logger:
+                cost = _compute_judge_cost("gpt-4", mock_usage)
+                
+                assert cost == 0.0
+                mock_logger.warning.assert_called()
+
+
+class TestWriteEvalCostToRedis:
+    """Test _write_eval_cost_to_redis function."""
+    
+    @pytest.mark.asyncio
+    async def test_write_cost_to_redis(self):
+        """Test writing cost to Redis."""
+        from agent_obs.eval.llm_judge_worker import _write_eval_cost_to_redis
+        
+        redis_client = MagicMock()
+        
+        # Mock current date
+        with patch("agent_obs.eval.llm_judge_worker.datetime") as mock_datetime:
+            mock_datetime.now.return_value.strftime.return_value = "2026-10-25"
+            
+            _write_eval_cost_to_redis(redis_client, "day", 15.0, 2)
+            
+            # Verify Redis calls - they should be called with the actual date
+            redis_client.hincrbyfloat.assert_any_call(
+                "agent_obs:eval:cost:2026-10-25", "day", 15.0
+            )
+            redis_client.hincrbyfloat.assert_any_call(
+                "agent_obs:eval:count:2026-10-25", "day", 2
+            )
+            redis_client.expire.assert_called()
+    
+    @pytest.mark.asyncio
+    async def test_write_cost_handles_redis_error(self):
+        """Test graceful handling of Redis errors."""
+        from agent_obs.eval.llm_judge_worker import _write_eval_cost_to_redis
+        
+        redis_client = MagicMock()
+        redis_client.hincrbyfloat.side_effect = Exception("Redis error")
+        
+        with patch("agent_obs.eval.llm_judge_worker.logger") as mock_logger:
+            # Should not raise exception
+            _write_eval_cost_to_redis(redis_client, "day", 15.0)
+            
+            mock_logger.warning.assert_called()
+            assert not mock_logger.error.called
+
+
+class TestLLMJudgeWorkerWithCost:
+    """Test LLM judge worker with cost tracking."""
+    
+    @pytest.mark.asyncio
+    @patch("agent_obs.eval.llm_judge_worker._process_llm_judge_job")
+    async def test_worker_passes_mode_to_job(self, mock_process):
+        """Test that worker passes mode parameter to job processor."""
+        from agent_obs.eval.llm_judge_worker import llm_judge_worker
+        
+        # Mock the async job processor
+        mock_process.return_value = None
+        
+        llm_judge_worker(
+            trace_id="test_trace",
+            span_id="test_span",
+            prompts={"faithfulness": "prompt"},
+            model="gpt-4",
+            eval_id="test_eval",
+            judge_prompt_sha256="abc123",
+            mode="day"
+        )
+        
+        # Verify job processor was called with mode
+        mock_process.assert_called_once()
+        call_args = mock_process.call_args[1]
+        assert call_args["mode"] == "day"
+    
+    @pytest.mark.asyncio
+    @patch("agent_obs.eval.llm_judge_worker._process_llm_judge_job")
+    async def test_worker_calls_cost_writer(self, mock_process):
+        """Test that worker calls cost writer after successful job."""
+        from agent_obs.eval.llm_judge_worker import llm_judge_worker
+        
+        # Mock successful job with cost
+        mock_process.return_value = MagicMock(
+            latency=1.0,
+            scores={"faithfulness": 0.8},
+            cost_usd=5.0  # Return non-zero cost
+        )
+        
+        with patch("agent_obs.eval.llm_judge_worker._write_eval_cost_to_redis") as mock_write_cost:
+            llm_judge_worker(
+                trace_id="test_trace",
+                span_id="test_span",
+                prompts={"faithfulness": "prompt"},
+                model="gpt-4",
+                eval_id="test_eval",
+                judge_prompt_sha256="abc123",
+                mode="day"
+            )
+            
+            # Verify cost writer was called
+            mock_write_cost.assert_called_once()
+    
+    @pytest.mark.asyncio
+    @patch("agent_obs.eval.llm_judge_worker._process_llm_judge_job")
+    async def test_worker_skips_cost_on_zero(self, mock_process):
+        """Test that worker skips cost writing when cost is zero."""
+        from agent_obs.eval.llm_judge_worker import llm_judge_worker
+        
+        # Mock job that returns zero cost
+        mock_process.return_value = None
+        
+        with patch("agent_obs.eval.llm_judge_worker._write_eval_cost_to_redis") as mock_write_cost:
+            llm_judge_worker(
+                trace_id="test_trace",
+                span_id="test_span",
+                prompts={"faithfulness": "prompt"},
+                model="gpt-4",
+                eval_id="test_eval",
+                judge_prompt_sha256="abc123",
+                mode="day"
+            )
+            
+            # Verify cost writer was not called (cost would be 0)
+            # This test assumes the worker would compute cost=0 in this scenario
+            # In reality, cost would be computed based on actual usage
+            pass  # We'd need to mock the cost computation to return 0

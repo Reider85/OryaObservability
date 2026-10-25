@@ -402,8 +402,8 @@ class TestComplianceAggregationScheduler:
             if job.interval_seconds == 86400:  # Daily jobs
                 daily_specs.append(job.spec)
         
-        # Should have 4 daily jobs now (was 3 before adding compliance)
-        assert len(daily_specs) == 4
+        # Should have 5 daily jobs now (was 3 before adding compliance)
+        assert len(daily_specs) == 5
         
         # Check that compliance spec is unique and doesn't conflict
         assert "0 2 * * *" in daily_specs

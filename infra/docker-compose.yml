@@ -433,6 +433,8 @@ services:
       LLM_JUDGE_MODEL: gpt-4o-mini
       LLM_JUDGE_API_KEY: ${OPENAI_API_KEY}
       EMBEDDING_MODEL: text-embedding-3-small
+      EVAL_DAILY_BUDGET_USD: ${EVAL_DAILY_BUDGET_USD:-20.0}
+      LLM_JUDGE_COST_PER_1M_TOKENS_USD: ${LLM_JUDGE_COST_PER_1M_TOKENS_USD:-5.0}
       PYTHONPATH: /app
     volumes:
       - ../:/app:ro

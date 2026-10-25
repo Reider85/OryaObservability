@@ -10,8 +10,8 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone, UTC
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,26 @@ class RecoveryAuditEvent:
             decision="allow",
         )
     
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse row format."""
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+self.user_agent,
+        )
+    
+    @property
+    def vault_api_path(self) -> str:
+        """Get the vault API path for this recovery."""
+        return f"secret/data/{self.resource['id']}"
+    
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
         return {
@@ -172,6 +192,107 @@ class RecoveryAuditEvent:
             "decision": self.decision,
             "reason_category": self.reason_category,
         }
+    
+def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row tuple (positional parameters).
+        
+        Matches audit_events_hot DDL columns:
+        (audit_id, timestamp, trace_id, actor, action, decision, resource, reason, ip_address, user_agent)
+        """
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+class EvalBudgetStateChangeAuditEvent:
+    """Audit event for budget state changes (PP15).
+    
+    Records when budget state transitions occur (ok/soft/paused).
+    """
+    
+    def __init__(
+        self,
+        audit_id: str,
+        timestamp: float,
+        trace_id: str,
+        actor: dict,
+        action: str,
+        decision: str,
+        resource: dict,
+        reason: str,
+        ip_address: str,
+        user_agent: str,
+    ):
+        self.audit_id = audit_id
+        self.timestamp = timestamp
+        self.trace_id = trace_id
+        self.actor = actor
+        self.action = action
+        self.decision = decision
+        self.resource = resource
+        self.reason = reason
+        self.ip_address = ip_address
+        self.user_agent = user_agent
+    
+    @classmethod
+    def for_budget_state_change(
+        cls,
+        old_state: str,
+        new_state: str,
+        current_cost: float,
+        budget: float,
+        actor_id: str,
+    ) -> "EvalBudgetStateChangeAuditEvent":
+        """Factory for budget state change audit events."""
+        from agent_obs.util import generate_audit_id
+        from datetime import datetime, UTC
+        
+        return cls(
+            audit_id=generate_audit_id(),
+            timestamp=datetime.now(UTC).timestamp(),
+            trace_id="system",  # System-level event, not trace-specific
+            actor={"id": actor_id, "type": "service"},
+            action="eval_budget.state_change",
+            decision="system",
+            resource={
+                "type": "budget_state",
+                "old_state": old_state,
+                "new_state": new_state,
+                "current_cost_usd": current_cost,
+                "budget_usd": budget,
+                "utilization_ratio": current_cost / budget if budget > 0 else 0.0,
+            },
+            reason=f"Budget state changed from {old_state} to {new_state}",
+            ip_address="127.0.0.1",
+            user_agent="agent-obs/eval",
+        )
+    
+    def to_dict(self) -> dict:
+        """Serialize to dict for ClickHouse insertion."""
+        from datetime import UTC
+        from agent_obs.util import serialize_audit_event
+        
+        return serialize_audit_event(
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
     
     def to_clickhouse_row(self) -> tuple:
         """Convert to ClickHouse INSERT row tuple (positional parameters).
@@ -441,12 +562,12 @@ class SamplerRateChangeAuditEvent:
         )
         return (
             self.audit_id,
-            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
             self.trace_id,
             json.dumps(self.actor),
             self.action,
             self.decision,
-            json.dumps(resource),
+            json.dumps(self.resource),
             self.reason,
             self.ip_address,
             self.user_agent,

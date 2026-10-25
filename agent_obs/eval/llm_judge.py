@@ -290,6 +290,16 @@ class LLMJudgeEvaluator(BaseEvaluator):
             # Determine priority: incident reasons get priority 10, others 1
             priority = 10 if reason.startswith("incident_") else 1
             queue_name = self.incident_queue_name if priority >= 10 else self.queue_name
+            
+            # Extract mode for cost tracking
+            if reason.startswith("incident_"):
+                mode = "incident"
+            elif reason.startswith("day_"):
+                mode = "day"
+            elif reason.startswith("night_"):
+                mode = "night"
+            else:
+                mode = "unknown"
         else:
             # Legacy random sampling
             sample_rate = float(os.environ.get("AGENT_OBS_LLM_JUDGE_RATE", self.sample_rate))
@@ -298,6 +308,7 @@ class LLMJudgeEvaluator(BaseEvaluator):
             
             priority = 1
             queue_name = self.queue_name
+            mode = "unknown"
         
         # Create evaluation ID
         eval_id = f"llm_judge_{int(time.time() * 1000)}"
@@ -319,6 +330,7 @@ class LLMJudgeEvaluator(BaseEvaluator):
                     "model": job.model,
                     "eval_id": job.eval_id,
                     "judge_prompt_sha256": job.judge_prompt_sha256,
+                    "mode": mode,
                 },
                 meta={"priority": priority}
             )
