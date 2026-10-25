@@ -17,6 +17,8 @@ WORKDIR /app
 #   hvac    <- agent_obs.guardrail.vault_client
 # The guardrail ML stack (presidio, transformers, torch) stays out: those
 # modules import their models lazily, so nothing here loads model weights.
+# PP13: httpx + openai are needed by the nightly_golden_eval job (pilot agent
+# + LLM judge); neither pulls in ML model weights.
 RUN pip install --no-cache-dir \
     clickhouse-driver \
     hvac \
@@ -25,13 +27,19 @@ RUN pip install --no-cache-dir \
     asyncpg \
     prometheus-client \
     pyyaml \
-    pyotp
+    pyotp \
+    httpx \
+    openai
 
 # The repo is bind-mounted read-only at /app by docker-compose; copying the
 # package here as well keeps `docker build` usable without the mount.
 COPY pyproject.toml README.md ./
 COPY agent_obs/ ./agent_obs/
 COPY scripts/ ./scripts/
+# PP13: pilot agent + golden set + price book for the nightly golden eval job.
+COPY pilot_agent/ ./pilot_agent/
+COPY eval/ ./eval/
+COPY price_book.yaml ./price_book.yaml
 
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \

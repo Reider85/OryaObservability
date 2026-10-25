@@ -1,0 +1,37 @@
+# PP13 (T3.3.2): golden set for the nightly LLM-judge regression run.
+#
+# One YAML file may hold many cases; the nightly job loads every
+# eval/golden/*.yaml. Fields per case:
+#   id               — stable question_id, used as eval_golden_results key
+#   question         — prompt sent to pilot_agent.run()
+#   expected_answer  — reference answer; passed to the faithfulness judge as
+#                      context (the golden eval has no retrieval context)
+#   expected_scores  — per-metric pass thresholds; a case passes only when
+#                      every actual score >= its expected threshold.
+#                      Metric names match agent_obs.eval.llm_judge.LLMJudgePrompts.
+#
+# See docs/eval-golden-runbook.md for how to add cases and interpret regressions.
+golden_cases:
+  - id: capital_of_france
+    question: "What is the capital of France?"
+    expected_answer: "The capital of France is Paris."
+    expected_scores:
+      faithfulness: 0.85
+      answer_relevancy: 0.85
+      completeness: 0.75
+
+  - id: capital_of_italy
+    question: "What is the capital of Italy?"
+    expected_answer: "The capital of Italy is Rome."
+    expected_scores:
+      faithfulness: 0.85
+      answer_relevancy: 0.85
+      completeness: 0.75
+
+  - id: capital_of_japan
+    question: "What is the capital of Japan?"
+    expected_answer: "The capital of Japan is Tokyo."
+    expected_scores:
+      faithfulness: 0.85
+      answer_relevancy: 0.85
+      completeness: 0.75

@@ -879,6 +879,38 @@ class HotStore:
             }
         )
 
+    def write_eval_golden_results(self, rows: list[dict[str, Any]]) -> int:
+        """Batch-insert nightly golden-eval rows into eval_golden_results (PP13).
+
+        Each row is a dict with keys: nightly_ts (datetime), question_id,
+        metric_name, expected_score, actual_score, pass (bool|int). Returns the
+        number of rows written.
+        """
+        if not rows:
+            return 0
+        client = self._get_client()
+        payload = [
+            (
+                row["nightly_ts"],
+                row["question_id"],
+                row["metric_name"],
+                float(row["expected_score"]),
+                float(row["actual_score"]),
+                1 if row["pass"] else 0,
+            )
+            for row in rows
+        ]
+        client.execute(
+            """
+            INSERT INTO eval_golden_results
+            (nightly_ts, question_id, metric_name, expected_score, actual_score, pass)
+            VALUES
+            """,
+            payload,
+        )
+        logger.info("eval_golden_results written: rows=%d", len(payload))
+        return len(payload)
+
     def close(self) -> None:
         """Close the ClickHouse connection."""
         if self._client is not None:

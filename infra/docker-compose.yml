@@ -495,6 +495,11 @@ services:
       AGENT_OBS_CRON_COLD_SPEC: ${AGENT_OBS_CRON_COLD_SPEC:-0 4 * * 0}
       AGENT_OBS_CRON_COMPLIANCE_SPEC: ${AGENT_OBS_CRON_COMPLIANCE_SPEC:-0 2 * * *}
       AGENT_OBS_CRON_COMPLIANCE_MIGRATION_SPEC: ${AGENT_OBS_CRON_COMPLIANCE_MIGRATION_SPEC:-0 5 * * 1}
+      # PP13: nightly golden eval at 03:00 UTC
+      AGENT_OBS_CRON_GOLDEN_EVAL_SPEC: ${AGENT_OBS_CRON_GOLDEN_EVAL_SPEC:-0 3 * * *}
+      AGENT_OBS_GOLDEN_AGENT_MODEL: ${AGENT_OBS_GOLDEN_AGENT_MODEL:-gpt-4o}
+      AGENT_OBS_GOLDEN_JUDGE_MODEL: ${AGENT_OBS_GOLDEN_JUDGE_MODEL:-gpt-4o-mini}
+      LLM_JUDGE_API_BASE: ${LLM_JUDGE_API_BASE:-https://api.openai.com/v1}
       AGENT_OBS_CRON_PORT: ${AGENT_OBS_CRON_PORT:-9777}
       # Retention windows (must match the ClickHouse TTLs)
       AGENT_OBS_CRON_AUDIT_RETENTION_DAYS: ${AGENT_OBS_CRON_AUDIT_RETENTION_DAYS:-365}
@@ -530,6 +535,10 @@ services:
       VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
       VAULT_TOKEN: ${VAULT_TOKEN:-}
       VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+      # PP13: pilot agent + LLM judge for the nightly golden eval. The script
+      # falls back from LLM_JUDGE_API_KEY to OPENAI_API_KEY.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_JUDGE_API_KEY: ${LLM_JUDGE_API_KEY:-}
     volumes:
       - ../:/app:ro
     ports:

@@ -220,3 +220,24 @@ ORDER BY (agent_id, created_at)
 PARTITION BY toYYYYMMDD(created_at)
 TTL created_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
+
+-- PP13 (T3.3.2): nightly golden-eval results for regression control.
+-- One row per (nightly run, question, metric). GoldenEvalRegression compares
+-- agent_obs_eval_golden_pass_rate against its 7-day moving average; this table
+-- is the row-level source for root-cause analysis when it fires.
+-- TTL 90d >> the 7d alert window, so a regression can be investigated long
+-- after the nightly run.
+CREATE TABLE IF NOT EXISTS eval_golden_results (
+    nightly_ts DateTime64(3),
+    question_id String,
+    metric_name String,
+    expected_score Float64,
+    actual_score Float64,
+    pass UInt8,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (nightly_ts, question_id, metric_name)
+PARTITION BY toYYYYMMDD(nightly_ts)
+TTL nightly_ts + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;

@@ -422,3 +422,76 @@ tests:
       - eval_time: 20m
         alertname: DriftDetected
         exp_alerts: []
+
+  # --- PP13: GoldenEvalRegression -------------------------------------------
+  # The gauge holds its value between nightly runs; avg_over_time therefore
+  # approximates the mean of the nightly values. A single night's sample can
+  # never fire (current == avg), so no history-count guard is needed.
+  - interval: 1m
+    name: stable golden pass rate never fires GoldenEvalRegression
+    input_series:
+      - series: 'agent_obs_eval_golden_pass_rate'
+        values: "0.9+0x1500"
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: GoldenEvalRegression
+        exp_alerts: []
+
+  - interval: 1m
+    name: pass rate dropped >0.10 below 7d average fires GoldenEvalRegression
+    input_series:
+      # 24h at 1.0, then one night collapses to 0.7
+      - series: 'agent_obs_eval_golden_pass_rate'
+        values: "1.0+0x1440 0.7+0x60"
+    promql_expr_test:
+      - expr: |
+          agent_obs_eval_golden_pass_rate
+            < (avg_over_time(agent_obs_eval_golden_pass_rate[7d]) - 0.10)
+        eval_time: 1500m
+        exp_samples:
+          - labels: '{__name__="agent_obs_eval_golden_pass_rate"}'
+            value: 0.7
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: GoldenEvalRegression
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: golden-eval
+            exp_annotations:
+              summary: "Golden eval pass rate regressed >10% below its 7-day average"
+
+  - interval: 1m
+    name: mild dip of exactly 0.10 below average stays quiet
+    input_series:
+      # avg = 0.95; threshold is avg - 0.10 = 0.85; 0.85 < 0.85 is false
+      - series: 'agent_obs_eval_golden_pass_rate'
+        values: "1.0+0x1440 0.85+0x60"
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: GoldenEvalRegression
+        exp_alerts: []
+
+  - interval: 1m
+    name: nightly golden eval stale past 48h fires GoldenEvalJobStale
+    input_series:
+      - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="nightly_golden_eval"}'
+        values: "0+0x3000"
+    alert_rule_test:
+      - eval_time: 50h
+        alertname: GoldenEvalJobStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: golden-eval
+              job_name: nightly_golden_eval
+
+  - interval: 1m
+    name: fresh nightly golden eval run keeps GoldenEvalJobStale quiet
+    input_series:
+      - series: 'agent_obs_cron_last_success_timestamp_seconds{job_name="nightly_golden_eval"}'
+        values: "0+0x600"
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: GoldenEvalJobStale
+        exp_alerts: []

@@ -83,6 +83,15 @@ eval_job_latency_seconds = Histogram(
     buckets=[1, 2, 5, 10, 15, 30, 60],
 )
 
+# PP13 (T3.3.2): nightly golden-set regression control. Set once per nightly
+# run by scripts/nightly_golden_eval.py (long-lived cron scheduler keeps the
+# gauge scrapeable between runs). GoldenEvalRegression fires when the value
+# drops more than 0.10 below its 7-day moving average.
+eval_golden_pass_rate = Gauge(
+    "agent_obs_eval_golden_pass_rate",
+    "Fraction of golden-set cases passing the nightly LLM-judge eval (last run)",
+)
+
 # --- Cron maintenance jobs (PC21) -------------------------------------------
 # These are emitted by the out-of-process cron service (scripts/cron/scheduler.py),
 # never by the SDK in-process. `job_name` is a bounded set: cleanup_vault,

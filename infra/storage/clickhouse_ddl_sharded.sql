@@ -211,5 +211,24 @@ PARTITION BY toYYYYMMDD(created_at)
 TTL created_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
+-- PP13 (T3.3.2): nightly golden-eval results (sharded).
+CREATE TABLE IF NOT EXISTS eval_golden_results_local ON CLUSTER 'observability_cluster' (
+    nightly_ts DateTime64(3),
+    question_id String,
+    metric_name String,
+    expected_score Float64,
+    actual_score Float64,
+    pass UInt8,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (nightly_ts, question_id, metric_name)
+PARTITION BY toYYYYMMDD(nightly_ts)
+TTL nightly_ts + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
+CREATE TABLE IF NOT EXISTS eval_golden_results ON CLUSTER 'observability_cluster' AS eval_golden_results_local
+ENGINE = Distributed('observability_cluster', 'observability', 'eval_golden_results_local', question_id);
+
 -- Grant permissions to observability user (will be created in init script)
 -- This will be executed by the init script after creating the user

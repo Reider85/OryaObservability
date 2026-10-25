@@ -235,3 +235,45 @@ groups:
             buffer size (max_count) is appropriate for your agent's reasoning
             step frequency. Dashboard: Span Aggregation
             (http://localhost:3001/d/span-aggregation); audit events via SDK logs.
+
+  # PP13 (T3.3.2): nightly golden eval regression control. The gauge is set
+  # once per nightly run by the nightly_golden_eval cron job and holds its
+  # value between runs (long-lived cron scheduler keeps it scrapeable).
+  - name: golden-eval
+    rules:
+      # Fires when the last run's pass rate is more than 0.10 below the mean
+      # of everything Prometheus scraped over the trailing 7 days. A single
+      # sample can never fire: current == avg(current), so current < current
+      # - 0.10 is impossible; no separate "enough history" guard is needed.
+      - alert: GoldenEvalRegression
+        expr: |
+          agent_obs_eval_golden_pass_rate
+            < (avg_over_time(agent_obs_eval_golden_pass_rate[7d]) - 0.10)
+        for: 5m
+        labels:
+          severity: warning
+          component: golden-eval
+        annotations:
+          summary: "Golden eval pass rate regressed >10% below its 7-day average"
+          description: >-
+            The nightly golden eval pass rate is {{ $value }}, more than 0.10
+            below the 7-day moving average. A recent agent, prompt, model or
+            dependency change likely degraded answer quality. Root-cause rows:
+            SELECT * FROM eval_golden_results WHERE pass = 0 ORDER BY nightly_ts
+            DESC; runbook: docs/eval-golden-runbook.md.
+
+      - alert: GoldenEvalJobStale
+        expr: |
+          (time() - agent_obs_cron_last_success_timestamp_seconds{job_name="nightly_golden_eval"}) > 172800
+        for: 5m
+        labels:
+          severity: warning
+          component: golden-eval
+        annotations:
+          summary: "nightly_golden_eval has not succeeded for more than 2 daily cycles"
+          description: >-
+            Last successful golden eval run was {{ $value | humanizeDuration }}
+            ago (threshold 48h). Golden-set regression control is blind: either
+            the cron job is broken, the LLM judge API is down, or ClickHouse
+            writes are failing. Check cron logs and the
+            agent_obs_cron_errors_total{job_name="nightly_golden_eval"} counter.

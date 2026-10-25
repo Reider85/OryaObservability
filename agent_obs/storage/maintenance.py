@@ -71,6 +71,7 @@ JOB_CALIBRATE_DRIFT_THRESHOLD = "calibrate_drift_threshold"
 JOB_EXPORT_EMBEDDINGS = "export_embeddings_to_phoenix"
 JOB_AGGREGATE_COMPLIANCE_CATALOG = "aggregate_compliance_catalog"
 JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM = "migrate_compliance_catalog_hot_to_warm"
+JOB_NIGHTLY_GOLDEN_EVAL = "nightly_golden_eval"
 
 DEFAULT_AUDIT_RETENTION_DAYS = 90
 DEFAULT_EVAL_RETENTION_DAYS = 7
@@ -1027,6 +1028,7 @@ __all__ = [
     "JOB_DRIFT_DETECTION",
     "JOB_MIGRATE_SPANS",
     "JOB_MIGRATE_TRACES",
+    "JOB_NIGHTLY_GOLDEN_EVAL",
     "VAULT_PREFIX",
     "AuditArchiveResult",
     "EvalWarmResult",

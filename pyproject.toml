@@ -55,6 +55,9 @@ cron = [
     "asyncpg>=0.29",
     # PC28: Phoenix UMAP visualizer export (optional, only for drift root-cause)
     # httpx is already in main dependencies
+    "httpx>=0.27",
+    # PP13: nightly_golden_eval needs the OpenAI client for pilot agent + judge
+    "openai>=1.0",
 ]
 
 [tool.setuptools.packages.find]

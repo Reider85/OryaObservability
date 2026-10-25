@@ -177,6 +177,25 @@ PARTITION BY toYYYYMMDD(created_at)
 TTL created_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
+-- PP13 (T3.3.2): nightly golden-eval results (HA).
+CREATE TABLE IF NOT EXISTS eval_golden_results_local ON CLUSTER 'observability_cluster' (
+    nightly_ts DateTime64(3),
+    question_id String,
+    metric_name String,
+    expected_score Float64,
+    actual_score Float64,
+    pass UInt8,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = ReplicatedMergeTree(
+    '/clickhouse/observability/eval_golden_results/{shard}',
+    '{replica}'
+)
+ORDER BY (nightly_ts, question_id, metric_name)
+PARTITION BY toYYYYMMDD(nightly_ts)
+TTL nightly_ts + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
 -- Distributed tables for querying across shards (same as base setup)
 -- These reference the local ReplicatedMergeTree tables and provide
 -- automatic routing to the appropriate replica
@@ -195,6 +214,10 @@ ENGINE = Distributed('observability_cluster', 'observability', 'audit_events_hot
 -- PC34: Distributed compliance catalog hot table
 CREATE TABLE IF NOT EXISTS compliance_catalog_hot ON CLUSTER 'observability_cluster' AS compliance_catalog_hot_local
 ENGINE = Distributed('observability_cluster', 'observability', 'compliance_catalog_hot_local', tenant_id);
+
+-- PP13: Distributed golden-eval results table
+CREATE TABLE IF NOT EXISTS eval_golden_results ON CLUSTER 'observability_cluster' AS eval_golden_results_local
+ENGINE = Distributed('observability_cluster', 'observability', 'eval_golden_results_local', question_id);
 
 -- Create views for easier querying (using Distributed tables)
 -- These views provide the same interface as the base setup but use HA tables
@@ -238,4 +261,4 @@ FROM compliance_catalog_hot;
 -- Grant permissions to observability user (will be created in init script)
 -- This will be executed by the init script after creating the user
 -- The observability_user.xml provides the user definition, this grants table permissions
-GRANT SELECT, INSERT, ALTER ON TABLE spans_hot_local, span_embeddings_local, eval_results_hot_local, audit_events_hot_local, compliance_catalog_hot_local, drift_history TO observability_user ON CLUSTER 'observability_cluster';
+GRANT SELECT, INSERT, ALTER ON TABLE spans_hot_local, span_embeddings_local, eval_results_hot_local, audit_events_hot_local, compliance_catalog_hot_local, drift_history, eval_golden_results_local TO observability_user ON CLUSTER 'observability_cluster';

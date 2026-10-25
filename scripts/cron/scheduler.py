@@ -47,6 +47,7 @@ from agent_obs.storage.maintenance import (
     JOB_MIGRATE_SPANS,
     JOB_MIGRATE_TRACES,
     JOB_MIGRATE_COMPLIANCE_CATALOG_HOT_TO_WARM,
+    JOB_NIGHTLY_GOLDEN_EVAL,
     archive_expired_audit_events,
     build_cold_store,
     build_cold_trace_store,
@@ -90,6 +91,8 @@ WEEKLY_COLD_SPEC = "0 4 * * 0"  # Sunday 04:00 UTC per PC23 spec
 # PC26: threshold calibration runs once a month, just after the weekly cold
 # migration and well clear of the daily jobs' window.
 MONTHLY_CALIBRATION_SPEC = "23 5 1 * *"  # 1st of the month, 05:23 UTC
+# PP13: nightly golden eval at 03:00 UTC (after the 03:00 migration window).
+DAILY_GOLDEN_EVAL_SPEC = "0 3 * * *"
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +470,25 @@ def _phoenix_export_job() -> Awaitable[Any]:
     return _runner()
 
 
+def _nightly_golden_eval_job() -> Awaitable[Any]:
+    """PP13: nightly-batch golden eval (ticket T3.3.2).
+
+    Runs the full golden set through the pilot agent + LLM judge, writes
+    eval_golden_results to ClickHouse, and updates the
+    agent_obs_eval_golden_pass_rate gauge that GoldenEvalRegression watches.
+    """
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
+    from scripts.nightly_golden_eval import run_nightly_golden_eval
+
+    async def _runner() -> Any:
+        return await run_nightly_golden_eval(
+            dry_run=_env_flag("AGENT_OBS_CRON_DRY_RUN"),
+        )
+
+    return _runner()
+
+
 def _compliance_aggregation_job() -> Awaitable[Any]:
     """PC34: daily compliance catalog aggregation.
     
@@ -587,6 +609,12 @@ def build_jobs() -> list[CronJob]:
             os.environ.get("AGENT_OBS_CRON_COMPLIANCE_MIGRATION_SPEC", "0 5 * * 1"),  # Monday 05:00 UTC weekly
             _compliance_hot_to_warm_job,
             604800,  # 7 days in seconds (weekly)
+        ),
+        CronJob(
+            JOB_NIGHTLY_GOLDEN_EVAL,
+            os.environ.get("AGENT_OBS_CRON_GOLDEN_EVAL_SPEC", DAILY_GOLDEN_EVAL_SPEC),
+            _nightly_golden_eval_job,
+            86400,  # daily
         ),
     ]
 

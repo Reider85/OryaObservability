@@ -1,0 +1,20 @@
+# PP13 (T3.3.2): golden set — programming / general-knowledge cases.
+# Loaded together with eval/golden/capitals.yaml by scripts/nightly_golden_eval.py.
+golden_cases:
+  - id: python_hello_world
+    question: "How do I print 'Hello World' in Python?"
+    expected_answer: "To print 'Hello World' in Python, use: print('Hello World')"
+    expected_scores:
+      faithfulness: 0.80
+      answer_relevancy: 0.85
+      completeness: 0.70
+
+  - id: python_data_types
+    question: "What are Python's built-in data types?"
+    expected_answer: >-
+      Python has several built-in data types including int, float, str, list,
+      dict, tuple, set, and bool.
+    expected_scores:
+      faithfulness: 0.80
+      answer_relevancy: 0.80
+      completeness: 0.75
