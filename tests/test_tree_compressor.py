@@ -695,7 +695,7 @@ class TestCompressionPolicy:
         for i in range(15):
             status = "error" if i == 5 else "ok"
             span = test_span_factory(
-                name=f"error{i}", 
+                name=f"error{i}",
                 span_type=SpanType.AGENT_REASONING,
                 parent_span_id=parent_id,
                 status=status,
@@ -703,7 +703,7 @@ class TestCompressionPolicy:
             )
             spans.append(span)
             parent_id = span.context.span_id
-        
+    
         tree = TraceTreeBuilder().build(spans)
         policy = CompressionPolicy(max_subtree_size=20)
         compressed = policy.compress(tree)
@@ -774,14 +774,20 @@ class TestCompressionPolicy:
         policy = CompressionPolicy(max_subtree_size=20)
         
         # Mock the gauge to capture set calls
-        with patch("agent_obs.metrics.tree_compression_ratio") as mock_gauge:
-            mock_gauge.labels.return_value.set = Mock()
+        # Create a mock gauge and assign it to the module
+        mock_gauge = Mock()
+        mock_labeled_gauge = Mock()
+        mock_gauge.labels.return_value = mock_labeled_gauge
+        
+        # Patch the gauge in the tree_compressor module
+        with patch("agent_obs.tree_compressor.tree_compression_ratio", mock_gauge):
             policy.compress(tree)
+            
+            
             
             # Verify gauge was called
             mock_gauge.labels.assert_called_once_with(agent_id="test-agent")
-            mock_gauge.labels.return_value.set.assert_called_once()
-            mock_gauge.labels.return_value.set.assert_called_once()
+            mock_labeled_gauge.set.assert_called_once()
             # Check the value is between 0 and 1
-            value = mock_gauge.labels.return_value.set.call_args[0][0]
+            value = mock_labeled_gauge.set.call_args[0][0]
             assert 0.0 <= value <= 1.0

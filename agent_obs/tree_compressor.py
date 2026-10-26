@@ -153,8 +153,47 @@ def _compute_subtree_metrics(tree: TraceTree) -> tuple[dict[str, int], dict[str,
             
             size_map[node_id] = size
             error_map[node_id] = has_error
-    
+
     return size_map, error_map
+
+
+def _propagate_error_status(tree: TraceTree, error_map: dict[str, bool]) -> dict[str, bool]:
+    """Propagate error status from ancestors to descendants.
+    
+    Args:
+        tree: The trace tree
+        error_map: Initial error map from _compute_subtree_metrics
+        
+    Returns:
+        Updated error_map with error status propagated from ancestors
+    """
+    # Use BFS to propagate error status from ancestors to descendants
+    from collections import deque
+    
+    # Start propagation from each child of the root separately
+    for child in tree.children:
+        queue = deque([child])
+        
+        while queue:
+            current = queue.popleft()
+            current_id = current.root.context.span_id
+            
+            # If current node has error, propagate to all descendants
+            if error_map.get(current_id, False):
+                # Use BFS to propagate to all descendants
+                descendant_queue = deque([current])
+                while descendant_queue:
+                    node = descendant_queue.popleft()
+                    node_id = node.root.context.span_id
+                    # Mark this node as having error
+                    error_map[node_id] = True
+                    # Add children to queue for propagation
+                    descendant_queue.extend(node.children)
+            
+            # Add current node's children to main queue
+            queue.extend(current.children)
+    
+    return error_map
 
 
 def _rebuild_tree_with_compression(
@@ -162,7 +201,7 @@ def _rebuild_tree_with_compression(
     size_map: dict[str, int], 
     error_map: dict[str, bool],
     policy: "CompressionPolicy"
-) -> TraceTree:
+) -> tuple[TraceTree, int]:
     """Rebuild tree with compression applied top-down.
     
     Args:
@@ -172,17 +211,24 @@ def _rebuild_tree_with_compression(
         policy: Compression policy with threshold
     
     Returns:
-        New TraceTree with compression applied
+        Tuple of (new TraceTree with compression applied, number of new summary nodes created)
     """
+    new_summaries = 0
+
     # For non-root nodes, check if eligible for compression
     def _should_compress(node: TraceTree) -> bool:
         node_id = node.root.context.span_id
-        size = size_map[node_id]
-        has_error = error_map[node_id]
         
         # Skip if already compressed or root
         is_compressed = node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED or node.compressed
         is_root = node.root.attributes.get("tree.virtual_root") or tree.root == node
+        
+        # Skip if node_id not in size_map (already compressed tree)
+        if node_id not in size_map:
+            return False
+        
+        size = size_map[node_id]
+        has_error = error_map[node_id]
         
         return (
             not is_root and 
@@ -193,6 +239,7 @@ def _rebuild_tree_with_compression(
     
     # Recursive rebuild with compression
     def _build_compressed_children(current: TraceTree) -> list[TraceTree]:
+        nonlocal new_summaries
         children = []
         
         for child_tree in current.children:
@@ -220,9 +267,16 @@ def _rebuild_tree_with_compression(
                     compression_ratio=0.0,
                 )
                 children.append(summary_tree)
+                new_summaries += 1
             else:
-                # Recurse into child
-                children.extend(_build_compressed_children(child_tree))
+                # Keep the child node, recurse into its descendants
+                child_copy = TraceTree(
+                    root=child_tree.root,
+                    children=_build_compressed_children(child_tree),
+                    compressed=child_tree.compressed,
+                    compression_ratio=child_tree.compression_ratio,
+                )
+                children.append(child_copy)
         
         return children
     
@@ -249,7 +303,7 @@ def _rebuild_tree_with_compression(
     )
     
     _mark_compressed_nodes(new_tree)
-    return new_tree
+    return new_tree, new_summaries
 
 
 @dataclass
@@ -292,20 +346,43 @@ class CompressionPolicy:
         # Compute subtree sizes and error flags
         size_map, error_map = _compute_subtree_metrics(tree)
         
+        # Propagate error status from ancestors to descendants
+        error_map = _propagate_error_status(tree, error_map)
+        
         # Rebuild tree with compression
-        compressed_tree = _rebuild_tree_with_compression(tree, size_map, error_map, self)
+        compressed_tree, new_summaries = _rebuild_tree_with_compression(tree, size_map, error_map, self)
         
-        # Compute compression ratio
-        original_count = size_map[tree.root.context.span_id]
-        compressed_count = 0
-        
-        def count_nodes(t: TraceTree) -> None:
-            nonlocal compressed_count
-            if t.root.span_type != SpanType.AGENT_REASONING_COMPRESSED:
-                compressed_count += 1
-        
-        count_nodes(compressed_tree)
-        compression_ratio = max(0.0, min(1.0, (original_count - compressed_count) / original_count))
+        # Idempotency: if no new summaries were created, preserve existing compression_ratio
+        if new_summaries == 0 and tree.compression_ratio > 0.0:
+            compression_ratio = tree.compression_ratio
+        else:
+            # Compute compression ratio
+            # Find the original root span ID in the size_map
+            original_count = None
+            for node_id, size in size_map.items():
+                if tree.root.attributes.get("tree.virtual_root") and "virtual_root" in node_id:
+                    original_count = size
+                    break
+                elif node_id == tree.root.context.span_id:
+                    original_count = size
+                    break
+            
+            if original_count is None:
+                # Fallback: count all non-compressed nodes
+                original_count = 0
+                for node_id, size in size_map.items():
+                    if "virtual_root" not in node_id:
+                        original_count += size
+            
+            compressed_count = 0
+            
+            def count_nodes(t: TraceTree) -> None:
+                nonlocal compressed_count
+                if t.root.span_type != SpanType.AGENT_REASONING_COMPRESSED:
+                    compressed_count += 1
+            
+            count_nodes(compressed_tree)
+            compression_ratio = max(0.0, min(1.0, (original_count - compressed_count) / original_count))
         
         # Update compression ratio on all nodes
         def set_ratio(t: TraceTree) -> None:
@@ -315,15 +392,11 @@ class CompressionPolicy:
         
         set_ratio(compressed_tree)
         
-        # Update metric
+# Update metric
         agent_id = tree.root.context.agent_id or "unknown"
         tree_compression_ratio.labels(agent_id=agent_id).set(compression_ratio)
         
         return compressed_tree
-
-
-# PP17 Policy version for idempotency
-COMPRESSION_POLICY_VERSION = "1"
 
 
 def compute_tree_metrics(tree: TraceTree) -> TreeMetrics:
