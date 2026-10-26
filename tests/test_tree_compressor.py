@@ -787,3 +787,244 @@ class TestCompressionPolicy:
             # Check the value is between 0 and 1
             value = mock_labeled_gauge.set.call_args[0][0]
             assert 0.0 <= value <= 1.0
+
+
+class TestSummaryEnqueue:
+    """Test async summary enqueue functionality (PP18)."""
+    
+    def test_summary_placeholder_set(self, mock_clock, default_context, test_span_factory):
+        """Test that summary nodes get 'pending' placeholder."""
+        # Create a chain of 21 spans (will be compressed)
+        spans = []
+        parent_id = default_context.span_id
+        
+        for i in range(21):
+            span = test_span_factory(
+                mock_clock, default_context, 
+                f"step_{i}", parent_span_id, "ok"
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        
+        # Compress with queue enabled
+        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
+        compressed_tree = policy.compress(tree)
+        
+        # Check that summary node has "pending" summary
+        summary_nodes = []
+        for node in compressed_tree.iter_dfs():
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_nodes.append(node)
+        
+        assert len(summary_nodes) == 1
+        assert summary_nodes[0].root.attributes["tree.summary"] == "pending"
+    
+    def test_enqueue_called_on_compression(self, mock_clock, default_context, test_span_factory):
+        """Test that enqueue is called when creating summary nodes."""
+        # Create a chain of 21 spans
+        spans = []
+        parent_id = default_context.span_id
+        
+        for i in range(21):
+            span = test_span_factory(
+                mock_clock, default_context, 
+                f"step_{i}", parent_span_id, "ok"
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        
+        # Mock the enqueue method
+        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
+        policy._enqueue_summary_job = unittest.mock.MagicMock()
+        
+        compressed_tree = policy.compress(tree)
+        
+        # Verify enqueue was called
+        assert policy._enqueue_summary_job.called
+        call_args = policy._enqueue_summary_job.call_args
+        assert call_args[1]["trace_id"] == default_context.trace_id
+        assert call_args[1]["summary_node_id"] is not None
+        assert call_args[1]["agent_id"] == "test-agent"
+    
+    def test_enqueue_fail_open(self, mock_clock, default_context, test_span_factory):
+        """Test that compression succeeds even if enqueue fails."""
+        # Create a chain of 21 spans
+        spans = []
+        parent_id = default_context.span_id
+        
+        for i in range(21):
+            span = test_span_factory(
+                mock_clock, default_context, 
+                f"step_{i}", parent_span_id, "ok"
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        
+        # Mock enqueue to raise exception
+        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
+        policy._enqueue_summary_job = unittest.mock.MagicMock(side_effect=Exception("Redis down"))
+        
+        # Compression should still succeed
+        compressed_tree = policy.compress(tree)
+        
+        # Verify enqueue was called but failed
+        assert policy._enqueue_summary_job.called
+        assert policy._enqueue_summary_job.call_args[1]["trace_id"] == default_context.trace_id
+    
+    def test_summary_queue_disabled(self, mock_clock, default_context, test_span_factory):
+        """Test that enqueue is not called when queue is disabled."""
+        # Create a chain of 21 spans
+        spans = []
+        parent_id = default_context.span_id
+        
+        for i in range(21):
+            span = test_span_factory(
+                mock_clock, default_context, 
+                f"step_{i}", parent_span_id, "ok"
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        
+        # Mock the enqueue method
+        policy = CompressionPolicy.from_env(summary_queue_enabled=False)
+        policy._enqueue_summary_job = unittest.mock.MagicMock()
+        
+        compressed_tree = policy.compress(tree)
+        
+        # Verify enqueue was not called
+        assert not policy._enqueue_summary_job.called
+    
+    def test_idempotency_no_reenqueue(self, mock_clock, default_context, test_span_factory):
+        """Test that compressing twice doesn't enqueue again."""
+        # Create a chain of 21 spans
+        spans = []
+        parent_id = default_context.span_id
+        
+        for i in range(21):
+            span = test_span_factory(
+                mock_clock, default_context, 
+                f"step_{i}", parent_span_id, "ok"
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        
+        # Mock the enqueue method
+        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
+        policy._enqueue_summary_job = unittest.mock.MagicMock()
+        
+        # First compression
+        compressed_tree1 = policy.compress(tree)
+        
+        # Second compression (should be idempotent)
+        compressed_tree2 = policy.compress(compressed_tree1)
+        
+        # Verify enqueue was called only once
+        assert policy._enqueue_summary_job.call_count == 1
+    
+    def test_apply_late_summaries(self, mock_clock, default_context, test_span_factory):
+        """Test applying late summaries to compressed nodes."""
+        # Create a summary node manually
+        summary_span = test_span_factory(
+            mock_clock, default_context,
+            name="compressed:3", span_type=SpanType.AGENT_REASONING_COMPRESSED,
+            parent_span_id=default_context.span_id,
+            status="ok"
+        )
+        summary_span.attributes["tree.summary"] = "pending"
+        
+        summary_tree = TraceTree(
+            root=summary_span,
+            children=[],
+            compressed=True,
+            compression_ratio=0.0,
+        )
+        
+        # Apply late summaries
+        summaries = {"test_span_id": "Generated summary text"}
+        updated_tree = apply_late_summaries(summary_tree, summaries)
+        
+        # Verify summary was updated
+        assert updated_tree.root.attributes["tree.summary"] == "Generated summary text"
+    
+    def test_apply_late_summaries_missing_summary(self, mock_clock, default_context, test_span_factory):
+        """Test that nodes without summaries remain 'pending'."""
+        # Create a summary node manually
+        summary_span = test_span_factory(
+            mock_clock, default_context,
+            name="compressed:3", span_type=SpanType.AGENT_REASONING_COMPRESSED,
+            parent_span_id=default_context.span_id,
+            status="ok"
+        )
+        summary_span.attributes["tree.summary"] = "pending"
+        
+        summary_tree = TraceTree(
+            root=summary_span,
+            children=[],
+            compressed=True,
+            compression_ratio=0.0,
+        )
+        
+        # Apply late summaries (missing this node)
+        summaries = {"other_id": "Some other summary"}
+        updated_tree = apply_late_summaries(summary_tree, summaries)
+        
+        # Verify summary remains pending
+        assert updated_tree.root.attributes["tree.summary"] == "pending"
+    
+    def test_apply_late_summaries_already_final(self, mock_clock, default_context, test_span_factory):
+        """Test that final summaries are not overwritten."""
+        # Create a summary node with final summary
+        summary_span = test_span_factory(
+            mock_clock, default_context,
+            name="compressed:3", span_type=SpanType.AGENT_REASONING_COMPRESSED,
+            parent_span_id=default_context.span_id,
+            status="ok"
+        )
+        summary_span.attributes["tree.summary"] = "Final summary"
+        
+        summary_tree = TraceTree(
+            root=summary_span,
+            children=[],
+            compressed=True,
+            compression_ratio=0.0,
+        )
+        
+        # Apply late summaries (different summary)
+        summaries = {"test_span_id": "New summary"}
+        updated_tree = apply_late_summaries(summary_tree, summaries)
+        
+        # Verify original summary is preserved
+        assert updated_tree.root.attributes["tree.summary"] == "Final summary"
+    
+    def test_compute_subtree_content_hash_deterministic(self, mock_clock, default_context, test_span_factory):
+        """Test that content hash is deterministic for same content."""
+        # Create two identical spans
+        span1 = test_span_factory(
+            mock_clock, default_context,
+            name="step1", parent_span_id=default_context.span_id,
+            status="ok"
+        )
+        span1.attributes["reasoning"] = "First step"
+        
+        span2 = test_span_factory(
+            mock_clock, default_context,
+            name="step1", parent_span_id=default_context.span_id,
+            status="ok"
+        )
+        span2.attributes["reasoning"] = "First step"
+        
+        # Hash should be the same
+        hash1 = compute_subtree_content_hash([span1])
+        hash2 = compute_subtree_content_hash([span2])
+        
+        assert hash1 == hash2

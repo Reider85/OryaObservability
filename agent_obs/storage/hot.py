@@ -133,10 +133,10 @@ class HotStore:
             SELECT trace_id, eval_id, eval_name, eval_timestamp, eval_latency_seconds,
                    scores, judge_model, judge_prompt_sha256, reasoning, flags
             FROM eval_results_hot
-            WHERE trace_id = %s
+            WHERE trace_id = %(trace_id)s
             ORDER BY eval_timestamp DESC
             """,
-            [trace_id],
+            {"trace_id": trace_id},
         )
 
         results: list[EvalResult] = []
@@ -153,10 +153,66 @@ class HotStore:
                     judge_model=row[6] or "",
                     judge_prompt_sha256=row[7] or "",
                     reasoning=row[8] or "",
-                    flags=row[9] if row[9] else [],
+                    flags=row[9] if isinstance(row[9], list) else [],
                 )
             )
+
         return results
+
+    def write_tree_summary(self, trace_id: str, node_span_id: str, summary: str,
+                           policy_version: str, subtree_size: int, total_cost: float) -> None:
+        """Write a tree summary to the tree_summaries table.
+        
+        Args:
+            trace_id: Trace ID
+            node_span_id: Span ID of the compressed summary node
+            summary: LLM-generated summary text
+            policy_version: Compression policy version used
+            subtree_size: Number of spans in the original subtree
+            total_cost: Total cost of the original subtree
+        """
+        client = self._get_client()
+        client.execute(
+            """
+            INSERT INTO tree_summaries
+            (trace_id, node_span_id, summary, policy_version, subtree_size, total_cost)
+            VALUES
+            """,
+            [(trace_id, node_span_id, summary, policy_version, subtree_size, total_cost)],
+        )
+
+    def get_tree_summaries(self, trace_id: str) -> list[dict]:
+        """Retrieve all tree summaries for a trace from tree_summaries.
+        
+        Args:
+            trace_id: Trace ID to query
+            
+        Returns:
+            List of summary dicts with node_span_id, summary, policy_version, etc.
+        """
+        client = self._get_client()
+        rows = client.execute(
+            """
+            SELECT trace_id, node_span_id, summary, policy_version, subtree_size, total_cost
+            FROM tree_summaries
+            WHERE trace_id = %(trace_id)s
+            ORDER BY created_at DESC
+            """,
+            {"trace_id": trace_id},
+        )
+        
+        summaries = []
+        for row in rows:
+            summaries.append({
+                "trace_id": row[0],
+                "node_span_id": row[1],
+                "summary": row[2],
+                "policy_version": row[3],
+                "subtree_size": row[4],
+                "total_cost": row[5],
+            })
+        
+        return summaries
 
     def write_spans_batch(self, spans: list[dict]) -> None:
         """Write a batch of span dicts to spans_hot table.

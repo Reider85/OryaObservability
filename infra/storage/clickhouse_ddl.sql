@@ -106,6 +106,24 @@ ORDER BY (trace_id, eval_id, eval_name, eval_timestamp)
 TTL eval_timestamp + INTERVAL 14 DAY
 SETTINGS index_granularity = 8192;
 
+-- tree_summaries table: async LLM summaries for compressed nodes (PP18)
+--
+-- Stores generated summaries for compressed reasoning subtrees.
+-- TTL matches eval_results_hot (14 days) for consistent cleanup.
+CREATE TABLE IF NOT EXISTS tree_summaries (
+    trace_id String,
+    node_span_id String,
+    summary String,
+    policy_version String,
+    subtree_size Int32,
+    total_cost Float64,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(created_at)
+ORDER BY (trace_id, node_span_id)
+TTL created_at + INTERVAL 14 DAY
+SETTINGS index_granularity = 8192;
+
 -- audit_events_hot table: security audit events for hot tier
 --
 -- Same INVARIANT as eval_results_hot (PC21): the hot TTL must outlast the cron

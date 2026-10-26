@@ -11,6 +11,60 @@ from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel
 
 from agent_obs.eval.late_annotation import get_eval_results
+from agent_obs.observability import Span, SpanContext
+
+def _dicts_to_spans(span_dicts: list[dict]) -> list[Span]:
+    """Convert ClickHouse span dicts to Span objects.
+    
+    Args:
+        span_dicts: List of span dicts from HotStore.get_spans()
+        
+    Returns:
+        List of Span objects with reconstructed contexts
+    """
+    spans = []
+    
+    for span_dict in span_dicts:
+        # Convert datetime to float timestamp
+        start_time = span_dict.get("start_time", 0.0)
+        if isinstance(start_time, datetime):
+            start_time = start_time.timestamp()
+        
+        end_time = span_dict.get("end_time", 0.0)
+        if isinstance(end_time, datetime):
+            end_time = end_time.timestamp()
+        
+        # Reconstruct SpanContext
+        context = SpanContext(
+            trace_id=span_dict.get("trace_id", ""),
+            span_id=span_dict.get("span_id", ""),
+            parent_span_id=span_dict.get("parent_span_id") or None,
+            agent_id=span_dict.get("agent_id", ""),
+            tenant_id=span_dict.get("tenant_id", ""),
+            user_id=span_dict.get("user_id", ""),
+            session_id=span_dict.get("session_id", ""),
+            tool_name=span_dict.get("tool_name", ""),
+        )
+        
+        # Ensure status is in attributes
+        attributes = span_dict.get("attributes", {})
+        if "status" not in attributes:
+            attributes["status"] = span_dict.get("status", "")
+        
+        span = Span(
+            name=span_dict.get("name", ""),
+            span_type=span_dict.get("span_type", ""),
+            context=context,
+            attributes=attributes,
+            events=span_dict.get("events", []),
+            start_time=start_time,
+            end_time=end_time,
+        )
+        
+        spans.append(span)
+    
+    return spans
+
 
 app = FastAPI(
     title="Agent Observability Eval API",
@@ -32,6 +86,12 @@ class SamplerRateHistoryResponse(BaseModel):
     """Response model for sampler rate-change audit history (PC31)."""
     events: list[dict[str, Any]]
     count: int
+
+
+class TraceTreeResponse(BaseModel):
+    """Response model for trace tree with compression and summaries."""
+    trace_id: str
+    tree: dict[str, Any]
 
 
 def _parse_range_bound(value: str, *, end_of_day: bool = False) -> datetime:
@@ -180,6 +240,67 @@ async def get_trace_eval_results(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to retrieve eval results: {str(e)}"
+        )
+
+
+@app.get("/api/v1/traces/{trace_id}/tree", response_model=TraceTreeResponse)
+async def get_trace_tree(
+    trace_id: str = Path(..., description="The trace ID to build tree for")
+) -> TraceTreeResponse:
+    """Build trace tree with compression and late summaries.
+    
+    Returns a TraceTree with compression applied and LLM summaries merged.
+    Returns empty tree if no spans found for the trace.
+    """
+    try:
+        from agent_obs.storage.hot import HotStore
+        from agent_obs.tree_compressor import TraceTreeBuilder, CompressionPolicy, apply_late_summaries
+
+        # Create hot store (ClickHouse)
+        hot_store = HotStore()
+        redis_client = None
+
+        # Get spans from ClickHouse
+        loop = asyncio.get_running_loop()
+        spans = await loop.run_in_executor(None, hot_store.get_spans, trace_id)
+        
+        if not spans:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No spans found for trace {trace_id}"
+            )
+        
+        # Convert dicts to Span objects
+        sdk_spans = _dicts_to_spans(spans)
+        
+        # Build trace tree
+        tree_builder = TraceTreeBuilder()
+        tree = tree_builder.build(sdk_spans)
+        
+        # Apply compression (with queue disabled for read path)
+        policy = CompressionPolicy.from_env()
+        policy.summary_queue_enabled = False  # Don't enqueue from read path
+        compressed_tree = policy.compress(tree)
+        
+        # Get late summaries and apply them
+        summaries = hot_store.get_tree_summaries(trace_id)
+        summaries_map = {s["node_span_id"]: s["summary"] for s in summaries}
+        final_tree = apply_late_summaries(compressed_tree, summaries_map)
+        
+        return TraceTreeResponse(
+            trace_id=trace_id,
+            tree=final_tree.to_dict()
+        )
+        
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="ClickHouse unavailable. Trace tree temporarily unavailable."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to build trace tree: {str(e)}"
         )
 
 

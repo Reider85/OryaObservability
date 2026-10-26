@@ -416,3 +416,10 @@ tree_compression_ratio = Gauge(
     "Ratio of compressed spans to total spans in tree (0..1)",
     ["agent_id"],
 )
+
+# PP18 Async LLM summary pending count (counter)
+tree_compression_summary_pending_total = Counter(
+    "tree_compression_summary_pending_total",
+    "Count of compressed nodes awaiting async LLM summary (PP18)",
+    ["agent_id"],
+)

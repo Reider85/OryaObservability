@@ -101,6 +101,24 @@ ORDER BY (trace_id, eval_id, eval_name, eval_timestamp)
 TTL eval_timestamp + INTERVAL 14 DAY
 SETTINGS index_granularity = 8192;
 
+-- Local table for tree_summaries on shard 1 with ReplicatedReplacingMergeTree (HA)
+CREATE TABLE IF NOT EXISTS tree_summaries_local ON CLUSTER 'observability_cluster' (
+    trace_id String,
+    node_span_id String,
+    summary String,
+    policy_version String,
+    subtree_size Int32,
+    total_cost Float64,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = ReplicatedReplacingMergeTree(
+    '/clickhouse/observability/tree_summaries/{shard}',
+    '{replica}'
+)
+ORDER BY (trace_id, node_span_id)
+TTL created_at + INTERVAL 14 DAY
+SETTINGS index_granularity = 8192;
+
 -- Local table for audit_events_hot on shard 1 with ReplicatedMergeTree (HA)
 CREATE TABLE IF NOT EXISTS audit_events_hot_local ON CLUSTER 'observability_cluster' (
     audit_id String,
@@ -208,6 +226,9 @@ ENGINE = Distributed('observability_cluster', 'observability', 'span_embeddings_
 CREATE TABLE IF NOT EXISTS eval_results_hot ON CLUSTER 'observability_cluster' AS eval_results_hot_local
 ENGINE = Distributed('observability_cluster', 'observability', 'eval_results_hot_local', tenant_id);
 
+CREATE TABLE IF NOT EXISTS tree_summaries ON CLUSTER 'observability_cluster' AS tree_summaries_local
+ENGINE = Distributed('observability_cluster', 'observability', 'tree_summaries_local', tenant_id);
+
 CREATE TABLE IF NOT EXISTS audit_events_hot ON CLUSTER 'observability_cluster' AS audit_events_hot_local
 ENGINE = Distributed('observability_cluster', 'observability', 'audit_events_hot_local', tenant_id);
 
@@ -261,4 +282,4 @@ FROM compliance_catalog_hot;
 -- Grant permissions to observability user (will be created in init script)
 -- This will be executed by the init script after creating the user
 -- The observability_user.xml provides the user definition, this grants table permissions
-GRANT SELECT, INSERT, ALTER ON TABLE spans_hot_local, span_embeddings_local, eval_results_hot_local, audit_events_hot_local, compliance_catalog_hot_local, drift_history, eval_golden_results_local TO observability_user ON CLUSTER 'observability_cluster';
+GRANT SELECT, INSERT, ALTER ON TABLE spans_hot_local, span_embeddings_local, eval_results_hot_local, tree_summaries_local, audit_events_hot_local, compliance_catalog_hot_local, drift_history, eval_golden_results_local TO observability_user ON CLUSTER 'observability_cluster';

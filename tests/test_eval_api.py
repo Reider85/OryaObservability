@@ -414,3 +414,284 @@ def kwargs_or_limit(call_args) -> int:
     if call_args.kwargs and "limit" in call_args.kwargs:
         return call_args.kwargs["limit"]
     return call_args.args[2] if len(call_args.args) > 2 else 1000
+
+
+class TestTraceTreeEndpoint:
+    """Test /api/v1/traces/{trace_id}/tree endpoint."""
+    
+    def test_get_trace_tree_success(self, client: TestClient) -> None:
+        """Test successful trace tree retrieval with compression and summaries."""
+        # Mock data
+        mock_spans = [
+            {
+                "trace_id": "test_trace",
+                "span_id": "root",
+                "parent_span_id": "",
+                "agent_id": "test-agent",
+                "name": "root",
+                "span_type": "agent.loop",
+                "start_time": "2026-10-26T10:00:00Z",
+                "end_time": "2026-10-26T10:01:00Z",
+                "status": "ok",
+                "attributes": {"input": "test input"},
+                "events": [],
+                "cost_usd": 0.01,
+                "response_embedding": [],
+            },
+            {
+                "trace_id": "test_trace",
+                "span_id": "step1",
+                "parent_span_id": "root",
+                "agent_id": "test-agent",
+                "name": "step1",
+                "span_type": "agent.reasoning",
+                "start_time": "2026-10-26T10:00:30Z",
+                "end_time": "2026-10-26T10:00:45Z",
+                "status": "ok",
+                "attributes": {"reasoning": "First step", "output": "intermediate"},
+                "events": [],
+                "cost_usd": 0.005,
+                "response_embedding": [],
+            },
+            {
+                "trace_id": "test_trace",
+                "span_id": "step2",
+                "parent_span_id": "root",
+                "agent_id": "test-agent",
+                "name": "step2",
+                "span_type": "agent.reasoning",
+                "start_time": "2026-10-26T10:00:46Z",
+                "end_time": "2026-10-26T10:01:00Z",
+                "status": "ok",
+                "attributes": {"reasoning": "Second step", "output": "final"},
+                "events": [],
+                "cost_usd": 0.005,
+                "response_embedding": [],
+            }
+        ]
+        
+        # Mock tree_summaries (no summaries for this test)
+        mock_summaries = []
+        
+        # Mock the components
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
+            mock_hot_store = MagicMock()
+            mock_hot_store_class.return_value = mock_hot_store
+            mock_hot_store.get_spans.return_value = mock_spans
+            mock_hot_store.get_tree_summaries.return_value = mock_summaries
+            
+            with patch("agent_obs.tree_compressor.TraceTreeBuilder") as mock_builder_class, \
+                 patch("agent_obs.tree_compressor.CompressionPolicy") as mock_policy_class, \
+                 patch("agent_obs.tree_compressor.apply_late_summaries") as mock_apply:
+                
+                # Mock tree building and compression
+                mock_tree = MagicMock()
+                mock_tree.to_dict.return_value = {
+                    "root": {"name": "root", "span_type": "agent.loop"},
+                    "children": [
+                        {"root": {"name": "compressed:2", "span_type": "agent.reasoning.compressed"}, "children": []}
+                    ],
+                    "compressed": True,
+                    "compression_ratio": 0.5
+                }
+                mock_builder_class.return_value.build.return_value = mock_tree
+                
+                mock_policy = MagicMock()
+                mock_policy.compress.return_value = mock_tree
+                mock_policy_class.from_env.return_value = mock_policy
+                
+                mock_apply.return_value = mock_tree
+                
+                # Make the request
+                response = client.get("/api/v1/traces/test_trace/tree")
+                
+                # Verify response
+                assert response.status_code == 200
+                data = response.json()
+                assert data["trace_id"] == "test_trace"
+                assert "tree" in data
+                assert data["tree"]["compressed"] is True
+                assert data["tree"]["compression_ratio"] == 0.5
+                
+                # Verify mocks
+                mock_hot_store.get_spans.assert_called_once_with("test_trace")
+                mock_hot_store.get_tree_summaries.assert_called_once_with("test_trace")
+                mock_builder_class.return_value.build.assert_called_once()
+                mock_policy_class.from_env.assert_called_once()
+                mock_policy.compress.assert_called_once()
+                mock_apply.assert_called_once()
+    
+    def test_get_trace_tree_with_summaries(self, client: TestClient) -> None:
+        """Test trace tree retrieval with late summaries applied."""
+        # Mock spans (simple chain that will be compressed)
+        mock_spans = [
+            {
+                "trace_id": "test_trace",
+                "span_id": "root",
+                "parent_span_id": "",
+                "agent_id": "test-agent",
+                "name": "root",
+                "span_type": "agent.loop",
+                "start_time": "2026-10-26T10:00:00Z",
+                "end_time": "2026-10-26T10:01:00Z",
+                "status": "ok",
+                "attributes": {},
+                "events": [],
+                "cost_usd": 0.01,
+                "response_embedding": [],
+            },
+            {
+                "trace_id": "test_trace",
+                "span_id": "step1",
+                "parent_span_id": "root",
+                "agent_id": "test-agent",
+                "name": "step1",
+                "span_type": "agent.reasoning",
+                "start_time": "2026-10-26T10:00:30Z",
+                "end_time": "2026-10-26T10:00:45Z",
+                "status": "ok",
+                "attributes": {"reasoning": "First step"},
+                "events": [],
+                "cost_usd": 0.005,
+                "response_embedding": [],
+            },
+            {
+                "trace_id": "test_trace",
+                "span_id": "step2",
+                "parent_span_id": "root",
+                "agent_id": "test-agent",
+                "name": "step2",
+                "span_type": "agent.reasoning",
+                "start_time": "2026-10-26T10:00:46Z",
+                "end_time": "2026-10-26T10:01:00Z",
+                "status": "ok",
+                "attributes": {"reasoning": "Second step"},
+                "events": [],
+                "cost_usd": 0.005,
+                "response_embedding": [],
+            }
+        ]
+        
+        # Mock tree_summaries with a summary
+        mock_summaries = [
+            {
+                "trace_id": "test_trace",
+                "node_span_id": "step1",
+                "summary": "Generated summary for steps",
+                "policy_version": "1",
+                "subtree_size": 2,
+                "total_cost": 0.01
+            }
+        ]
+        
+        # Mock the components
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
+            mock_hot_store = MagicMock()
+            mock_hot_store_class.return_value = mock_hot_store
+            mock_hot_store.get_spans.return_value = mock_spans
+            mock_hot_store.get_tree_summaries.return_value = mock_summaries
+            
+            with patch("agent_obs.tree_compressor.TraceTreeBuilder") as mock_builder_class, \
+                 patch("agent_obs.tree_compressor.CompressionPolicy") as mock_policy_class, \
+                 patch("agent_obs.tree_compressor.apply_late_summaries") as mock_apply:
+                
+                # Mock tree building and compression
+                mock_tree = MagicMock()
+                mock_tree.to_dict.return_value = {
+                    "root": {"name": "root", "span_type": "agent.loop"},
+                    "children": [
+                        {
+                            "root": {
+                                "name": "compressed:2", 
+                                "span_type": "agent.reasoning.compressed",
+                                "attributes": {"tree.summary": "pending"}
+                            }, 
+                            "children": []
+                        }
+                    ],
+                    "compressed": True,
+                    "compression_ratio": 0.5
+                }
+                mock_builder_class.return_value.build.return_value = mock_tree
+                
+                mock_policy = MagicMock()
+                mock_policy.compress.return_value = mock_tree
+                mock_policy_class.from_env.return_value = mock_policy
+                
+                # Mock apply_late_summaries to return tree with updated summary
+                updated_tree = MagicMock()
+                updated_tree.to_dict.return_value = {
+                    "root": {"name": "root", "span_type": "agent.loop"},
+                    "children": [
+                        {
+                            "root": {
+                                "name": "compressed:2", 
+                                "span_type": "agent.reasoning.compressed",
+                                "attributes": {"tree.summary": "Generated summary for steps"}
+                            }, 
+                            "children": []
+                        }
+                    ],
+                    "compressed": True,
+                    "compression_ratio": 0.5
+                }
+                mock_apply.return_value = updated_tree
+                
+                # Make the request
+                response = client.get("/api/v1/traces/test_trace/tree")
+                
+                # Verify response
+                assert response.status_code == 200
+                data = response.json()
+                assert data["trace_id"] == "test_trace"
+                assert data["tree"]["children"][0]["root"]["attributes"]["tree.summary"] == "Generated summary for steps"
+                
+                # Verify apply_late_summaries was called with the right summaries
+                mock_apply.assert_called_once()
+                call_args = mock_apply.call_args[0]
+                summaries_arg = call_args[1]
+                assert summaries_arg["step1"] == "Generated summary for steps"
+    
+    def test_get_trace_tree_empty(self, client: TestClient) -> None:
+        """Test trace tree retrieval with no spans found."""
+        # Mock empty spans
+        mock_spans = []
+        
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
+            mock_hot_store = MagicMock()
+            mock_hot_store_class.return_value = mock_hot_store
+            mock_hot_store.get_spans.return_value = mock_spans
+            
+            # Make the request
+            response = client.get("/api/v1/traces/nonexistent_trace/tree")
+            
+            # Verify response
+            assert response.status_code == 404
+            assert "No spans found" in response.json()["detail"]
+    
+    def test_get_trace_tree_clickhouse_error(self, client: TestClient) -> None:
+        """Test trace tree retrieval when ClickHouse is unavailable."""
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
+            mock_hot_store_class.side_effect = Exception("Connection failed")
+            
+            # Make the request
+            response = client.get("/api/v1/traces/test_trace/tree")
+            
+            # Verify response
+            assert response.status_code == 500
+            assert "Failed to build trace tree" in response.json()["detail"]
+    
+    def test_get_trace_tree_connect_error(self, client: TestClient) -> None:
+        """Test trace tree retrieval when ClickHouse connection fails."""
+        with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
+            # Import httpx here to avoid import issues when not testing
+            import httpx
+            
+            mock_hot_store_class.side_effect = httpx.ConnectError("Connection refused")
+            
+            # Make the request
+            response = client.get("/api/v1/traces/test_trace/tree")
+            
+            # Verify response
+            assert response.status_code == 503
+            assert "ClickHouse unavailable" in response.json()["detail"]

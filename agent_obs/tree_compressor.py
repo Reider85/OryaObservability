@@ -8,6 +8,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 
+import hashlib
 from agent_obs.metrics import tree_compression_ratio
 from agent_obs.observability import Span, SpanContext, SpanType
 
@@ -100,7 +101,7 @@ def make_summary_node(replaced: TraceTree, subtree_size: int, total_cost: float)
         "tree.children_count": subtree_size,
         "tree.total_cost": total_cost,
         "tree.error_count": 0,  # Error subtrees never compressed
-        "tree.summary": "",  # Placeholder; PP18 will set "pending"
+        "tree.summary": "pending",  # PP18: async LLM summary placeholder
         "tree.policy_version": COMPRESSION_POLICY_VERSION,
     }
     
@@ -268,6 +269,13 @@ def _rebuild_tree_with_compression(
                 )
                 children.append(summary_tree)
                 new_summaries += 1
+                
+                # Enqueue async LLM summary job (PP18)
+                policy._enqueue_summary_job(
+                    trace_id=child_tree.root.context.trace_id,
+                    summary_node_id=child_id,
+                    agent_id=child_tree.root.context.agent_id or "unknown",
+                )
             else:
                 # Keep the child node, recurse into its descendants
                 child_copy = TraceTree(
@@ -315,6 +323,8 @@ class CompressionPolicy:
     
     max_subtree_size: int
     policy_version: str = COMPRESSION_POLICY_VERSION
+    summary_queue_enabled: bool = True
+    redis_url: str | None = None
     
     @classmethod
     def from_env(cls, policy_version: str = COMPRESSION_POLICY_VERSION) -> CompressionPolicy:
@@ -332,7 +342,16 @@ class CompressionPolicy:
             warnings.warn(f"Invalid TREE_COMPRESSION_THRESHOLD: {e}, using default {default_size}")
             env_size = default_size
         
-        return cls(max_subtree_size=env_size, policy_version=policy_version)
+        # Read summary queue config
+        summary_enabled = os.environ.get("AGENT_OBS_TREE_SUMMARY_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+        redis_url = os.environ.get("EVAL_REDIS_URL", "redis://localhost:6379/1")
+        
+        return cls(
+            max_subtree_size=env_size,
+            policy_version=policy_version,
+            summary_queue_enabled=summary_enabled,
+            redis_url=redis_url,
+        )
     
     def compress(self, tree: TraceTree) -> TraceTree:
         """Compress tree by replacing subtrees > max_subtree_size with summary nodes.
@@ -394,6 +413,49 @@ class CompressionPolicy:
         tree_compression_ratio.labels(agent_id=agent_id).set(compression_ratio)
         
         return compressed_tree
+    
+    def _enqueue_summary_job(self, trace_id: str, summary_node_id: str, agent_id: str) -> None:
+        """Enqueue async LLM summary job for a compressed node.
+        
+        Args:
+            trace_id: Trace ID containing the summary node
+            summary_node_id: Span ID of the compressed summary node
+            agent_id: Agent ID for metrics
+        """
+        if not self.summary_queue_enabled:
+            return
+        
+        try:
+            import rq
+            from agent_obs.metrics import tree_compression_summary_pending_total
+            
+            # Create Redis connection
+            redis_client = rq.Redis.from_url(self.redis_url)
+            queue = rq.Queue(name="eval-queue", connection=redis_client)
+            
+            # Enqueue the summary job
+            queue.enqueue(
+                "agent_obs.eval.tree_summary_worker.tree_summary_worker",
+                kwargs={
+                    "trace_id": trace_id,
+                    "summary_node_id": summary_node_id,
+                },
+                meta={"priority": 0},  # Low priority
+            )
+            
+            # Increment pending metric
+            tree_compression_summary_pending_total.labels(agent_id=agent_id).inc()
+            
+        except Exception as e:
+            # Fail-open: log warning, compression still succeeds
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Failed to enqueue summary job for trace=%s node=%s: %s",
+                trace_id,
+                summary_node_id,
+                str(e),
+            )
 
 
 def compute_tree_metrics(tree: TraceTree) -> TreeMetrics:
@@ -435,6 +497,74 @@ def compute_tree_metrics(tree: TraceTree) -> TreeMetrics:
         leaf_count=state.leaf_count,
         error_leaf_count=state.error_leaf_count,
     )
+
+
+def compute_subtree_content_hash(spans: list[Span]) -> str:
+    """Compute deterministic SHA256 hash of subtree content for caching.
+    
+    Args:
+        spans: List of spans in the subtree (sorted by start_time)
+        
+    Returns:
+        SHA256 hash string
+    """
+    # Sort spans by start_time for deterministic ordering
+    sorted_spans = sorted(spans, key=lambda s: s.start_time)
+    
+    # Collect text content from span attributes
+    content_parts = []
+    for span in sorted_spans:
+        # Extract string attributes, excluding metadata keys
+        metadata_keys = {
+            "status", "tree.compressed", "tree.children_count", "tree.total_cost",
+            "tree.error_count", "tree.summary", "tree.policy_version",
+            "aggregation.children_count", "aggregation.bytes_saved", "aggregation.source",
+            "cost.usd", "cost.usd_sum", "cost.tokens", "cost.tokens_sum",
+            "guardrail.redacted_fields", "guardrail.verdicts"
+        }
+        
+        for key, value in span.attributes.items():
+            if key not in metadata_keys and isinstance(value, str) and value:
+                content_parts.append(f"{key}:{value}")
+        
+        # Add events content for aggregated spans
+        if span.events:
+            for event in span.events:
+                for attr_key, attr_value in event.attributes.items():
+                    if attr_key not in metadata_keys and isinstance(attr_value, str) and attr_value:
+                        content_parts.append(f"event.{attr_key}:{attr_value}")
+    
+    # Concatenate all content parts and compute hash
+    full_content = "|".join(content_parts)
+    return hashlib.sha256(full_content.encode("utf-8")).hexdigest()
+
+
+def apply_late_summaries(tree: TraceTree, summaries: dict[str, str]) -> TraceTree:
+    """Apply late LLM summaries to compressed nodes.
+    
+    Args:
+        tree: TraceTree to update
+        summaries: Mapping from node_span_id to summary text
+        
+    Returns:
+        Updated TraceTree with summaries applied
+    """
+    def _apply_to_node(node: TraceTree) -> None:
+        # Check if this is a compressed node with pending summary
+        if (node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED and
+            node.root.attributes.get("tree.summary") == "pending"):
+            
+            node_id = node.root.context.span_id
+            if node_id in summaries:
+                # Replace pending summary with final summary
+                node.root.attributes["tree.summary"] = summaries[node_id]
+        
+        # Recursively apply to children
+        for child in node.children:
+            _apply_to_node(child)
+    
+    _apply_to_node(tree)
+    return tree
 
 
 class TraceTreeBuilder:
