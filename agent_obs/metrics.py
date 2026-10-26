@@ -423,3 +423,10 @@ tree_compression_summary_pending_total = Counter(
     "Count of compressed nodes awaiting async LLM summary (PP18)",
     ["agent_id"],
 )
+
+# PP20 Embedded subtree ratio (gauge)
+tree_embedded_ratio = Gauge(
+    "tree_embedded_ratio",
+    "Fraction of tree nodes with embedded subtree (0..1)",
+    ["agent_id"],
+)

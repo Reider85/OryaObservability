@@ -110,6 +110,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_TLS_CA` / `_CERT` / `_KEY` | — | mTLS material for exporters (PP02). |
 | `AGENT_OBS_EVAL_ADAPTIVE_SAMPLER` | `false` | Enable adaptive eval sampler in LLM judge when a judge is supplied. PP14. |
 | `TREE_COMPRESSION_THRESHOLD` | `20` | PP17: Max subtree size before compression to summary node (tree compression). |
+| `TREE_EMBEDDED_SIZE` | `10` | PP20: Max leaf-children embedded into parent events (matreshka). |
 | `AGENT_OBS_TREE_SUMMARY_ENABLED` | `true` | Enable async LLM summary generation for compressed nodes (PP18). |
 | `AGENT_OBS_TREE_SUMMARY_CACHE_TTL` | `604800` | Redis TTL for tree summary cache in seconds (PP18). |
 | `AGENT_OBS_EVAL_INCIDENT_RATE_LIMIT` | `100` | Max incident eval jobs per minute (Redis-based rate limiter). PP14. |

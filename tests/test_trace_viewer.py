@@ -435,9 +435,122 @@ class TestTraceViewer:
         assert "This is a summary of the reasoning process" in html_content
         assert "Summary:" in html_content
     
+    def test_trace_view_with_embedded_node(self):
+        """Test trace view with embedded node rendering (PP20)."""
+        embedded_trace = [
+            {
+                "trace_id": "embedded_trace",
+                "span_id": "root_1",
+                "parent_span_id": "",
+                "name": "agent.loop",
+                "span_type": "agent.loop",
+                "start_time": 1705326600.0,
+                "end_time": 1705326602.0,
+                "status": "ok",
+                "attributes": {"agent_id": "test-agent"},
+                "events": []
+            },
+            {
+                "trace_id": "embedded_trace",
+                "span_id": "parent_1",
+                "parent_span_id": "root_1",
+                "name": "parent",
+                "span_type": "agent.reasoning",
+                "start_time": 1705326602.0,
+                "end_time": 1705326603.0,
+                "status": "ok",
+                "attributes": {
+                    "agent_id": "test-agent",
+                    "embedded": True,
+                    "embedded_count": 2
+                },
+                "events": [
+                    {
+                        "name": "child0",
+                        "timestamp": "2024-01-15T10:30:02.000Z",
+                        "attributes": {
+                            "span_id": "child_0",
+                            "parent_span_id": "parent_1",
+                            "span_type": "agent.reasoning",
+                            "status": "ok",
+                            "embedded": True,
+                            "reasoning": "first"
+                        }
+                    },
+                    {
+                        "name": "child1",
+                        "timestamp": "2024-01-15T10:30:03.000Z",
+                        "attributes": {
+                            "span_id": "child_1",
+                            "parent_span_id": "parent_1",
+                            "span_type": "agent.reasoning",
+                            "status": "error",
+                            "embedded": True,
+                            "reasoning": "second"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        HotStoreFactory._mock_hot_store.spans_data = {
+            "embedded_trace": embedded_trace
+        }
+        
+        response = self.client.get("/trace/embedded_trace")
+        assert response.status_code == 200
+        html_content = response.text
+        
+        # Check that embedded node is rendered with badge
+        assert "parent" in html_content
+        assert "embedded-badge" in html_content
+        assert "EMBEDDED (2)" in html_content
+        
+        # Check that embedded events are rendered inline (server-side)
+        assert "child0" in html_content
+        assert "child1" in html_content
+        assert "first" in html_content
+        assert "second" in html_content
+        
+        # Check JS embedded handling is present (inline render, no fetch)
+        assert "renderEmbeddedEventsSection" in html_content
+    
+    def test_embedded_events_inline_no_fetch(self):
+        """Test that embedded spans render events from span.events without fetch (PP20)."""
+        from agent_obs.trace_viewer.ui import build_span_tree, render_span_tree
+        
+        embedded_span = {
+            "trace_id": "t1",
+            "span_id": "p1",
+            "parent_span_id": "",
+            "name": "parent",
+            "span_type": "agent.reasoning",
+            "start_time": 1705326600.0,
+            "end_time": 1705326601.0,
+            "status": "ok",
+            "attributes": {"embedded": True, "embedded_count": 1},
+            "events": [
+                {
+                    "name": "child",
+                    "timestamp": "2024-01-15T10:30:00.000Z",
+                    "attributes": {"span_id": "c1", "embedded": True, "status": "ok"}
+                }
+            ]
+        }
+        
+        tree = build_span_tree([embedded_span])
+        html = render_span_tree(tree, expand_events=False)
+        
+        # Server-side: embedded badge and inline events section rendered
+        assert "EMBEDDED (1)" in html
+        assert "child" in html
+        # Events section starts hidden (lazy render)
+        assert 'display: none' in html
+    
     def test_trace_view_with_large_compressed_tree(self):
-        """Test trace view with large compressed tree (compression threshold test)"""
-        # Create a large trace that should trigger compression
+        """Test trace view renders a large trace (HTML endpoint does not compress — compression is in /tree API)."""
+        # Create a large trace
         large_trace = []
         
         # Root node
@@ -454,7 +567,7 @@ class TestTraceViewer:
             "events": []
         })
         
-        # Many reasoning steps (should trigger compression)
+        # Many reasoning steps
         for i in range(25):
             large_trace.append({
                 "trace_id": "large_trace",
@@ -474,12 +587,10 @@ class TestTraceViewer:
             "large_trace": large_trace
         }
         
-        # Lower compression threshold for testing
-        with patch.dict(os.environ, {'TREE_COMPRESSION_THRESHOLD': '5'}):
-            response = self.client.get("/trace/large_trace")
-            assert response.status_code == 200
-            html_content = response.text
-            
-            # Should show compressed node
-            assert "compressed:25" in html_content
-            assert "compressed-badge" in html_content
+        response = self.client.get("/trace/large_trace")
+        assert response.status_code == 200
+        html_content = response.text
+        
+        # HTML endpoint renders raw spans (no compression); all steps visible
+        assert "reasoning_step_0" in html_content
+        assert "reasoning_step_24" in html_content

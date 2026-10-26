@@ -256,6 +256,7 @@ async def get_trace_tree(
         from agent_obs.storage.hot import HotStore
         from agent_obs.tree_compressor import (
             CompressionPolicy,
+            EmbeddedSubtreePolicy,
             TraceTreeBuilder,
             apply_late_summaries,
         )
@@ -290,6 +291,10 @@ async def get_trace_tree(
         summaries = hot_store.get_tree_summaries(trace_id)
         summaries_map = {s["node_span_id"]: s["summary"] for s in summaries}
         final_tree = apply_late_summaries(compressed_tree, summaries_map)
+        
+        # PP20: embed small leaf-subtrees into parent events (matreshka)
+        embedded_policy = EmbeddedSubtreePolicy.from_env()
+        final_tree = embedded_policy.embed(final_tree)
         
         return TraceTreeResponse(
             trace_id=trace_id,

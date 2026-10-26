@@ -9,8 +9,15 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 
-from agent_obs.metrics import tree_compression_ratio
-from agent_obs.observability import Span, SpanContext, SpanType
+from agent_obs.metrics import tree_compression_ratio, tree_embedded_ratio
+from agent_obs.observability import (
+    Event,
+    Span,
+    SpanContext,
+    SpanType,
+    _parse_iso8601,
+    _to_iso8601,
+)
 
 # PP17 Policy version for idempotency
 COMPRESSION_POLICY_VERSION = "1"
@@ -457,6 +464,201 @@ class CompressionPolicy:
                 summary_node_id,
                 str(e),
             )
+
+
+# PP20: Embedded subtree (matreshka)
+EMBEDDED_POLICY_VERSION = "1"
+
+
+@dataclass
+class EmbeddedSubtreePolicy:
+    """Policy for embedding small leaf-subtrees into parent span events (PP20).
+
+    Matreshka: a parent with ≤ max_embedded_size leaf children has those children
+    embedded as an events array on the parent span. Drill-down parses the events
+    locally — no API call needed.
+    """
+
+    max_embedded_size: int = 10
+    policy_version: str = EMBEDDED_POLICY_VERSION
+
+    @classmethod
+    def from_env(cls, policy_version: str = EMBEDDED_POLICY_VERSION) -> EmbeddedSubtreePolicy:
+        """Create policy from environment variable TREE_EMBEDDED_SIZE (default 10)."""
+        default_size = 10
+        try:
+            env_size = int(os.environ.get("TREE_EMBEDDED_SIZE", str(default_size)))
+            if env_size <= 0:
+                raise ValueError(f"Invalid TREE_EMBEDDED_SIZE: {env_size}, must be > 0")
+        except ValueError as e:
+            import warnings
+            warnings.warn(f"Invalid TREE_EMBEDDED_SIZE: {e}, using default {default_size}")
+            env_size = default_size
+
+        return cls(max_embedded_size=env_size, policy_version=policy_version)
+
+    def embed(self, tree: TraceTree) -> TraceTree:
+        """Embed small leaf-subtrees into parent events (PP20).
+
+        For every node whose children are ALL leaves and 1 <= len(children) <=
+        max_embedded_size: convert children into events on the parent span, set
+        attributes embedded=true / embedded_count=N, and clear children.
+
+        Idempotent: after embedding a parent is itself a leaf, so a second pass
+        is a no-op. Non-destructive: error leaves are embedded too — data stays
+        in events.
+
+        Args:
+            tree: Input TraceTree (typically after PP17 compression + PP18 summaries)
+
+        Returns:
+            New TraceTree with embedding applied
+        """
+        embedded_nodes = 0
+        total_nodes = 0
+
+        def _is_embeddable(node: TraceTree) -> bool:
+            if not node.children:
+                return False
+            if len(node.children) > self.max_embedded_size:
+                return False
+            # All children must be leaves
+            return all(len(child.children) == 0 for child in node.children)
+
+        def _embed_node(node: TraceTree) -> list[Event]:
+            """Convert node's leaf children into embedded events on its span."""
+            # Deterministic order
+            children_sorted = sorted(
+                node.children, key=lambda c: c.root.start_time
+            )
+            events: list[Event] = []
+            for child in children_sorted:
+                span = child.root
+                attrs = {
+                    "span_id": span.context.span_id,
+                    "parent_span_id": span.context.parent_span_id,
+                    "span_type": span.span_type.value,
+                    "status": span.attributes.get("status", "unset"),
+                    "embedded": True,
+                }
+                # Merge remaining child attributes (skip keys already set)
+                for k, v in span.attributes.items():
+                    if k not in attrs:
+                        attrs[k] = v
+                events.append(
+                    Event(
+                        name=span.name,
+                        timestamp=_to_iso8601(span.start_time) or "",
+                        attributes=attrs,
+                    )
+                )
+            # Append to existing events (do not clobber, e.g. aggregate events)
+            node.root.events.extend(events)
+            node.root.attributes["embedded"] = True
+            node.root.attributes["embedded_count"] = len(events)
+            node.children = []
+            return events
+
+        def _recurse(node: TraceTree, is_root: bool = False) -> None:
+            nonlocal embedded_nodes, total_nodes
+            total_nodes += 1
+            # Never embed the tree root itself (mirrors CompressionPolicy root skip)
+            if not is_root and _is_embeddable(node):
+                _embed_node(node)
+                embedded_nodes += 1
+            for child in node.children:
+                _recurse(child)
+
+        # Work on a shallow-copied tree to avoid mutating input structure beyond
+        # span-level in-place edits (attributes/events), matching apply_late_summaries.
+        _recurse(tree, is_root=True)
+
+        # Metric: fraction of nodes with embedded subtree
+        agent_id = tree.root.context.agent_id or "unknown"
+        ratio = (embedded_nodes / total_nodes) if total_nodes > 0 else 0.0
+        tree_embedded_ratio.labels(agent_id=agent_id).set(ratio)
+
+        return tree
+
+
+def expand_embedded(parent: Span) -> list[Span]:
+    """Reconstruct embedded child spans from a parent span's events (PP20).
+
+    Local drill-down: no API call needed — all data is already in the parent span.
+
+    Args:
+        parent: Span that may contain embedded events (attributes.embedded=True)
+
+    Returns:
+        List of reconstructed child Spans (events with attributes.embedded=True)
+    """
+    children: list[Span] = []
+    for event in parent.events:
+        attrs = event.attributes
+        if not attrs.get("embedded"):
+            continue
+        ctx = SpanContext(
+            trace_id=parent.context.trace_id,
+            span_id=attrs.get("span_id", ""),
+            parent_span_id=attrs.get("parent_span_id", parent.context.span_id),
+            agent_id=parent.context.agent_id,
+            agent_version=parent.context.agent_version,
+            user_id=parent.context.user_id,
+            session_id=parent.context.session_id,
+            tool_name=parent.context.tool_name,
+        )
+        child_attrs = {
+            k: v for k, v in attrs.items()
+            if k not in ("span_id", "parent_span_id", "span_type", "status", "embedded")
+        }
+        child_attrs["status"] = attrs.get("status", "unset")
+        child = Span(
+            name=event.name,
+            span_type=attrs.get("span_type", SpanType.AGENT_REASONING.value),
+            context=ctx,
+            attributes=child_attrs,
+            start_time=_parse_iso8601(event.timestamp) if event.timestamp else 0.0,
+        )
+        children.append(child)
+    return children
+
+
+def expand_embedded_dict(span_dict: dict) -> list[dict]:
+    """Dict-path version of expand_embedded for UI/API (PP20).
+
+    Args:
+        span_dict: Span dict (from hot store / to_dict) that may contain embedded events
+
+    Returns:
+        List of reconstructed child span dicts (events with attributes.embedded=True)
+    """
+    children: list[dict] = []
+    parent_span_id = span_dict.get("span_id", "")
+    trace_id = span_dict.get("trace_id", "")
+    for event in span_dict.get("events", []):
+        attrs = event.get("attributes", {})
+        if not attrs.get("embedded"):
+            continue
+        child_attrs = {
+            k: v for k, v in attrs.items()
+            if k not in ("span_id", "parent_span_id", "span_type", "status", "embedded")
+        }
+        child_attrs["status"] = attrs.get("status", "unset")
+        children.append(
+            {
+                "trace_id": trace_id,
+                "span_id": attrs.get("span_id", ""),
+                "parent_span_id": attrs.get("parent_span_id", parent_span_id),
+                "name": event.get("name", ""),
+                "span_type": attrs.get("span_type", ""),
+                "start_time": event.get("timestamp", ""),
+                "end_time": None,
+                "status": attrs.get("status", "unset"),
+                "attributes": child_attrs,
+                "events": [],
+            }
+        )
+    return children
 
 
 def compute_tree_metrics(tree: TraceTree) -> TreeMetrics:

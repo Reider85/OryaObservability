@@ -487,6 +487,7 @@ class TestTraceTreeEndpoint:
             
             with patch("agent_obs.tree_compressor.TraceTreeBuilder") as mock_builder_class, \
                  patch("agent_obs.tree_compressor.CompressionPolicy") as mock_policy_class, \
+                 patch("agent_obs.tree_compressor.EmbeddedSubtreePolicy") as mock_embedded_class, \
                  patch("agent_obs.tree_compressor.apply_late_summaries") as mock_apply:
                 
                 # Mock tree building and compression
@@ -506,6 +507,10 @@ class TestTraceTreeEndpoint:
                 mock_policy_class.from_env.return_value = mock_policy
                 
                 mock_apply.return_value = mock_tree
+                
+                mock_embedded_policy = MagicMock()
+                mock_embedded_policy.embed.return_value = mock_tree
+                mock_embedded_class.from_env.return_value = mock_embedded_policy
                 
 # Make the request
                 response = client.get("/api/v1/traces/test_trace/tree")
@@ -529,6 +534,8 @@ class TestTraceTreeEndpoint:
                 mock_policy_class.from_env.assert_called_once()
                 mock_policy.compress.assert_called_once()
                 mock_apply.assert_called_once()
+                mock_embedded_class.from_env.assert_called_once()
+                mock_embedded_policy.embed.assert_called_once()
     
     def test_get_trace_tree_with_summaries(self, client: TestClient) -> None:
         """Test trace tree retrieval with late summaries applied."""
@@ -607,6 +614,7 @@ class TestTraceTreeEndpoint:
             
             with patch("agent_obs.tree_compressor.TraceTreeBuilder") as mock_builder_class, \
                  patch("agent_obs.tree_compressor.CompressionPolicy") as mock_policy_class, \
+                 patch("agent_obs.tree_compressor.EmbeddedSubtreePolicy") as mock_embedded_class, \
                  patch("agent_obs.tree_compressor.apply_late_summaries") as mock_apply:
                 
                 # Mock tree building and compression
@@ -651,6 +659,10 @@ class TestTraceTreeEndpoint:
                 }
                 mock_apply.return_value = updated_tree
                 
+                mock_embedded_policy = MagicMock()
+                mock_embedded_policy.embed.return_value = updated_tree
+                mock_embedded_class.from_env.return_value = mock_embedded_policy
+                
                 # Make the request
                 response = client.get("/api/v1/traces/test_trace/tree")
                 
@@ -665,6 +677,10 @@ class TestTraceTreeEndpoint:
                 call_args = mock_apply.call_args[0]
                 summaries_arg = call_args[1]
                 assert summaries_arg["step1"] == "Generated summary for steps"
+                
+                # Verify PP20 embed was applied after summaries
+                mock_embedded_class.from_env.assert_called_once()
+                mock_embedded_policy.embed.assert_called_once()
     
     def test_get_trace_tree_empty(self, client: TestClient) -> None:
         """Test trace tree retrieval with no spans found."""

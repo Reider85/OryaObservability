@@ -1,15 +1,20 @@
 """Tests for TraceTreeBuilder and tree compression utilities."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
 from agent_obs.observability import Span, SpanContext, SpanType
 from agent_obs.tree_compressor import (
     CompressionPolicy,
+    EmbeddedSubtreePolicy,
     TraceTree,
     TraceTreeBuilder,
+    apply_late_summaries,
+    compute_subtree_content_hash,
     compute_tree_metrics,
+    expand_embedded,
+    expand_embedded_dict,
     is_aggregate_span,
 )
 
@@ -792,56 +797,57 @@ class TestCompressionPolicy:
 class TestSummaryEnqueue:
     """Test async summary enqueue functionality (PP18)."""
     
-    def test_summary_placeholder_set(self, mock_clock, default_context, test_span_factory):
-        """Test that summary nodes get 'pending' placeholder."""
-        # Create a chain of 21 spans (will be compressed)
+    def _build_chain(self, factory, n: int, start_parent_id: str):
+        """Build a chain of n spans; returns list of spans."""
         spans = []
-        parent_id = default_context.span_id
-        
-        for i in range(21):
-            span = test_span_factory(
-                mock_clock, default_context, 
-                f"step_{i}", parent_span_id, "ok"
+        parent_id = start_parent_id
+        for i in range(n):
+            span = factory(
+                name=f"step_{i}", parent_span_id=parent_id, status="ok"
             )
             spans.append(span)
             parent_id = span.context.span_id
-        
+        return spans
+    
+    @staticmethod
+    def _collect_summary_nodes(tree: TraceTree):
+        """Synchronously collect compressed summary nodes via stack DFS."""
+        summary_nodes = []
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_nodes.append(node)
+            stack.extend(node.children)
+        return summary_nodes
+    
+    def test_summary_placeholder_set(self, mock_clock, default_context, test_span_factory):
+        """Test that summary nodes get 'pending' placeholder."""
+        # 25-span chain: root subtree size 25 > 20 triggers compression
+        spans = self._build_chain(test_span_factory, 25, default_context.span_id)
         tree = TraceTreeBuilder().build(spans)
         
         # Compress with queue enabled
-        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
+        policy = CompressionPolicy.from_env()
+        policy.summary_queue_enabled = True
         compressed_tree = policy.compress(tree)
         
-        # Check that summary node has "pending" summary
-        summary_nodes = []
-        for node in compressed_tree.iter_dfs():
-            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
-                summary_nodes.append(node)
+        summary_nodes = self._collect_summary_nodes(compressed_tree)
         
         assert len(summary_nodes) == 1
         assert summary_nodes[0].root.attributes["tree.summary"] == "pending"
     
     def test_enqueue_called_on_compression(self, mock_clock, default_context, test_span_factory):
         """Test that enqueue is called when creating summary nodes."""
-        # Create a chain of 21 spans
-        spans = []
-        parent_id = default_context.span_id
-        
-        for i in range(21):
-            span = test_span_factory(
-                mock_clock, default_context, 
-                f"step_{i}", parent_span_id, "ok"
-            )
-            spans.append(span)
-            parent_id = span.context.span_id
-        
+        spans = self._build_chain(test_span_factory, 25, default_context.span_id)
         tree = TraceTreeBuilder().build(spans)
         
         # Mock the enqueue method
-        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
-        policy._enqueue_summary_job = unittest.mock.MagicMock()
+        policy = CompressionPolicy.from_env()
+        policy.summary_queue_enabled = True
+        policy._enqueue_summary_job = MagicMock()
         
-        compressed_tree = policy.compress(tree)
+        policy.compress(tree)
         
         # Verify enqueue was called
         assert policy._enqueue_summary_job.called
@@ -852,81 +858,58 @@ class TestSummaryEnqueue:
     
     def test_enqueue_fail_open(self, mock_clock, default_context, test_span_factory):
         """Test that compression succeeds even if enqueue fails."""
-        # Create a chain of 21 spans
-        spans = []
-        parent_id = default_context.span_id
-        
-        for i in range(21):
-            span = test_span_factory(
-                mock_clock, default_context, 
-                f"step_{i}", parent_span_id, "ok"
-            )
-            spans.append(span)
-            parent_id = span.context.span_id
-        
+        spans = self._build_chain(test_span_factory, 25, default_context.span_id)
         tree = TraceTreeBuilder().build(spans)
         
-        # Mock enqueue to raise exception
-        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
-        policy._enqueue_summary_job = unittest.mock.MagicMock(side_effect=Exception("Redis down"))
+        # Policy with queue enabled; patch rq module so Redis.from_url raises
+        policy = CompressionPolicy.from_env()
+        policy.summary_queue_enabled = True
         
-        # Compression should still succeed
-        compressed_tree = policy.compress(tree)
+        mock_rq = MagicMock()
+        mock_rq.Redis.from_url.side_effect = Exception("Redis down")
+        with patch.dict("sys.modules", {"rq": mock_rq}):
+            # Compression should still succeed (fail-open)
+            compressed_tree = policy.compress(tree)
         
-        # Verify enqueue was called but failed
-        assert policy._enqueue_summary_job.called
-        assert policy._enqueue_summary_job.call_args[1]["trace_id"] == default_context.trace_id
+        summary_nodes = self._collect_summary_nodes(compressed_tree)
+        assert len(summary_nodes) == 1
     
     def test_summary_queue_disabled(self, mock_clock, default_context, test_span_factory):
         """Test that enqueue is not called when queue is disabled."""
-        # Create a chain of 21 spans
-        spans = []
-        parent_id = default_context.span_id
-        
-        for i in range(21):
-            span = test_span_factory(
-                mock_clock, default_context, 
-                f"step_{i}", parent_span_id, "ok"
-            )
-            spans.append(span)
-            parent_id = span.context.span_id
-        
+        spans = self._build_chain(test_span_factory, 25, default_context.span_id)
         tree = TraceTreeBuilder().build(spans)
         
-        # Mock the enqueue method
-        policy = CompressionPolicy.from_env(summary_queue_enabled=False)
-        policy._enqueue_summary_job = unittest.mock.MagicMock()
+        # Policy with queue disabled; patch rq module and verify it's never touched
+        policy = CompressionPolicy.from_env()
+        policy.summary_queue_enabled = False
         
-        compressed_tree = policy.compress(tree)
+        mock_rq = MagicMock()
+        with patch.dict("sys.modules", {"rq": mock_rq}):
+            compressed_tree = policy.compress(tree)
         
-        # Verify enqueue was not called
-        assert not policy._enqueue_summary_job.called
+        # Verify rq was never touched (enqueue skipped entirely)
+        mock_rq.Redis.from_url.assert_not_called()
+        mock_rq.Queue.assert_not_called()
+        
+        # Compression still happened
+        summary_nodes = self._collect_summary_nodes(compressed_tree)
+        assert len(summary_nodes) == 1
     
     def test_idempotency_no_reenqueue(self, mock_clock, default_context, test_span_factory):
         """Test that compressing twice doesn't enqueue again."""
-        # Create a chain of 21 spans
-        spans = []
-        parent_id = default_context.span_id
-        
-        for i in range(21):
-            span = test_span_factory(
-                mock_clock, default_context, 
-                f"step_{i}", parent_span_id, "ok"
-            )
-            spans.append(span)
-            parent_id = span.context.span_id
-        
+        spans = self._build_chain(test_span_factory, 25, default_context.span_id)
         tree = TraceTreeBuilder().build(spans)
         
         # Mock the enqueue method
-        policy = CompressionPolicy.from_env(summary_queue_enabled=True)
-        policy._enqueue_summary_job = unittest.mock.MagicMock()
+        policy = CompressionPolicy.from_env()
+        policy.summary_queue_enabled = True
+        policy._enqueue_summary_job = MagicMock()
         
         # First compression
         compressed_tree1 = policy.compress(tree)
         
         # Second compression (should be idempotent)
-        compressed_tree2 = policy.compress(compressed_tree1)
+        policy.compress(compressed_tree1)
         
         # Verify enqueue was called only once
         assert policy._enqueue_summary_job.call_count == 1
@@ -935,7 +918,6 @@ class TestSummaryEnqueue:
         """Test applying late summaries to compressed nodes."""
         # Create a summary node manually
         summary_span = test_span_factory(
-            mock_clock, default_context,
             name="compressed:3", span_type=SpanType.AGENT_REASONING_COMPRESSED,
             parent_span_id=default_context.span_id,
             status="ok"
@@ -949,8 +931,8 @@ class TestSummaryEnqueue:
             compression_ratio=0.0,
         )
         
-        # Apply late summaries
-        summaries = {"test_span_id": "Generated summary text"}
+        # Apply late summaries keyed by the real span_id
+        summaries = {summary_span.context.span_id: "Generated summary text"}
         updated_tree = apply_late_summaries(summary_tree, summaries)
         
         # Verify summary was updated
@@ -960,7 +942,6 @@ class TestSummaryEnqueue:
         """Test that nodes without summaries remain 'pending'."""
         # Create a summary node manually
         summary_span = test_span_factory(
-            mock_clock, default_context,
             name="compressed:3", span_type=SpanType.AGENT_REASONING_COMPRESSED,
             parent_span_id=default_context.span_id,
             status="ok"
@@ -985,7 +966,6 @@ class TestSummaryEnqueue:
         """Test that final summaries are not overwritten."""
         # Create a summary node with final summary
         summary_span = test_span_factory(
-            mock_clock, default_context,
             name="compressed:3", span_type=SpanType.AGENT_REASONING_COMPRESSED,
             parent_span_id=default_context.span_id,
             status="ok"
@@ -1000,7 +980,7 @@ class TestSummaryEnqueue:
         )
         
         # Apply late summaries (different summary)
-        summaries = {"test_span_id": "New summary"}
+        summaries = {summary_span.context.span_id: "New summary"}
         updated_tree = apply_late_summaries(summary_tree, summaries)
         
         # Verify original summary is preserved
@@ -1010,14 +990,12 @@ class TestSummaryEnqueue:
         """Test that content hash is deterministic for same content."""
         # Create two identical spans
         span1 = test_span_factory(
-            mock_clock, default_context,
             name="step1", parent_span_id=default_context.span_id,
             status="ok"
         )
         span1.attributes["reasoning"] = "First step"
         
         span2 = test_span_factory(
-            mock_clock, default_context,
             name="step1", parent_span_id=default_context.span_id,
             status="ok"
         )
@@ -1028,3 +1006,193 @@ class TestSummaryEnqueue:
         hash2 = compute_subtree_content_hash([span2])
         
         assert hash1 == hash2
+
+
+class TestEmbeddedSubtreePolicy:
+    """Test EmbeddedSubtreePolicy.embed and expand_embedded (PP20)."""
+
+    def _build_leaf_parent_tree(self, factory, n_children: int, status: str = "ok"):
+        """Build a tree: root → parent → n leaf children."""
+        root = factory(name="root", span_type=SpanType.AGENT_LOOP, start_time=1.0)
+        parent = factory(
+            name="parent", span_type=SpanType.AGENT_REASONING,
+            parent_span_id=root.context.span_id, start_time=2.0
+        )
+        children = []
+        for i in range(n_children):
+            child = factory(
+                name=f"child{i}", span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent.context.span_id,
+                status=status if i == 0 else "ok",
+                start_time=3.0 + i * 0.1,
+            )
+            children.append(child)
+        return TraceTreeBuilder().build([root, parent, *children]), parent
+
+    @staticmethod
+    def _find_node(tree: TraceTree, span_id: str):
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if node.root.context.span_id == span_id:
+                return node
+            stack.extend(node.children)
+        return None
+
+    def test_eight_leaf_children_embedded(self, test_span_factory):
+        """8 leaf children → embedded в parent (DoD)."""
+        tree, parent = self._build_leaf_parent_tree(test_span_factory, 8)
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        result = policy.embed(tree)
+
+        parent_node = self._find_node(result, parent.context.span_id)
+        assert parent_node is not None
+        assert parent_node.root.attributes["embedded"] is True
+        assert parent_node.root.attributes["embedded_count"] == 8
+        assert parent_node.children == []
+        assert len(parent_node.root.events) == 8
+        for event in parent_node.root.events:
+            assert event.attributes["embedded"] is True
+            assert event.attributes["span_id"]
+
+    def test_eleven_children_not_embedded(self, test_span_factory):
+        """11 leaf children > max → not embedded."""
+        tree, parent = self._build_leaf_parent_tree(test_span_factory, 11)
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        result = policy.embed(tree)
+
+        parent_node = self._find_node(result, parent.context.span_id)
+        assert parent_node is not None
+        assert parent_node.root.attributes.get("embedded") is not True
+        assert len(parent_node.children) == 11
+
+    def test_parent_with_grandchild_not_embedded(self, test_span_factory):
+        """Parent whose children have children → not a leaf-parent → not embedded."""
+        root = test_span_factory(name="root", span_type=SpanType.AGENT_LOOP, start_time=1.0)
+        parent = test_span_factory(
+            name="parent", span_type=SpanType.AGENT_REASONING,
+            parent_span_id=root.context.span_id, start_time=2.0
+        )
+        child = test_span_factory(
+            name="child", span_type=SpanType.AGENT_REASONING,
+            parent_span_id=parent.context.span_id, start_time=3.0
+        )
+        grandchild = test_span_factory(
+            name="grandchild", span_type=SpanType.AGENT_REASONING,
+            parent_span_id=child.context.span_id, start_time=4.0
+        )
+        tree = TraceTreeBuilder().build([root, parent, child, grandchild])
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        result = policy.embed(tree)
+
+        parent_node = self._find_node(result, parent.context.span_id)
+        assert parent_node is not None
+        assert parent_node.root.attributes.get("embedded") is not True
+
+    def test_embedded_compressed_children(self, test_span_factory):
+        """Compressed summary-узлы тоже встраиваются (решение: все leaves)."""
+        root = test_span_factory(name="root", span_type=SpanType.AGENT_LOOP, start_time=1.0)
+        parent = test_span_factory(
+            name="parent", span_type=SpanType.AGENT_REASONING,
+            parent_span_id=root.context.span_id, start_time=2.0
+        )
+        children = []
+        for i in range(2):
+            summary = test_span_factory(
+                name=f"compressed:{i}", span_type=SpanType.AGENT_REASONING_COMPRESSED,
+                parent_span_id=parent.context.span_id, start_time=3.0 + i
+            )
+            summary.attributes["tree.compressed"] = True
+            children.append(TraceTree(root=summary, children=[]))
+        parent_tree = TraceTree(root=parent, children=children)
+        root_tree = TraceTree(root=root, children=[parent_tree])
+
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        result = policy.embed(root_tree)
+
+        parent_node = result.children[0]
+        assert parent_node.root.attributes["embedded"] is True
+        assert parent_node.root.attributes["embedded_count"] == 2
+        assert parent_node.children == []
+        for event in parent_node.root.events:
+            assert event.attributes["embedded"] is True
+            assert event.attributes["span_type"] == "agent.reasoning.compressed"
+
+    def test_expand_embedded_roundtrip(self, test_span_factory):
+        """expand_embedded восстанавливает детей локально (no API call)."""
+        tree, parent = self._build_leaf_parent_tree(test_span_factory, 8)
+        # Capture original children IDs before embed (embed mutates in place)
+        original_children = None
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if node.root.context.span_id == parent.context.span_id:
+                original_children = list(node.children)
+                break
+            stack.extend(node.children)
+        original_ids = {c.root.context.span_id for c in original_children}
+
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        result = policy.embed(tree)
+
+        parent_node = self._find_node(result, parent.context.span_id)
+        recovered = expand_embedded(parent_node.root)
+        assert len(recovered) == 8
+        recovered_ids = {s.context.span_id for s in recovered}
+        assert recovered_ids == original_ids
+        assert all(s.attributes.get("status") in ("ok", "error") for s in recovered)
+
+    def test_expand_embedded_dict(self, test_span_factory):
+        """expand_embedded_dict — dict-path drill-down для UI/API."""
+        tree, parent = self._build_leaf_parent_tree(test_span_factory, 3)
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        result = policy.embed(tree)
+
+        parent_node = self._find_node(result, parent.context.span_id)
+        parent_dict = parent_node.root.to_dict()
+        recovered = expand_embedded_dict(parent_dict)
+        assert len(recovered) == 3
+        for child_dict in recovered:
+            assert child_dict["parent_span_id"] == parent.context.span_id
+            assert child_dict["span_id"]
+
+    def test_idempotency(self, test_span_factory):
+        """embed(embed(tree)) == embed(tree)."""
+        tree, _ = self._build_leaf_parent_tree(test_span_factory, 8)
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        once = policy.embed(tree)
+        twice = policy.embed(once)
+        assert twice.root.attributes.get("embedded") is not True
+
+        def count_embedded(t):
+            n = 0
+            stack = [t]
+            while stack:
+                node = stack.pop()
+                if node.root.attributes.get("embedded"):
+                    n += 1
+                stack.extend(node.children)
+            return n
+        assert count_embedded(once) == count_embedded(twice)
+
+    def test_from_env(self, monkeypatch):
+        """env TREE_EMBEDDED_SIZE меняет max_embedded_size."""
+        monkeypatch.setenv("TREE_EMBEDDED_SIZE", "5")
+        policy = EmbeddedSubtreePolicy.from_env()
+        assert policy.max_embedded_size == 5
+
+        monkeypatch.setenv("TREE_EMBEDDED_SIZE", "0")
+        with pytest.warns(UserWarning):
+            policy = EmbeddedSubtreePolicy.from_env()
+        assert policy.max_embedded_size == 10  # fallback
+
+    def test_metric_set(self, test_span_factory):
+        """tree_embedded_ratio gauge устанавливается."""
+        tree, _ = self._build_leaf_parent_tree(test_span_factory, 8)
+        policy = EmbeddedSubtreePolicy(max_embedded_size=10)
+        with patch("agent_obs.tree_compressor.tree_embedded_ratio") as mock_gauge:
+            policy.embed(tree)
+            mock_gauge.labels.assert_called_once()
+            mock_gauge.labels.return_value.set.assert_called_once()
+            ratio = mock_gauge.labels.return_value.set.call_args[0][0]
+            assert 0.0 < ratio <= 1.0

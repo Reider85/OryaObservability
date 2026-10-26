@@ -638,6 +638,7 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
         .focused {{ outline: 2px solid #007bff; outline-offset: 2px; }}
         .loading {{ color: #6c757d; font-style: italic; }}
         .compressed-badge {{ background-color: #ffc107; color: #212529; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }}
+        .embedded-badge {{ background-color: #6f42c1; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }}
         .expand-compressed {{ background-color: #28a745; color: white; padding: 4px 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 8px; }}
         .expand-compressed:hover {{ background-color: #218838; }}
         .compressed-name {{ color: #dc3545; font-weight: bold; }}
@@ -691,7 +692,12 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
             
             renderSpanRow(span, index) {{
                 const hasEvents = span.events && span.events.length > 0;
-                const eventsHtml = hasEvents ? this.renderEventsSection(span) : '<div class="no-events">No events</div>';
+                const isEmbedded = span.attributes && span.attributes.embedded;
+                const embeddedCount = span.attributes ? (span.attributes.embedded_count || 0) : 0;
+                // For embedded spans: render events inline from span.events (no API call needed — PP20)
+                const eventsHtml = hasEvents
+                    ? (isEmbedded ? this.renderEmbeddedEventsSection(span) : this.renderEventsSection(span))
+                    : '<div class="no-events">No events</div>';
                 
                 return `
                     <div class="span-row" data-index="${{index}}" data-span-id="${{span.span_id}}">
@@ -699,6 +705,7 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
                             <div>
                                 <span class="span-name">${{span.name}}</span>
                                 <span class="span-meta">| Type: ${{span.span_type}} | Status: ${{span.status}}</span>
+                                ${{isEmbedded ? `<span class="embedded-badge">EMBEDDED (${{embeddedCount}})</span>` : ''}}
                             </div>
                             ${{hasEvents ? `<button class="events-toggle">Show ${{span.events.length}} events</button>` : ''}}
                         </div>
@@ -708,6 +715,34 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
                         <div class="events-section" style="display: none;">
                             ${{eventsHtml}}
                         </div>
+                    </div>
+                `;
+            }}
+            
+            renderEmbeddedEventsSection(span) {{
+                // PP20: embedded children are already in span.events — render inline, no fetch
+                const rows = span.events.map(event => {{
+                    const isError = event.attributes && event.attributes.status === 'error';
+                    return `
+                        <tr class="${{isError ? 'event-row--error' : ''}}">
+                            <td class="event-name">${{event.name}}</td>
+                            <td>${{event.timestamp ? new Date(event.timestamp).toLocaleString() : ''}}</td>
+                            <td class="event-attrs">${{JSON.stringify(event.attributes || {{}}, null, 2)}}</td>
+                        </tr>
+                    `;
+                }}).join('');
+                return `
+                    <div class="events-table">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Timestamp</th>
+                                    <th>Attributes</th>
+                                </tr>
+                            </thead>
+                            <tbody>${{rows}}</tbody>
+                        </table>
                     </div>
                 `;
             }}
@@ -948,6 +983,8 @@ def render_span_tree(spans: List[Dict[str, Any]], expand_events: bool) -> str:
         is_compressed = span.get("span_type") == "agent.reasoning.compressed"
         compressed_children_count = span.get("attributes", {}).get("tree.children_count", 0)
         compressed_summary = span.get("attributes", {}).get("tree.summary", "")
+        is_embedded = span.get("attributes", {}).get("embedded", False)
+        embedded_count = span.get("attributes", {}).get("embedded_count", 0)
         
         events_html = ""
         
@@ -982,6 +1019,9 @@ def render_span_tree(spans: List[Dict[str, Any]], expand_events: bool) -> str:
             # Add summary if available
             if compressed_summary:
                 span_meta += f' <div class="summary">Summary: {compressed_summary}</div>'
+        
+        if is_embedded:
+            span_meta += f' <span class="embedded-badge">EMBEDDED ({embedded_count})</span>'
             
         children_html = ""
         if span.get("children"):
@@ -1010,15 +1050,25 @@ def render_span_tree(spans: List[Dict[str, Any]], expand_events: bool) -> str:
         """
     
     def render_events(events):
-        return "".join([
-            f"""
-            <tr class="{'event-row--error' if event.get('error') else ''}">
+        rows = []
+        for event in events:
+            # Tolerate both PP0 internal {name, ts, attrs} and OTLP {name, timestamp, attributes}
+            ts_raw = event.get("ts", event.get("timestamp", ""))
+            attrs = event.get("attributes", event.get("attrs", {}))
+            # Error flag: top-level error key OR attributes.status == "error" (embedded events)
+            is_error = event.get("error") or attrs.get("status") == "error"
+            try:
+                ts_display = datetime.fromisoformat(ts_raw).strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, AttributeError):
+                ts_display = str(ts_raw)
+            rows.append(f"""
+            <tr class="{'event-row--error' if is_error else ''}">
                 <td class="event-name">{event["name"]}</td>
-                <td>{datetime.fromisoformat(event["ts"].replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")}</td>
-                <td class="event-attrs">{json.dumps(event.get("attributes", {}), indent=2)}</td>
+                <td>{ts_display}</td>
+                <td class="event-attrs">{json.dumps(attrs, indent=2)}</td>
             </tr>
-            """ for event in events
-        ])
+            """)
+        return "".join(rows)
     
     return "".join([render_span(span) for span in spans])
 
