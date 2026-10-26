@@ -1,8 +1,5 @@
 """Tests for TraceTreeBuilder and tree compression utilities."""
 
-import asyncio
-import time
-from dataclasses import dataclass
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,7 +9,6 @@ from agent_obs.tree_compressor import (
     CompressionPolicy,
     TraceTree,
     TraceTreeBuilder,
-    TreeMetrics,
     compute_tree_metrics,
     is_aggregate_span,
 )

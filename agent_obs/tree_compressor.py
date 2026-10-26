@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 
 from agent_obs.metrics import tree_compression_ratio
@@ -119,12 +119,12 @@ def _compute_subtree_metrics(tree: TraceTree) -> tuple[dict[str, int], dict[str,
     Returns:
         Tuple of (size_map: node_id -> size, error_map: node_id -> has_error)
     """
-    size_map = {}
-    error_map = {}
+    size_map: dict[str, int] = {}
+    error_map: dict[str, bool] = {}
     
     # Use a stack for iterative post-order traversal
     # Each element: (node, children_iterator)
-    stack: list[tuple[TraceTree, AsyncIterator[TraceTree]]] = []
+    stack: list[tuple[TraceTree, Iterator[TraceTree]]] = []
     # Start with the root and its children iterator
     stack.append((tree, iter(tree.children)))
     
@@ -200,7 +200,7 @@ def _rebuild_tree_with_compression(
     tree: TraceTree, 
     size_map: dict[str, int], 
     error_map: dict[str, bool],
-    policy: "CompressionPolicy"
+    policy: CompressionPolicy
 ) -> tuple[TraceTree, int]:
     """Rebuild tree with compression applied top-down.
     
@@ -317,7 +317,7 @@ class CompressionPolicy:
     policy_version: str = COMPRESSION_POLICY_VERSION
     
     @classmethod
-    def from_env(cls, policy_version: str = COMPRESSION_POLICY_VERSION) -> "CompressionPolicy":
+    def from_env(cls, policy_version: str = COMPRESSION_POLICY_VERSION) -> CompressionPolicy:
         """Create policy from environment variable.
         
         Priority: param > env > default (20)
@@ -360,10 +360,7 @@ class CompressionPolicy:
             # Find the original root span ID in the size_map
             original_count = None
             for node_id, size in size_map.items():
-                if tree.root.attributes.get("tree.virtual_root") and "virtual_root" in node_id:
-                    original_count = size
-                    break
-                elif node_id == tree.root.context.span_id:
+                if tree.root.attributes.get("tree.virtual_root") and "virtual_root" in node_id or node_id == tree.root.context.span_id:
                     original_count = size
                     break
             
