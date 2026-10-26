@@ -44,9 +44,11 @@ class TestSpanType:
         assert SpanType.AGENT_LOOP.value == "agent.loop"
         assert SpanType.LLM_CALL.value == "llm.call"
         assert SpanType.TOOL_CALL.value == "tool.call"
+        assert SpanType.AGENT_REASONING.value == "agent.reasoning"
+        assert SpanType.AGENT_REASONING_COMPRESSED.value == "agent.reasoning.compressed"
 
-    def test_all_four_types_present(self):
-        assert len(SpanType) == 4
+    def test_all_five_types_present(self):
+        assert len(SpanType) == 5
 
 
 # ---------------------------------------------------------------------------

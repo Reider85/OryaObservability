@@ -409,3 +409,10 @@ eval_budget_state = Gauge(
     "eval_budget_state",
     "Current budget state (0=ok, 1=soft, 2=paused)",
 )
+
+# PP17 Tree compression ratio (gauge, 0..1)
+tree_compression_ratio = Gauge(
+    "tree_compression_ratio",
+    "Ratio of compressed spans to total spans in tree (0..1)",
+    ["agent_id"],
+)

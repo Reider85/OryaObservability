@@ -201,6 +201,7 @@ class SpanType(Enum):
     LLM_CALL = "llm.call"
     TOOL_CALL = "tool.call"
     AGENT_REASONING = "agent.reasoning"
+    AGENT_REASONING_COMPRESSED = "agent.reasoning.compressed"
     # Level 2 placeholders — not implemented in MVP
     # TOOL_INPUT = "tool.input"
     # TOOL_OUTPUT = "tool.output"

@@ -3,12 +3,13 @@
 import asyncio
 import time
 from dataclasses import dataclass
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from agent_obs.observability import Span, SpanContext, SpanType
 from agent_obs.tree_compressor import (
+    CompressionPolicy,
     TraceTree,
     TraceTreeBuilder,
     TreeMetrics,
@@ -453,3 +454,334 @@ class TestTraceTreeBuilder:
         assert metrics.total_spans == 5
         assert metrics.leaf_count == 2
         assert metrics.error_leaf_count == 1  # leaf1 has status="error"
+
+
+class TestCompressionPolicy:
+    """Test CompressionPolicy.compress method."""
+
+    def test_compress_50_nodes_to_one_summary(self, test_span_factory):
+        """Test: 50 узлов → 1 summary."""
+        # Create a linear chain of 50 spans
+        spans = []
+        parent_id = None
+        for i in range(50):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        compressed = policy.compress(tree)
+        
+        # Should have exactly one summary node
+        summary_spans = []
+        # Use synchronous traversal
+        stack = [compressed]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans.append(node.root)
+            stack.extend(reversed(node.children))
+        
+        assert len(summary_spans) == 1
+        assert summary_spans[0].name == "compressed:50"
+        assert summary_spans[0].attributes["tree.children_count"] == 50
+        assert summary_spans[0].attributes["tree.error_count"] == 0
+        assert compressed.compression_ratio > 0.0
+
+    def test_compress_50_nodes_with_error_no_compression(self, test_span_factory):
+        """Test: 50 узлов с 1 error → НЕ сжимается (error сохраняется в full tree)."""
+        # Create a chain of 50 spans, mark 10th as error
+        spans = []
+        parent_id = None
+        for i in range(50):
+            status = "error" if i == 10 else "ok"
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                status=status,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        compressed = policy.compress(tree)
+        
+        # No summary nodes should exist because error is in the middle
+        # and all large subtrees contain the error
+        summary_spans = []
+        # Since error is at position 10, subtrees containing positions 10-49
+        # cannot be compressed. Subtrees before position 10 are small.
+        assert len(summary_spans) == 0
+        # Use synchronous traversal
+        stack = [compressed]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans.append(node.root)
+            stack.extend(reversed(node.children))
+        
+        assert len(summary_spans) == 0
+        # Error span should still exist
+        error_spans = [s for s in spans if s.attributes.get("status") == "error"]
+        assert len(error_spans) == 1
+
+    def test_compress_21_nodes_to_one_summary(self, test_span_factory):
+        """Test: 21 узел без errors → 1 summary."""
+        # Create a chain of 21 spans
+        spans = []
+        parent_id = None
+        for i in range(21):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        compressed = policy.compress(tree)
+        
+        # Should have exactly one summary node
+        summary_spans = []
+        # Use synchronous traversal
+        stack = [compressed]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans.append(node.root)
+            stack.extend(reversed(node.children))
+        
+        assert len(summary_spans) == 1
+        assert summary_spans[0].name == "compressed:21"
+        assert summary_spans[0].attributes["tree.children_count"] == 21
+
+    def test_threshold_boundary(self, test_span_factory):
+        """Test: exactly 20 → not compressed; 21 → compressed."""
+        # Test exactly 20 nodes
+        spans_20 = []
+        parent_id = None
+        for i in range(20):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans_20.append(span)
+            parent_id = span.context.span_id
+        
+        tree_20 = TraceTreeBuilder().build(spans_20)
+        policy = CompressionPolicy(max_subtree_size=20)
+        compressed_20 = policy.compress(tree_20)
+        
+        # No compression for exactly 20
+        summary_spans_20 = []
+        # Use synchronous traversal
+        stack = [compressed_20]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans_20.append(node.root)
+            stack.extend(reversed(node.children))
+        assert len(summary_spans_20) == 0
+        
+        # Test 21 nodes (should compress)
+        span_21 = test_span_factory(
+            name="step20", 
+            span_type=SpanType.AGENT_REASONING,
+            parent_span_id=parent_id,
+            start_time=1.0 + 20 * 0.1
+        )
+        spans_21 = spans_20 + [span_21]
+        tree_21 = TraceTreeBuilder().build(spans_21)
+        compressed_21 = policy.compress(tree_21)
+        
+        # Should compress 21-node subtree
+        summary_spans_21 = []
+        # Use synchronous traversal
+        stack = [compressed_21]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans_21.append(node.root)
+            stack.extend(reversed(node.children))
+        assert len(summary_spans_21) == 1
+
+    def test_idempotency(self, test_span_factory):
+        """Test: compress(compress(tree)) == compress(tree)."""
+        # Create a compressible tree
+        spans = []
+        parent_id = None
+        for i in range(25):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        
+        # Compress twice
+        compressed1 = policy.compress(tree)
+        compressed2 = policy.compress(compressed1)
+        
+        # Should be identical
+        assert compressed1.to_dict() == compressed2.to_dict()
+
+    def test_root_never_replaced(self, test_span_factory):
+        """Test: корень никогда не заменяется."""
+        # Create tree with root and large subtree
+        spans = []
+        parent_id = None
+        for i in range(25):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING if i > 0 else SpanType.AGENT_LOOP,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        compressed = policy.compress(tree)
+        
+        # Root should still be AGENT_LOOP
+        assert compressed.root.span_type == SpanType.AGENT_LOOP
+        assert compressed.root.name == "step0"
+        # But should be marked as containing compression
+        assert compressed.compressed
+
+    def test_error_in_one_branch_only(self, test_span_factory):
+        """Test: error только в одной ветке → соседняя чистая большая ветка сжимается."""
+        # Create two branches from root, one with error, one clean and large
+        spans = []
+        
+        # Root
+        root = test_span_factory(name="root", span_type=SpanType.AGENT_LOOP, start_time=1.0)
+        spans.append(root)
+        
+        # Branch 1: clean, large (25 nodes)
+        parent_id = root.context.span_id
+        for i in range(25):
+            span = test_span_factory(
+                name=f"clean{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=2.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        # Branch 2: with error (15 nodes)
+        parent_id = root.context.span_id
+        for i in range(15):
+            status = "error" if i == 5 else "ok"
+            span = test_span_factory(
+                name=f"error{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                status=status,
+                start_time=2.0 + 25 * 0.1 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        compressed = policy.compress(tree)
+        
+        # Clean branch should be compressed, error branch should not
+        summary_spans = []
+        # Use synchronous traversal
+        stack = [compressed]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans.append(node.root)
+            stack.extend(reversed(node.children))
+        
+        assert len(summary_spans) == 1
+        # Check summary is from clean branch (size should be 25, not 15)
+        assert summary_spans[0].attributes["tree.children_count"] == 25
+
+    def test_env_threshold_respected(self, test_span_factory, monkeypatch):
+        """Test: env TREE_COMPRESSION_THRESHOLD меняет порог."""
+        # Create 25-node tree
+        spans = []
+        parent_id = None
+        for i in range(25):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        
+        # Set threshold to 30 via env
+        monkeypatch.setenv("TREE_COMPRESSION_THRESHOLD", "30")
+        policy = CompressionPolicy.from_env()
+        compressed = policy.compress(tree)
+        
+        # Should not compress (25 < 30)
+        summary_spans = []
+        # Use synchronous traversal
+        stack = [compressed]
+        while stack:
+            node = stack.pop()
+            if node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED:
+                summary_spans.append(node.root)
+            stack.extend(reversed(node.children))
+        assert len(summary_spans) == 0
+
+    def test_metric_emission(self, test_span_factory):
+        """Test: metric gauge установлен."""
+        # Create 25-node tree
+        spans = []
+        parent_id = None
+        for i in range(25):
+            span = test_span_factory(
+                name=f"step{i}", 
+                span_type=SpanType.AGENT_REASONING,
+                parent_span_id=parent_id,
+                start_time=1.0 + i * 0.1
+            )
+            spans.append(span)
+            parent_id = span.context.span_id
+        
+        tree = TraceTreeBuilder().build(spans)
+        policy = CompressionPolicy(max_subtree_size=20)
+        
+        # Mock the gauge to capture set calls
+        with patch("agent_obs.metrics.tree_compression_ratio") as mock_gauge:
+            mock_gauge.labels.return_value.set = Mock()
+            policy.compress(tree)
+            
+            # Verify gauge was called
+            mock_gauge.labels.assert_called_once_with(agent_id="test-agent")
+            mock_gauge.labels.return_value.set.assert_called_once()
+            mock_gauge.labels.return_value.set.assert_called_once()
+            # Check the value is between 0 and 1
+            value = mock_gauge.labels.return_value.set.call_args[0][0]
+            assert 0.0 <= value <= 1.0

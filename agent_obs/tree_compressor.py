@@ -1,13 +1,18 @@
-"""Trace tree construction and traversal for long traces compression (PP16)."""
+"""Trace tree construction and traversal for long traces compression (PP16+PP17)."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
+from agent_obs.metrics import tree_compression_ratio
 from agent_obs.observability import Span, SpanContext, SpanType
+
+# PP17 Policy version for idempotency
+COMPRESSION_POLICY_VERSION = "1"
 
 
 @dataclass
@@ -64,6 +69,261 @@ class TreeMetrics:
 def is_aggregate_span(span: Span) -> bool:
     """Check if span is an aggregate (contains aggregation metadata)."""
     return "aggregation.children_count" in span.attributes
+
+
+def make_summary_node(replaced: TraceTree, subtree_size: int, total_cost: float) -> Span:
+    """Create a summary span to replace a subtree.
+    
+    Args:
+        replaced: The TraceTree node being replaced
+        subtree_size: Total number of nodes in the compressed subtree
+        total_cost: Sum of cost.usd + cost.usd_sum over all nodes in subtree
+    
+    Returns:
+        A Span representing the compressed subtree
+    """
+    # Copy context from replaced node to preserve referential integrity for drill-down
+    summary_context = SpanContext(
+        trace_id=replaced.root.context.trace_id,
+        span_id=replaced.root.context.span_id,  # Keep original span_id for PP19 drill-down
+        parent_span_id=replaced.root.context.parent_span_id,
+        agent_id=replaced.root.context.agent_id,
+        agent_version=replaced.root.context.agent_version,
+        user_id=replaced.root.context.user_id,
+        session_id=replaced.root.context.session_id,
+        tool_name=replaced.root.context.tool_name,
+    )
+    
+    # Build attributes per PP17 spec
+    attributes = {
+        "tree.compressed": True,
+        "tree.children_count": subtree_size,
+        "tree.total_cost": total_cost,
+        "tree.error_count": 0,  # Error subtrees never compressed
+        "tree.summary": "",  # Placeholder; PP18 will set "pending"
+        "tree.policy_version": COMPRESSION_POLICY_VERSION,
+    }
+    
+    return Span(
+        name=f"compressed:{subtree_size}",
+        span_type=SpanType.AGENT_REASONING_COMPRESSED,
+        context=summary_context,
+        attributes=attributes,
+        start_time=replaced.root.start_time,
+    )
+
+
+def _compute_subtree_metrics(tree: TraceTree) -> tuple[dict[str, int], dict[str, bool]]:
+    """Compute subtree size and has_error for each node via iterative post-order traversal.
+    
+    Returns:
+        Tuple of (size_map: node_id -> size, error_map: node_id -> has_error)
+    """
+    size_map = {}
+    error_map = {}
+    
+    # Use a stack for iterative post-order traversal
+    # Each element: (node, children_iterator)
+    stack: list[tuple[TraceTree, AsyncIterator[TraceTree]]] = []
+    # Start with the root and its children iterator
+    stack.append((tree, iter(tree.children)))
+    
+    while stack:
+        node, children_iter = stack[-1]
+        node_id = node.root.context.span_id
+        
+        try:
+            # Get next child
+            child = next(children_iter)
+            # Push child onto stack with its own children iterator
+            stack.append((child, iter(child.children)))
+        except StopIteration:
+            # All children processed, compute metrics for this node
+            stack.pop()
+            
+            # Compute size and error for this node
+            size = 1  # Self
+            has_error = node.root.attributes.get("status") == "error"
+            
+            # Add metrics from all children
+            for child in node.children:
+                child_id = child.root.context.span_id
+                size += size_map[child_id]
+                has_error = has_error or error_map[child_id]
+            
+            size_map[node_id] = size
+            error_map[node_id] = has_error
+    
+    return size_map, error_map
+
+
+def _rebuild_tree_with_compression(
+    tree: TraceTree, 
+    size_map: dict[str, int], 
+    error_map: dict[str, bool],
+    policy: "CompressionPolicy"
+) -> TraceTree:
+    """Rebuild tree with compression applied top-down.
+    
+    Args:
+        tree: Input tree to compress
+        size_map: Precomputed subtree sizes
+        error_map: Precomputed error flags
+        policy: Compression policy with threshold
+    
+    Returns:
+        New TraceTree with compression applied
+    """
+    # For non-root nodes, check if eligible for compression
+    def _should_compress(node: TraceTree) -> bool:
+        node_id = node.root.context.span_id
+        size = size_map[node_id]
+        has_error = error_map[node_id]
+        
+        # Skip if already compressed or root
+        is_compressed = node.root.span_type == SpanType.AGENT_REASONING_COMPRESSED or node.compressed
+        is_root = node.root.attributes.get("tree.virtual_root") or tree.root == node
+        
+        return (
+            not is_root and 
+            not is_compressed and 
+            size > policy.max_subtree_size and 
+            not has_error
+        )
+    
+    # Recursive rebuild with compression
+    def _build_compressed_children(current: TraceTree) -> list[TraceTree]:
+        children = []
+        
+        for child_tree in current.children:
+            if _should_compress(child_tree):
+                # Replace child with summary node
+                child_id = child_tree.root.context.span_id
+                subtree_size = size_map[child_id]
+                
+                # Compute total cost
+                total_cost = 0.0
+                # Use synchronous traversal for cost computation
+                stack = [child_tree]
+                while stack:
+                    node = stack.pop()
+                    cost_usd = node.root.attributes.get("cost.usd", 0.0)
+                    cost_usd_sum = node.root.attributes.get("cost.usd_sum", 0.0)
+                    total_cost += float(cost_usd) + float(cost_usd_sum)
+                    stack.extend(reversed(node.children))  # For DFS order
+                
+                summary_span = make_summary_node(child_tree, subtree_size, total_cost)
+                summary_tree = TraceTree(
+                    root=summary_span,
+                    children=[],  # Summary nodes are leaves
+                    compressed=True,
+                    compression_ratio=0.0,
+                )
+                children.append(summary_tree)
+            else:
+                # Recurse into child
+                children.extend(_build_compressed_children(child_tree))
+        
+        return children
+    
+    # Rebuild root and mark compressed nodes
+    new_children = _build_compressed_children(tree)
+    
+    # Mark nodes containing summaries as compressed
+    def _mark_compressed_nodes(node: TraceTree) -> None:
+        has_compressed_child = False
+        for child in node.children:
+            if child.compressed:
+                has_compressed_child = True
+                break
+        if has_compressed_child:
+            node.compressed = True
+        for child in node.children:
+            _mark_compressed_nodes(child)
+    
+    new_tree = TraceTree(
+        root=tree.root,
+        children=new_children,
+        compressed=False,  # Will be set by _mark_compressed_nodes
+        compression_ratio=0.0,  # Will be set later
+    )
+    
+    _mark_compressed_nodes(new_tree)
+    return new_tree
+
+
+@dataclass
+class CompressionPolicy:
+    """Policy for compressing trace trees when subtrees exceed size threshold.
+    
+    PP17: Compression policy: поддерево > 20 узлов сжимается в summary-node
+    """
+    
+    max_subtree_size: int
+    policy_version: str = COMPRESSION_POLICY_VERSION
+    
+    @classmethod
+    def from_env(cls, policy_version: str = COMPRESSION_POLICY_VERSION) -> "CompressionPolicy":
+        """Create policy from environment variable.
+        
+        Priority: param > env > default (20)
+        """
+        default_size = 20
+        try:
+            env_size = int(os.environ.get("TREE_COMPRESSION_THRESHOLD", str(default_size)))
+            if env_size <= 0:
+                raise ValueError(f"Invalid TREE_COMPRESSION_THRESHOLD: {env_size}, must be > 0")
+        except ValueError as e:
+            import warnings
+            warnings.warn(f"Invalid TREE_COMPRESSION_THRESHOLD: {e}, using default {default_size}")
+            env_size = default_size
+        
+        return cls(max_subtree_size=env_size, policy_version=policy_version)
+    
+    def compress(self, tree: TraceTree) -> TraceTree:
+        """Compress tree by replacing subtrees > max_subtree_size with summary nodes.
+        
+        Args:
+            tree: Input TraceTree to compress
+            
+        Returns:
+            New TraceTree with compression applied
+        """
+        # Compute subtree sizes and error flags
+        size_map, error_map = _compute_subtree_metrics(tree)
+        
+        # Rebuild tree with compression
+        compressed_tree = _rebuild_tree_with_compression(tree, size_map, error_map, self)
+        
+        # Compute compression ratio
+        original_count = size_map[tree.root.context.span_id]
+        compressed_count = 0
+        
+        def count_nodes(t: TraceTree) -> None:
+            nonlocal compressed_count
+            if t.root.span_type != SpanType.AGENT_REASONING_COMPRESSED:
+                compressed_count += 1
+        
+        count_nodes(compressed_tree)
+        compression_ratio = max(0.0, min(1.0, (original_count - compressed_count) / original_count))
+        
+        # Update compression ratio on all nodes
+        def set_ratio(t: TraceTree) -> None:
+            t.compression_ratio = compression_ratio
+            for child in t.children:
+                set_ratio(child)
+        
+        set_ratio(compressed_tree)
+        
+        # Update metric
+        agent_id = tree.root.context.agent_id or "unknown"
+        tree_compression_ratio.labels(agent_id=agent_id).set(compression_ratio)
+        
+        return compressed_tree
+
+
+# PP17 Policy version for idempotency
+COMPRESSION_POLICY_VERSION = "1"
 
 
 def compute_tree_metrics(tree: TraceTree) -> TreeMetrics:

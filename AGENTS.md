@@ -71,7 +71,7 @@ not mass-refactor. There is no ruff/mypy config; both run with defaults.
 - **`agent.reasoning` spans are aggregated in-process (PP09).** `_enqueue` routes them through `SpanAggregator` (buffer 50 spans / 1s window) instead of the ring buffer; flushed aggregates re-enter normal export. Aggregation is enabled by default (`AGENT_OBS_AGGREGATION_ENABLED=true`).
 - **Compliance catalog is a free side-product of masking (PC33).** `GuardrailEngine.check_input()` calls `ComplianceCatalog.record()` (sync dict increment, no I/O) for every `redacted_fields` entry. Persistence is a background `asyncio` task batching UPSERTs to Postgres `compliance_catalog` once per minute (`flush_interval`). On flush failure the buffer is kept and retried; `asyncpg` stays optional via `AGENT_OBS_COMPLIANCE_PG` (NullCatalogWriter fallback). `tool_name` for catalog rows comes from `SpanContext.tool_name`, set only in `tool_call`.
 
-## Span types (only 4 in MVP)
+## Span types (5 in MVP after PP17)
 
 | Type | Value |
 |---|---|
@@ -79,6 +79,7 @@ not mass-refactor. There is no ruff/mypy config; both run with defaults.
 | LLM call | `llm.call` |
 | Tool call | `tool.call` |
 | Reasoning micro-span | `agent.reasoning` (PP09: routed through SpanAggregator when aggregation is enabled) |
+| Compressed reasoning | `agent.reasoning.compressed` (PP17: tree compression summary nodes, tree-only, never exported) |
 
 Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use.
 
@@ -107,6 +108,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_USER_HASH_SALT` | `""` | Salt for user hashing (empty = no salt). |
 | `AGENT_OBS_TLS_CA` / `_CERT` / `_KEY` | — | mTLS material for exporters (PP02). |
 | `AGENT_OBS_EVAL_ADAPTIVE_SAMPLER` | `false` | Enable adaptive eval sampler in LLM judge when a judge is supplied. PP14. |
+| `TREE_COMPRESSION_THRESHOLD` | `20` | PP17: Max subtree size before compression to summary node (tree compression). |
 | `AGENT_OBS_EVAL_INCIDENT_RATE_LIMIT` | `100` | Max incident eval jobs per minute (Redis-based rate limiter). PP14. |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
