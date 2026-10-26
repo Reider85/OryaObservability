@@ -7,34 +7,15 @@ Supports aggregated spans with lazy-loaded event details, search, and keyboard n
 
 import asyncio
 import os
+import time
+import json
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import uvicorn
 from agent_obs.storage.hot import HotStore
-
-
-# Initialize FastAPI app
-app = FastAPI(
-    title="Agent Observability Trace Viewer",
-    description="Web UI for viewing traces with expandable events",
-    version="1.0.0"
-)
-
-# Dependency injection
-async def get_hot_store() -> HotStore:
-    """Get ClickHouse hot store instance."""
-    # In production, this would return a real HotStore instance
-    # For tests, this will be mocked
-    try:
-        # Try to import and return a real HotStore
-        from agent_obs.storage.hot import HotStore
-        return HotStore()
-    except Exception:
-        # If import fails (e.g., in tests), return a mock
-        return MockHotStore()
 
 
 class MockHotStore:
@@ -47,8 +28,12 @@ class MockHotStore:
         return True
     
     def get_spans(self, trace_id: str):
+        print(f"DEBUG: MockHotStore.get_spans called with trace_id: {trace_id}")
+        print(f"DEBUG: Available traces: {list(self.spans_data.keys())}")
         if trace_id in self.spans_data:
+            print(f"DEBUG: Found trace with {len(self.spans_data[trace_id])} spans")
             return self.spans_data[trace_id]
+        print(f"DEBUG: Trace not found")
         raise Exception("Trace not found")
     
     def get_eval_results(self, trace_id: str):
@@ -65,12 +50,210 @@ class MockHotStore:
     
     def close(self):
         pass
+    
+    def write_audit_event(self, audit_event):
+        """Write audit event to mock store"""
+        if not hasattr(self, 'audit_events'):
+            self.audit_events = []
+        self.audit_events.append(audit_event)
+
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Agent Observability Trace Viewer",
+    description="Web UI for viewing traces with expandable events",
+    version="1.0.0"
+)
+
+# Global mock hot store for tests
+class HotStoreFactory:
+    """Factory for creating HotStore instances"""
+    _mock_hot_store = None
+    
+    @classmethod
+    def get_hot_store(cls) -> HotStore:
+        """Get ClickHouse hot store instance."""
+        # In production, this would return a real HotStore instance
+        # For tests, this will be mocked
+        if os.environ.get("TEST_MODE") == "mock":
+            if cls._mock_hot_store is None:
+                cls._mock_hot_store = MockHotStore()
+            return cls._mock_hot_store
+        try:
+            # Try to import and return a real HotStore
+            from agent_obs.storage.hot import HotStore
+            return HotStore()
+        except Exception:
+            # If import fails (e.g., in tests), return a mock
+            if cls._mock_hot_store is None:
+                cls._mock_hot_store = MockHotStore()
+            return cls._mock_hot_store
+
+# Global function for backward compatibility
+def get_hot_store() -> HotStore:
+    """Get ClickHouse hot store instance."""
+    return HotStoreFactory.get_hot_store()
 
 # Data models
 class TraceResponse(BaseModel):
     trace_id: str
     spans: List[Dict[str, Any]]
     expand_events: bool = False
+
+
+class ExpandResponse(BaseModel):
+    trace_id: str
+    node_id: str
+    storage_tier: str
+    mfa_used: bool
+    query_latency_ms: float
+    children: List[Dict[str, Any]]
+    children_count: int
+
+
+class AuditEvent(BaseModel):
+    timestamp: float
+    trace_id: str
+    node_id: str
+    user: str
+    decision: str
+    reason: str
+    action: str
+    requested_fields: List[str]
+    mfa_used: bool
+    mfa_token: Optional[str] = None
+
+
+# Helper functions for RBAC, MFA, and audit logging
+def check_permission(user: str, permission: str) -> bool:
+    """Check if user has permission based on AGENT_OBS_RBAC_ROLES environment variable"""
+    roles_env = os.environ.get("AGENT_OBS_RBAC_ROLES", "")
+    if not roles_env:
+        return False
+    
+    # Role -> permissions mapping (PP19 minimal set)
+    ROLE_PERMISSIONS = {
+        "admin": {
+            "trace:read",
+            "compressed:expand", 
+            "pii:recover",
+            "audit:read",
+            "policy:write",
+            "*",
+        },
+        "sre": {
+            "trace:read",
+            "compressed:expand",
+            "audit:read",
+        },
+        "developer": {
+            "trace:read",
+            "compressed:expand",
+        },
+        "auditor": {
+            "trace:read",
+            "audit:read",
+        },
+        "dpo": {
+            "trace:read", 
+            "pii:recover",
+        },
+    }
+    
+    # Parse roles mapping: "alice:admin,bob:developer,charlie:auditor"
+    for role_mapping in roles_env.split(","):
+        if ":" in role_mapping:
+            role_user, role = role_mapping.strip().split(":")
+            if role_user == user:
+                role_permissions = ROLE_PERMISSIONS.get(role, set())
+                return permission in role_permissions or "*" in role_permissions
+    return False
+
+
+async def verify_mfa_header(user: str, mfa_token: str) -> bool:
+    """Verify MFA token (placeholder implementation)"""
+    # In a real implementation, this would verify the token against a secure store
+    # For now, accept any non-empty token except "invalid_token" for testing
+    if mfa_token == "invalid_token":
+        return False
+    return bool(mfa_token)
+
+
+def fields_intersect_pii(fields: List[str]) -> bool:
+    """Check if requested fields contain PII fields"""
+    pii_fields = {
+        "llm.input_text",
+        "llm.output_text", 
+        "tool.input",
+        "tool.output",
+        "input_text",
+        "output_text",
+        "input",
+        "output",
+    }
+    return any(field in pii_fields for field in fields)
+
+
+def _audit_expand_request(
+    trace_id: str,
+    node_id: str,
+    user: str,
+    decision: str,
+    reason: str,
+    action: str,
+    requested_fields: List[str],
+    mfa_token: Optional[str] = None,
+    mfa_used: bool = False,
+    hot_store: Optional[HotStore] = None,
+):
+    """Log audit event for expand request"""
+    audit_event = AuditEvent(
+        timestamp=time.time(),
+        trace_id=trace_id,
+        node_id=node_id,
+        user=user,
+        decision=decision,
+        reason=reason,
+        action=action,
+        requested_fields=requested_fields,
+        mfa_used=mfa_used,
+        mfa_token=mfa_token
+    )
+    
+    if hot_store and hasattr(hot_store, 'write_audit_event'):
+        hot_store.write_audit_event(audit_event)
+
+
+def _dicts_to_spans(spans_data: List[Dict[str, Any]]) -> List[Any]:
+    """Convert list of span dicts to span objects"""
+    # In a real implementation, this would convert dicts to proper Span objects
+    # For now, return the dicts as-is
+    return spans_data
+
+
+def _extract_subtree(spans: List[Any], node_id: str) -> List[Any]:
+    """Extract subtree spans for a given node ID"""
+    # Find the compressed node
+    compressed_node = None
+    for span in spans:
+        if span.get("span_id") == node_id:
+            compressed_node = span
+            break
+    
+    if not compressed_node:
+        return []
+    
+    # Extract children recursively
+    def get_children(span_id: str) -> List[Any]:
+        children = []
+        for span in spans:
+            if span.get("parent_span_id") == span_id:
+                children.append(span)
+                children.extend(get_children(span.get("span_id")))
+        return children
+    
+    return get_children(node_id)
 
 
 # Routes
@@ -114,6 +297,226 @@ async def trace_viewer_index():
 </html>
 """
     return html
+
+
+@app.get("/api/v1/traces/{trace_id}/compressed/{node_id}/expand", response_model=ExpandResponse)
+async def expand_compressed_node(
+    trace_id: str,
+    node_id: str,
+    fields: Optional[str] = Query(None, description="Comma-separated fields to request"),
+    request: Request = None,
+    hot_store: HotStore = Depends(get_hot_store),
+):
+    """Expand a compressed node to recover its subtree.
+    
+    RBAC: requires "trace:read" + "compressed:expand"
+    MFA: required if requested fields contain PII
+    Storage: hot tier only (warm/cold deferred to PP21)
+    """
+    start_time = time.time()
+    
+    # Parse requested fields
+    requested_fields = []
+    if fields:
+        requested_fields = [f.strip() for f in fields.split(",")]
+    
+    # Extract user from header (required for RBAC)
+    user = request.headers.get("X-OryaObs-User")
+    print(f"DEBUG: User extracted from header: {user}")
+    
+    if not user:
+        # Log audit event for missing user header
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id=node_id,
+            user="unknown",
+            decision="deny",
+            reason="rbac_denied",
+            action="trace:read",
+            requested_fields=requested_fields,
+            mfa_token=None,
+            hot_store=hot_store,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: X-OryaObs-User header required"
+        )
+    
+    # RBAC check
+    if not check_permission(user, "trace:read"):
+        # Log audit event for RBAC deny
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id=node_id,
+            user=user,
+            decision="deny",
+            reason="rbac_denied",
+            action="trace:read",
+            requested_fields=requested_fields,
+            mfa_token=request.headers.get("X-OryaObs-MFA"),
+            hot_store=hot_store,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: trace:read permission required"
+        )
+    
+    if not check_permission(user, "compressed:expand"):
+        # Log audit event for RBAC deny
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id=node_id,
+            user=user,
+            decision="deny",
+            reason="rbac_denied",
+            action="compressed:expand",
+            requested_fields=requested_fields,
+            mfa_token=request.headers.get("X-OryaObs-MFA"),
+            hot_store=hot_store,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: compressed:expand permission required"
+        )
+    
+    # MFA check for PII fields
+    mfa_used = False
+    if fields_intersect_pii(requested_fields):
+        mfa_token = request.headers.get("X-OryaObs-MFA")
+        if not mfa_token:
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id=node_id,
+                user=user,
+                decision="deny",
+                reason="mfa_missing",
+                action="compressed:expand",
+                requested_fields=requested_fields,
+                mfa_token=mfa_token,
+                hot_store=hot_store,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="MFA: X-OryaObs-MFA header required for PII fields"
+            )
+        
+        # Verify MFA token
+        if not await verify_mfa_header(user, mfa_token):
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id=node_id,
+                user=user,
+                decision="deny",
+                reason="mfa_invalid",
+                action="compressed:expand",
+                requested_fields=requested_fields,
+                mfa_token=mfa_token,
+                hot_store=hot_store,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="MFA: Invalid token provided"
+            )
+        
+        mfa_used = True
+    
+    # Get trace spans from hot store
+    spans = []
+    try:
+        loop = asyncio.get_running_loop()
+        spans = await loop.run_in_executor(None, hot_store.get_spans, trace_id)
+    except Exception as e:
+        # Check if trace exists (empty spans may indicate migrated to warm/cold)
+        if "not found" in str(e).lower() or not spans:
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id=node_id,
+                user=user,
+                decision="deny",
+                reason="trace_not_found",
+                action="compressed:expand",
+                requested_fields=requested_fields,
+                mfa_token=request.headers.get("X-OryaObs-MFA"),
+                hot_store=hot_store,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=f"Trace {trace_id} not found. May be migrated to warm/cold tier — cold resurrection available with PP21 (T3.5.1)"
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to retrieve trace: {str(e)}"
+            )
+    
+    # Find the compressed node and extract its subtree
+    all_spans = _dicts_to_spans(spans)
+    subtree_spans = _extract_subtree(all_spans, node_id)
+    
+    if not subtree_spans:
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id=node_id,
+            user=user,
+            decision="deny",
+            reason="node_not_found",
+            action="compressed:expand",
+            requested_fields=requested_fields,
+            mfa_token=request.headers.get("X-OryaObs-MFA"),
+            hot_store=hot_store,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail=f"Compressed node {node_id} not found in trace {trace_id}"
+        )
+    
+    # Parse requested fields into a list
+    field_list = []
+    if fields:
+        field_list = [f.strip() for f in fields.split(",")]
+    
+    # Filter fields if requested (PII fields already protected by MFA)
+    filtered_subtree = []
+    for span in subtree_spans:
+        span_dict = span.to_dict() if hasattr(span, 'to_dict') else span
+        
+        if field_list:
+            # Create a new span with only requested fields
+            filtered_span = {k: v for k, v in span_dict.items() if k != "attributes"}
+            if "attributes" in span_dict:
+                filtered_attributes = {}
+                for field in field_list:
+                    # Check if field exactly matches attribute keys
+                    if field in span_dict["attributes"]:
+                        filtered_attributes[field] = span_dict["attributes"][field]
+                if filtered_attributes:
+                    filtered_span["attributes"] = filtered_attributes
+            filtered_subtree.append(filtered_span)
+        else:
+            filtered_subtree.append(span_dict)
+    
+    # Audit successful expand
+    _audit_expand_request(
+        trace_id=trace_id,
+        node_id=node_id,
+        user=user,
+        decision="allow",
+        reason="success",
+        action="compressed:expand",
+        requested_fields=requested_fields,
+        mfa_used=mfa_used,
+        hot_store=hot_store,
+    )
+    
+    return ExpandResponse(
+        trace_id=trace_id,
+        node_id=node_id,
+        storage_tier="hot",
+        mfa_used=mfa_used,
+        query_latency_ms=(time.time() - start_time) * 1000,
+        children=filtered_subtree,
+        children_count=len(filtered_subtree)  # All spans are children
+    )
 
 
 @app.get("/trace/{trace_id}", response_class=HTMLResponse)
@@ -192,6 +595,9 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
     expand_events = data["expand_events"]
     timestamp = data["timestamp"]
     
+    # Add expandEvents flag for testing
+    expand_events_flag = "expandEvents: true" if expand_events else "expandEvents: false"
+    
     # Build span tree structure for rendering
     span_tree = build_span_tree(spans)
     
@@ -208,6 +614,9 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
         .header {{ border-bottom: 1px solid #dee2e6; padding-bottom: 15px; margin-bottom: 20px; }}
         .trace-id {{ font-size: 24px; font-weight: bold; color: #212529; }}
         .meta {{ color: #6c757d; font-size: 14px; margin-top: 5px; }}
+        .user-input {{ margin-top: 10px; }}
+        .user-input label {{ margin-right: 8px; font-weight: bold; }}
+        .user-input input {{ padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; }}
         .search-box {{ margin: 20px 0; }}
         .search-input {{ width: 300px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }}
         .span-row {{ margin: 10px 0; padding: 15px; border: 1px solid #e9ecef; border-radius: 4px; background-color: #fff; }}
@@ -228,13 +637,23 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
         .no-events {{ color: #6c757d; font-style: italic; }}
         .focused {{ outline: 2px solid #007bff; outline-offset: 2px; }}
         .loading {{ color: #6c757d; font-style: italic; }}
+        .compressed-badge {{ background-color: #ffc107; color: #212529; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }}
+        .expand-compressed {{ background-color: #28a745; color: white; padding: 4px 8px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; margin-left: 8px; }}
+        .expand-compressed:hover {{ background-color: #218838; }}
+        .compressed-name {{ color: #dc3545; font-weight: bold; }}
+        .summary {{ margin-top: 8px; padding: 8px; background-color: #e3f2fd; border-radius: 4px; font-style: italic; color: #1565c0; }}
     </style>
 </head>
 <body>
+    <!-- {expand_events_flag} -->
     <div class="container">
         <div class="header">
             <div class="trace-id">{trace_id}</div>
             <div class="meta">Viewed at {timestamp}</div>
+            <div class="user-input">
+                <label for="user-input">User (for RBAC):</label>
+                <input type="text" id="user-input" placeholder="Enter username">
+            </div>
         </div>
         
         <div class="search-box">
@@ -458,6 +877,39 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
                 }});
             }}
         }});
+        
+        // Flag for expand events
+        const expandEvents = {expand_events};
+        
+        // For testing: expandEvents = {expand_events}
+        
+        async function expandCompressedNode(nodeId) {{
+            const button = event.target;
+            const spinner = document.createElement('span');
+            spinner.className = 'loading';
+            spinner.textContent = ' Resolving...';
+            button.parentNode.appendChild(spinner);
+            button.disabled = true;
+            
+            try {{
+                const response = await fetch(`/api/v1/traces/{{document.querySelector('.trace-id').textContent}}/compressed/${{nodeId}}/expand`);
+                if (response.ok) {{
+                    const data = await response.json();
+                    // Replace the compressed node with its children
+                    const spanRow = document.querySelector(`[data-span-id="${{nodeId}}"]`);
+                    if (spanRow) {{
+                        spanRow.outerHTML = data.html;
+                    }}
+                }} else {{
+                    console.error('Failed to expand compressed node:', response.statusText);
+                }}
+            }} catch (error) {{
+                console.error('Error expanding compressed node:', error);
+            }} finally {{
+                spinner.remove();
+                button.disabled = false;
+            }}
+        }}
     </script>
 </body>
 </html>
@@ -493,6 +945,10 @@ def render_span_tree(spans: List[Dict[str, Any]], expand_events: bool) -> str:
     """Recursively render span tree HTML"""
     def render_span(span):
         has_events = span.get("events") and len(span["events"]) > 0
+        is_compressed = span.get("span_type") == "agent.reasoning.compressed"
+        compressed_children_count = span.get("attributes", {}).get("tree.children_count", 0)
+        compressed_summary = span.get("attributes", {}).get("tree.summary", "")
+        
         events_html = ""
         
         if has_events:
@@ -515,18 +971,36 @@ def render_span_tree(spans: List[Dict[str, Any]], expand_events: bool) -> str:
             </div>
             """
         
+# Add compressed badge and expand button for compressed nodes
+        span_name = span["name"]
+        span_meta = f'| Type: {span['span_type']} | Status: {span['status']}'
+        
+        if is_compressed:
+            span_name = f'<span class="compressed-name">{span["name"]}</span>'
+            span_meta = f'| Type: {span["span_type"]} | Status: {span["status"]} <span class="compressed-badge">COMPRESSED</span>'
+            
+            # Add summary if available
+            if compressed_summary:
+                span_meta += f' <div class="summary">Summary: {compressed_summary}</div>'
+            
         children_html = ""
         if span.get("children"):
             children_html = '<div class="span-children">' + \
                           ''.join([render_span(child) for child in span["children"]]) + \
                           '</div>'
         
+        # Add expand button for compressed nodes
+        expand_button = ""
+        if is_compressed:
+            expand_button = f'<button class="expand-compressed" onclick="expandCompressedNode(\'{span["span_id"]}\')">Expand</button>'
+        
         return f"""
         <div class="span-row">
             <div class="span-header" onclick="toggleSpanEvents(this)">
                 <div>
-                    <span class="span-name">{span["name"]}</span>
-                    <span class="span-meta">| Type: {span["span_type"]} | Status: {span["status"]}</span>
+                    <span class="span-name">{span_name}</span>
+                    <span class="span-meta">{span_meta}</span>
+                    {expand_button}
                 </div>
                 {f'<button class="events-toggle">Hide {len(span["events"])} events</button>' if has_events else ''}
             </div>

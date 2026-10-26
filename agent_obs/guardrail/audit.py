@@ -575,6 +575,100 @@ class SamplerRateChangeAuditEvent:
 
 
 @dataclass
+class CompressedExpandAuditEvent:
+    """Audit event for compressed node expand (PP19).
+
+    Records each compressed node expand request for security and compliance.
+    Includes RBAC decision, MFA usage, and requested fields for audit trail.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    actor: dict[str, str]  # {"type": "user", "id": login}
+    resource: dict[str, Any]  # {"type": "compressed_node", "trace_id", "node_id", "requested_fields", "mfa_used"}
+    reason: str  # "ok", "rbac_denied", "mfa_missing", "mfa_invalid", "trace_not_found", "node_not_found"
+    action: str = "tree.compressed_expand"
+    decision: str = "allow"  # "allow" or "deny"
+    trace_id: str = ""
+    ip_address: str = "unknown"
+    user_agent: str = "trace-viewer-expand-api"
+
+    @classmethod
+    def for_expand(
+        cls,
+        trace_id: str,
+        node_id: str,
+        user: str,
+        decision: str,
+        reason: str,
+        requested_fields: list[str] | None = None,
+        mfa_used: bool = False,
+        ip_address: str = "unknown",
+    ) -> "CompressedExpandAuditEvent":
+        """Create an audit event for compressed node expand request.
+
+        Args:
+            trace_id: Trace ID containing the compressed node
+            node_id: Span ID of the compressed node being expanded
+            user: User login making the request
+            decision: "allow" or "deny"
+            reason: Reason for decision (see class docstring)
+            requested_fields: Optional list of requested fields (for PIA check)
+            mfa_used: Whether MFA was used and valid
+            ip_address: Client IP address
+        """
+        return cls(
+            audit_id=f"cde-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "user", "id": user},
+            resource={
+                "type": "compressed_node",
+                "trace_id": trace_id,
+                "node_id": node_id,
+                "requested_fields": requested_fields or [],
+                "mfa_used": mfa_used,
+            },
+            reason=reason,
+            action="tree.compressed_expand",
+            decision=decision,
+            trace_id=trace_id,
+            ip_address=ip_address,
+            user_agent="trace-viewer-expand-api",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Flatten the expand metadata for the Query API."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "decision": self.decision,
+            "resource": self.resource,
+            "reason": self.reason,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to a ClickHouse INSERT row matching the audit_events_hot DDL."""
+        resource = dict(self.resource)
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
 class EvalSamplerModeChangeAuditEvent:
     """Audit event for eval sampler mode change (PP12).
 

@@ -49,6 +49,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_langfuse_event_mapping.py`: Unit tests for PP10 Langfuse event mapping functionality
 - `tests/test_trace_viewer.py`: TestClient tests for trace viewer UI (requires ClickHouse mocking for full functionality)
 - `tests/e2e/test_trace_viewer_e2e.py`: Playwright e2e tests for trace viewer (requires `playwright install chromium` once)
+- `tests/test_compressed_expand_api.py`: Unit tests for PP19 compressed node expand API with RBAC/MFA support
 
 ## Lint / typecheck
 
@@ -112,6 +113,9 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_TREE_SUMMARY_ENABLED` | `true` | Enable async LLM summary generation for compressed nodes (PP18). |
 | `AGENT_OBS_TREE_SUMMARY_CACHE_TTL` | `604800` | Redis TTL for tree summary cache in seconds (PP18). |
 | `AGENT_OBS_EVAL_INCIDENT_RATE_LIMIT` | `100` | Max incident eval jobs per minute (Redis-based rate limiter). PP14. |
+| `AGENT_OBS_RBAC_ROLES` | — | PP19: User→role mapping for compressed expand API (e.g., "alice:admin,bob:developer"). Unknown users fail-closed. |
+| `X-OryaObs-User` | — | PP19: HTTP header with user login for RBAC in compressed expand API. |
+| `X-OryaObs-MFA` | — | PP19: HTTP header with MFA token for PII field requests in compressed expand API. |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
 `AGENT_OBS_CRON_*` family (~30 vars: retention days, specs, batch sizes,

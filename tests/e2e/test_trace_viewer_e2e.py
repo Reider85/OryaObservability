@@ -315,3 +315,363 @@ class TestTraceViewerE2E:
             # Child should have indentation (visual representation)
             child_span = page.locator(".span-row").nth(1)
             expect(child_span).to_have_css("margin-left", "30px")
+    
+    def test_compressed_node_display(self, page: Page):
+        """Test that compressed nodes are displayed with badge"""
+        # Mock trace with compressed node
+        compressed_spans = [
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "root_1",
+                "parent_span_id": "",
+                "name": "agent.loop",
+                "span_type": "agent.loop",
+                "start_time": 1705326600.0,
+                "end_time": 1705326602.0,
+                "status": "ok",
+                "attributes": {"agent_id": "test-agent"},
+                "events": []
+            },
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "compressed_1",
+                "parent_span_id": "root_1",
+                "name": "compressed:5",
+                "span_type": "agent.reasoning.compressed",
+                "start_time": 1705326602.0,
+                "end_time": 1705326603.0,
+                "status": "ok",
+                "attributes": {
+                    "agent_id": "test-agent",
+                    "tree.compressed": True,
+                    "tree.children_count": 5,
+                    "tree.summary": "pending",
+                    "tree.policy_version": "1"
+                },
+                "events": []
+            }
+        ]
+        
+        with patch('agent_obs.trace_viewer.ui.hot_store') as mock_store:
+            mock_store.get_spans.return_value = compressed_spans
+            
+            page.goto(f"{page.url}trace/compressed_trace")
+            
+            # Should show compressed node with badge
+            compressed_span = page.locator(".span-row").nth(1)
+            expect(compressed_span.locator(".compressed-badge")).to_be_visible()
+            expect(compressed_span.locator(".compressed-badge")).to_have_text("COMPRESSED")
+            
+            # Should show expand button
+            expand_button = compressed_span.locator(".expand-button")
+            expect(expand_button).to_be_visible()
+            expect(expand_button).to_have_text("Expand")
+            
+            # Should show spinner initially
+            expect(compressed_span.locator(".spinner")).to_be_hidden()  # Hidden until clicked
+    
+    def test_expand_compressed_node_success(self, page: Page):
+        """Test successful expand of compressed node"""
+        # Mock trace with compressed node and children
+        compressed_spans = [
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "root_1",
+                "parent_span_id": "",
+                "name": "agent.loop",
+                "span_type": "agent.loop",
+                "start_time": 1705326600.0,
+                "end_time": 1705326602.0,
+                "status": "ok",
+                "attributes": {"agent_id": "test-agent"},
+                "events": []
+            },
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "compressed_1",
+                "parent_span_id": "root_1",
+                "name": "compressed:5",
+                "span_type": "agent.reasoning.compressed",
+                "start_time": 1705326602.0,
+                "end_time": 1705326603.0,
+                "status": "ok",
+                "attributes": {
+                    "agent_id": "test-agent",
+                    "tree.compressed": True,
+                    "tree.children_count": 5,
+                    "tree.summary": "pending",
+                    "tree.policy_version": "1"
+                },
+                "events": []
+            },
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "child_1",
+                "parent_span_id": "compressed_1",
+                "name": "llm.call",
+                "span_type": "llm.call",
+                "start_time": 1705326603.0,
+                "end_time": 1705326604.0,
+                "status": "ok",
+                "attributes": {
+                    "model": "gpt-4",
+                    "llm.input_text": "Hello world",
+                    "llm.output_text": "Hello there"
+                },
+                "events": []
+            },
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "child_2",
+                "parent_span_id": "compressed_1",
+                "name": "tool.call",
+                "span_type": "tool.call",
+                "start_time": 1705326604.0,
+                "end_time": 1705326605.0,
+                "status": "ok",
+                "attributes": {
+                    "tool.name": "calculator",
+                    "tool.input": "2+2"
+                },
+                "events": []
+            }
+        ]
+        
+        with patch('agent_obs.trace_viewer.ui.hot_store') as mock_store:
+            mock_store.get_spans.return_value = compressed_spans
+            
+            page.goto(f"{page.url}trace/compressed_trace")
+            
+            # Find compressed node
+            compressed_span = page.locator(".span-row").nth(1)
+            expand_button = compressed_span.locator(".expand-button")
+            
+            # Click expand button
+            expand_button.click()
+            
+            # Should show spinner
+            expect(compressed_span.locator(".spinner")).to_be_visible()
+            
+            # Mock the API call to expand endpoint
+            api_response = {
+                "trace_id": "compressed_trace",
+                "node_id": "compressed_1",
+                "storage_tier": "hot",
+                "mfa_used": False,
+                "query_latency_ms": 45,
+                "children_count": 2,
+                "children": [
+                    {
+                        "span_id": "child_1",
+                        "name": "llm.call",
+                        "span_type": "llm.call",
+                        "start_time": 1705326603.0,
+                        "end_time": 1705326604.0,
+                        "status": "ok",
+                        "attributes": {
+                            "model": "gpt-4",
+                            "llm.input_text": "Hello world",
+                            "llm.output_text": "Hello there"
+                        }
+                    },
+                    {
+                        "span_id": "child_2",
+                        "name": "tool.call",
+                        "span_type": "tool.call",
+                        "start_time": 1705326604.0,
+                        "end_time": 1705326605.0,
+                        "status": "ok",
+                        "attributes": {
+                            "tool.name": "calculator",
+                            "tool.input": "2+2"
+                        }
+                    }
+                ]
+            }
+            
+            # Intercept the API call and return mock response
+            page.route("**/api/v1/traces/compressed_trace/compressed/compressed_1", lambda route: route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(api_response)
+            ))
+            
+            # Wait for spinner to disappear and children to appear
+            page.wait_for_selector(".spinner", state="hidden")
+            
+            # Should show children spans
+            children_spans = page.locator(".span-row").filter(has_text="child_1, child_2")
+            expect(children_spans).to_have_count(2)
+            
+            # Check that children are properly indented
+            child1 = page.locator(".span-row").filter(has_text="llm.call")
+            child2 = page.locator(".span-row").filter(has_text="tool.call")
+            expect(child1).to_have_css("margin-left", "60px")  # Double indentation
+            expect(child2).to_have_css("margin-left", "60px")
+            
+            # Expand button should now show "Collapse"
+            expect(expand_button).to_have_text("Collapse")
+    
+    def test_expand_compressed_node_with_mfa(self, page: Page):
+        """Test expand with MFA for PII fields"""
+        # Mock trace with PII in compressed children
+        compressed_spans = [
+            {
+                "trace_id": "pi_trace",
+                "span_id": "root_1",
+                "parent_span_id": "",
+                "name": "agent.loop",
+                "span_type": "agent.loop",
+                "start_time": 1705326600.0,
+                "end_time": 1705326602.0,
+                "status": "ok",
+                "attributes": {"agent_id": "test-agent"},
+                "events": []
+            },
+            {
+                "trace_id": "pi_trace",
+                "span_id": "compressed_1",
+                "parent_span_id": "root_1",
+                "name": "compressed:3",
+                "span_type": "agent.reasoning.compressed",
+                "start_time": 1705326602.0,
+                "end_time": 1705326603.0,
+                "status": "ok",
+                "attributes": {
+                    "agent_id": "test-agent",
+                    "tree.compressed": True,
+                    "tree.children_count": 3,
+                    "tree.summary": "pending",
+                    "tree.policy_version": "1"
+                },
+                "events": []
+            }
+        ]
+        
+        with patch('agent_obs.trace_viewer.ui.hot_store') as mock_store:
+            mock_store.get_spans.return_value = compressed_spans
+            
+            page.goto(f"{page.url}trace/pi_trace")
+            
+            # Find compressed node
+            compressed_span = page.locator(".span-row").nth(1)
+            expand_button = compressed_span.locator(".expand-button")
+            
+            # Click expand button
+            expand_button.click()
+            
+            # Should show user input modal for MFA
+            user_modal = page.locator(".user-modal")
+            expect(user_modal).to_be_visible()
+            
+            # Enter user and MFA
+            user_input = user_modal.locator("#user-input")
+            mfa_input = user_modal.locator("#mfa-input")
+            submit_button = user_modal.locator(".submit-button")
+            
+            user_input.fill("developer")
+            mfa_input.fill("123456")
+            submit_button.click()
+            
+            # Mock successful API response
+            api_response = {
+                "trace_id": "pi_trace",
+                "node_id": "compressed_1",
+                "storage_tier": "hot",
+                "mfa_used": True,
+                "query_latency_ms": 67,
+                "children_count": 1,
+                "children": [
+                    {
+                        "span_id": "child_1",
+                        "name": "llm.call",
+                        "span_type": "llm.call",
+                        "start_time": 1705326603.0,
+                        "end_time": 1705326604.0,
+                        "status": "ok",
+                        "attributes": {
+                            "model": "gpt-4",
+                            "llm.input_text": "Hello world",
+                            "llm.output_text": "Hello there"
+                        }
+                    }
+                ]
+            }
+            
+            # Intercept API call
+            page.route("**/api/v1/traces/pi_trace/compressed/compressed_1", lambda route: route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps(api_response)
+            ))
+            
+            # Wait for modal to disappear and children to appear
+            page.wait_for_selector(".user-modal", state="hidden")
+            
+            # Should show expanded children
+            child_span = page.locator(".span-row").filter(has_text="llm.call")
+            expect(child_span).to_be_visible()
+            
+            # MFA should be shown in the UI
+            expect(compressed_span.locator(".mfa-indicator")).to_be_visible()
+            expect(compressed_span.locator(".mfa-indicator")).to_have_text("MFA Used")
+    
+    def test_expand_compressed_node_insufficient_permissions(self, page: Page):
+        """Test expand with insufficient permissions"""
+        page.goto(f"{page.url}trace/compressed_trace")
+        
+        # Find compressed node
+        compressed_span = page.locator(".span-row").nth(1)
+        expand_button = compressed_span.locator(".expand-button")
+        
+        # Click expand button
+        expand_button.click()
+        
+        # Should show user input modal
+        user_modal = page.locator(".user-modal")
+        expect(user_modal).to_be_visible()
+        
+        # Enter user without sufficient permissions
+        user_input = user_modal.locator("#user-input")
+        submit_button = user_modal.locator(".submit-button")
+        
+        user_input.fill("auditor")  # auditor role doesn't have compressed:expand
+        submit_button.click()
+        
+        # Should show error message
+        error_message = user_modal.locator(".error-message")
+        expect(error_message).to_be_visible()
+        expect(error_message).to_have_text("Insufficient permissions: compressed:expand permission required")
+        
+        # Modal should still be open
+        expect(user_modal).to_be_visible()
+    
+    def test_expand_compressed_node_missing_mfa(self, page: Page):
+        """Test expand without MFA for PII fields"""
+        page.goto(f"{page.url}trace/pi_trace")
+        
+        # Find compressed node
+        compressed_span = page.locator(".span-row").nth(1)
+        expand_button = compressed_span.locator(".expand-button")
+        
+        # Click expand button
+        expand_button.click()
+        
+        # Should show user input modal
+        user_modal = page.locator(".user-modal")
+        expect(user_modal).to_be_visible()
+        
+        # Enter user but no MFA
+        user_input = user_modal.locator("#user-input")
+        submit_button = user_modal.locator(".submit-button")
+        
+        user_input.fill("developer")
+        submit_button.click()
+        
+        # Should show MFA required error
+        error_message = user_modal.locator(".error-message")
+        expect(error_message).to_be_visible()
+        expect(error_message).to_have_text("MFA required for PII fields")
+        
+        # Modal should still be open
+        expect(user_modal).to_be_visible()

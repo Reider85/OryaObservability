@@ -59,64 +59,103 @@ class MockHotStore:
         pass
 
 
+# Import os for environment variable manipulation
+import os
+
+# Import the UI module
+import agent_obs.trace_viewer.ui as ui_module
+from agent_obs.trace_viewer.ui import app
+
 # Mock the HotStore import to prevent ClickHouse connection
 import sys
 from unittest.mock import MagicMock
 sys.modules['agent_obs.storage.hot'] = MagicMock()
 sys.modules['agent_obs.storage.hot'].HotStore = MockHotStore
 
+# Create a mock function that returns our mock hot store
+def mock_get_hot_store_func():
+    print("DEBUG: Mock get_hot_store called")
+    return mock_hot_store_instance
+
+# Replace the original function with our mock
+ui_module.get_hot_store = mock_get_hot_store_func
+
+# Create a global mock hot store instance that will be used by all tests
+mock_hot_store_instance = MockHotStore()
+
 
 class TestTraceViewer:
     """Test suite for trace viewer service"""
+    
+    # Class-level mock hot store instance
+    mock_hot_store = None
+    
+    # Mock span data with events
+    mock_spans = [
+        {
+            "trace_id": "01H2ABC123",
+            "span_id": "01H2ABC123",
+            "parent_span_id": "",
+            "name": "agent.loop",
+            "span_type": "agent.loop",
+            "start_time": 1705326600.0,
+            "end_time": 1705326602.0,
+            "status": "ok",
+            "attributes": {"agent_id": "test-agent"},
+            "events": [
+                {
+                    "name": "reasoning_step",
+                    "ts": "2024-01-15T10:30:00.000Z",
+                    "attributes": {"step": 1, "input": "Hello"}
+                },
+                {
+                    "name": "error_occurred",
+                    "ts": "2024-01-15T10:30:01.000Z",
+                    "attributes": {"status": "error", "error_code": "500"}
+                }
+            ]
+        },
+        {
+            "trace_id": "01H2ABC123",
+            "span_id": "01H2DEF456",
+            "parent_span_id": "01H2ABC123",
+            "name": "llm.call",
+            "span_type": "llm.call",
+            "start_time": 1705326602.0,
+            "end_time": 1705326603.0,
+            "status": "ok",
+            "attributes": {"model": "gpt-4"},
+            "events": []
+        }
+    ]
     
     def setup_method(self):
         """Setup test client and mock data"""
         self.client = TestClient(app)
         
-        # Mock span data with events
-        self.mock_spans = [
-            {
-                "trace_id": "01H2ABC123",
-                "span_id": "01H2ABC123",
-                "parent_span_id": "",
-                "name": "agent.loop",
-                "span_type": "agent.loop",
-                "start_time": 1705326600.0,
-                "end_time": 1705326602.0,
-                "status": "ok",
-                "attributes": {"agent_id": "test-agent"},
-                "events": [
-                    {
-                        "name": "reasoning_step",
-                        "ts": "2024-01-15T10:30:00.000Z",
-                        "attributes": {"step": 1, "input": "Hello"}
-                    },
-                    {
-                        "name": "error_occurred",
-                        "ts": "2024-01-15T10:30:01.000Z",
-                        "attributes": {"status": "error", "error_code": "500"}
-                    }
-                ]
-            },
-            {
-                "trace_id": "01H2ABC123",
-                "span_id": "01H2DEF456",
-                "parent_span_id": "01H2ABC123",
-                "name": "llm.call",
-                "span_type": "llm.call",
-                "start_time": 1705326602.0,
-                "end_time": 1705326603.0,
-                "status": "ok",
-                "attributes": {"model": "gpt-4"},
-                "events": []
-            }
-        ]
+        # Set test mode to use mock
+        os.environ["TEST_MODE"] = "mock"
         
-        # Create mock hot store instance
-        self.mock_hot_store = MockHotStore()
-        self.mock_hot_store.spans_data = {
+        # Set up the mock data directly
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        print(f"DEBUG: Creating MockHotStore directly")
+        mock_store = MockHotStore()
+        mock_store.spans_data = {
             "01H2ABC123": self.mock_spans
         }
+        HotStoreFactory._mock_hot_store = mock_store
+        print(f"DEBUG: HotStoreFactory._mock_hot_store: {HotStoreFactory._mock_hot_store}")
+        print(f"DEBUG: HotStoreFactory._mock_hot_store.spans_data: {HotStoreFactory._mock_hot_store.spans_data}")
+        
+        # Set RBAC roles for testing
+        os.environ["AGENT_OBS_RBAC_ROLES"] = "alice:admin,bob:developer,charlie:auditor"
+    
+    def teardown_method(self):
+        """Clean up environment"""
+        if "TEST_MODE" in os.environ:
+            del os.environ["TEST_MODE"]
+        if "AGENT_OBS_RBAC_ROLES" in os.environ:
+            del os.environ["AGENT_OBS_RBAC_ROLES"]
     
     @patch('agent_obs.trace_viewer.ui.get_hot_store')
     def test_index_page(self, mock_hot_store):
@@ -145,7 +184,8 @@ class TestTraceViewer:
     def test_trace_view_not_found(self):
         """Test trace view when trace is not found"""
         # Clear the mock data for not found test
-        self.mock_hot_store.spans_data = {}
+        global mock_hot_store_instance
+        mock_hot_store_instance.spans_data = {}
         
         response = self.client.get("/trace/01H2XYZ789")
         assert response.status_code == 404
@@ -172,7 +212,8 @@ class TestTraceViewer:
     def test_get_span_events_trace_not_found(self):
         """Test events endpoint when trace is not found"""
         # Clear the mock data for not found test
-        self.mock_hot_store.spans_data = {}
+        global mock_hot_store_instance
+        mock_hot_store_instance.spans_data = {}
         
         response = self.client.get("/api/traces/01H2XYZ789/spans/01H2ABC123/events")
         assert response.status_code == 404
@@ -227,7 +268,8 @@ class TestTraceViewer:
         }
         
         mock_spans_with_empty = self.mock_spans + [span_no_events]
-        self.mock_hot_store.spans_data["01H2ABC123"] = mock_spans_with_empty
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        HotStoreFactory._mock_hot_store.spans_data["01H2ABC123"] = mock_spans_with_empty
         
         response = self.client.get("/trace/01H2ABC123")
         assert response.status_code == 200
@@ -276,7 +318,8 @@ class TestTraceViewer:
             }
         ]
         
-        self.mock_hot_store.spans_data["01H2ABC123"] = nested_spans
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        HotStoreFactory._mock_hot_store.spans_data["01H2ABC123"] = nested_spans
         
         response = self.client.get("/trace/01H2ABC123")
         assert response.status_code == 200
@@ -284,3 +327,159 @@ class TestTraceViewer:
         assert "root" in response.text
         assert "child1" in response.text
         assert "grandchild" in response.text
+    
+    def test_trace_view_with_compressed_node(self):
+        """Test trace view with compressed node rendering"""
+        # Create trace with compressed node
+        compressed_trace = [
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "root_1",
+                "parent_span_id": "",
+                "name": "agent.loop",
+                "span_type": "agent.loop",
+                "start_time": 1705326600.0,
+                "end_time": 1705326602.0,
+                "status": "ok",
+                "attributes": {"agent_id": "test-agent"},
+                "events": []
+            },
+            {
+                "trace_id": "compressed_trace",
+                "span_id": "compressed_1",
+                "parent_span_id": "root_1",
+                "name": "compressed:5",
+                "span_type": "agent.reasoning.compressed",
+                "start_time": 1705326602.0,
+                "end_time": 1705326603.0,
+                "status": "ok",
+                "attributes": {
+                    "agent_id": "test-agent",
+                    "tree.compressed": True,
+                    "tree.children_count": 5,
+                    "tree.summary": "pending",
+                    "tree.policy_version": "1"
+                },
+                "events": []
+            }
+        ]
+        
+        # Add the compressed trace to the mock hot store
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        HotStoreFactory._mock_hot_store.spans_data = {
+            "compressed_trace": compressed_trace
+        }
+        
+        response = self.client.get("/trace/compressed_trace")
+        assert response.status_code == 200
+        html_content = response.text
+        
+        # Check that compressed node is rendered with badge
+        assert "compressed:5" in html_content
+        assert "compressed-badge" in html_content
+        assert "Expand" in html_content  # Expand button
+        assert "Resolving..." in html_content  # Spinner
+        
+        # Check that user input field is present
+        assert "User (for RBAC)" in html_content
+        assert 'id="user-input"' in html_content
+    
+    def test_trace_view_with_compressed_node_and_summary(self):
+        """Test trace view with compressed node and summary text"""
+        # Create trace with compressed node and summary
+        compressed_trace_with_summary = [
+            {
+                "trace_id": "summary_trace",
+                "span_id": "root_1",
+                "parent_span_id": "",
+                "name": "agent.loop",
+                "span_type": "agent.loop",
+                "start_time": 1705326600.0,
+                "end_time": 1705326602.0,
+                "status": "ok",
+                "attributes": {"agent_id": "test-agent"},
+                "events": []
+            },
+            {
+                "trace_id": "summary_trace",
+                "span_id": "compressed_1",
+                "parent_span_id": "root_1",
+                "name": "compressed:3",
+                "span_type": "agent.reasoning.compressed",
+                "start_time": 1705326602.0,
+                "end_time": 1705326603.0,
+                "status": "ok",
+                "attributes": {
+                    "agent_id": "test-agent",
+                    "tree.compressed": True,
+                    "tree.children_count": 3,
+                    "tree.summary": "This is a summary of the reasoning process",
+                    "tree.policy_version": "1"
+                },
+                "events": []
+            }
+        ]
+        
+        # Add the summary trace to the mock hot store
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        HotStoreFactory._mock_hot_store.spans_data = {
+            "summary_trace": compressed_trace_with_summary
+        }
+        
+        response = self.client.get("/trace/summary_trace")
+        assert response.status_code == 200
+        html_content = response.text
+        
+        # Check that summary is displayed
+        assert "compressed:3" in html_content
+        assert "This is a summary of the reasoning process" in html_content
+        assert "Summary:" in html_content
+    
+    def test_trace_view_with_large_compressed_tree(self):
+        """Test trace view with large compressed tree (compression threshold test)"""
+        # Create a large trace that should trigger compression
+        large_trace = []
+        
+        # Root node
+        large_trace.append({
+            "trace_id": "large_trace",
+            "span_id": "root_1",
+            "parent_span_id": "",
+            "name": "agent.loop",
+            "span_type": "agent.loop",
+            "start_time": 1705326600.0,
+            "end_time": 1705326602.0,
+            "status": "ok",
+            "attributes": {"agent_id": "test-agent"},
+            "events": []
+        })
+        
+        # Many reasoning steps (should trigger compression)
+        for i in range(25):
+            large_trace.append({
+                "trace_id": "large_trace",
+                "span_id": f"reasoning_{i}",
+                "parent_span_id": "root_1",
+                "name": f"reasoning_step_{i}",
+                "span_type": "agent.reasoning",
+                "start_time": 1705326602.0 + i,
+                "end_time": 1705326603.0 + i,
+                "status": "ok",
+                "attributes": {"step": i, "input": f"Step {i} input"},
+                "events": []
+            })
+        
+        from agent_obs.trace_viewer.ui import HotStoreFactory
+        HotStoreFactory._mock_hot_store.spans_data = {
+            "large_trace": large_trace
+        }
+        
+        # Lower compression threshold for testing
+        with patch.dict(os.environ, {'TREE_COMPRESSION_THRESHOLD': '5'}):
+            response = self.client.get("/trace/large_trace")
+            assert response.status_code == 200
+            html_content = response.text
+            
+            # Should show compressed node
+            assert "compressed:25" in html_content
+            assert "compressed-badge" in html_content
