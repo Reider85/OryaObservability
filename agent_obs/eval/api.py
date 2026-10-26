@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from agent_obs.eval.late_annotation import get_eval_results
 from agent_obs.observability import Span, SpanContext
+
 
 def _dicts_to_spans(span_dicts: list[dict]) -> list[Span]:
     """Convert ClickHouse span dicts to Span objects.
@@ -40,7 +41,6 @@ def _dicts_to_spans(span_dicts: list[dict]) -> list[Span]:
             span_id=span_dict.get("span_id", ""),
             parent_span_id=span_dict.get("parent_span_id") or None,
             agent_id=span_dict.get("agent_id", ""),
-            tenant_id=span_dict.get("tenant_id", ""),
             user_id=span_dict.get("user_id", ""),
             session_id=span_dict.get("session_id", ""),
             tool_name=span_dict.get("tool_name", ""),
@@ -110,13 +110,13 @@ def _parse_range_bound(value: str, *, end_of_day: bool = False) -> datetime:
             if end_of_day:
                 return base.replace(
                     hour=23, minute=59, second=59, microsecond=999999,
-                    tzinfo=timezone.utc,
+                    tzinfo=UTC,
                 )
-            return base.replace(tzinfo=timezone.utc)
+            return base.replace(tzinfo=UTC)
         parsed = datetime.fromisoformat(raw)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     except ValueError as exc:
         raise ValueError(f"invalid datetime {value!r}: {exc}") from exc
 
@@ -184,7 +184,7 @@ async def get_sampler_rate_history(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve sampler rate history: {str(e)}",
+            detail=f"Failed to retrieve sampler rate history: {e!s}",
         )
 
 
@@ -239,7 +239,7 @@ async def get_trace_eval_results(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve eval results: {str(e)}"
+            detail=f"Failed to retrieve eval results: {e!s}"
         )
 
 
@@ -254,7 +254,11 @@ async def get_trace_tree(
     """
     try:
         from agent_obs.storage.hot import HotStore
-        from agent_obs.tree_compressor import TraceTreeBuilder, CompressionPolicy, apply_late_summaries
+        from agent_obs.tree_compressor import (
+            CompressionPolicy,
+            TraceTreeBuilder,
+            apply_late_summaries,
+        )
 
         # Create hot store (ClickHouse)
         hot_store = HotStore()
@@ -292,6 +296,9 @@ async def get_trace_tree(
             tree=final_tree.to_dict()
         )
         
+    except HTTPException:
+        # Re-raise HTTPException (e.g., 404 for no spans found)
+        raise
     except httpx.ConnectError:
         raise HTTPException(
             status_code=503,
@@ -300,7 +307,7 @@ async def get_trace_tree(
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to build trace tree: {str(e)}"
+            detail=f"Failed to build trace tree: {e!s}"
         )
 
 

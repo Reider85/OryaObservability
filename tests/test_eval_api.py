@@ -421,6 +421,9 @@ class TestTraceTreeEndpoint:
     
     def test_get_trace_tree_success(self, client: TestClient) -> None:
         """Test successful trace tree retrieval with compression and summaries."""
+        # Import MockHotStore for testing
+        from agent_obs.trace_viewer.ui import MockHotStore
+        
         # Mock data
         mock_spans = [
             {
@@ -469,16 +472,18 @@ class TestTraceTreeEndpoint:
                 "response_embedding": [],
             }
         ]
-        
+    
         # Mock tree_summaries (no summaries for this test)
         mock_summaries = []
         
+        # Create mock hot store
+        mock_hot_store = MockHotStore()
+        mock_hot_store.get_spans = MagicMock(return_value=mock_spans)
+        mock_hot_store.get_tree_summaries = MagicMock(return_value=mock_summaries)
+        
         # Mock the components
         with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
-            mock_hot_store = MagicMock()
             mock_hot_store_class.return_value = mock_hot_store
-            mock_hot_store.get_spans.return_value = mock_spans
-            mock_hot_store.get_tree_summaries.return_value = mock_summaries
             
             with patch("agent_obs.tree_compressor.TraceTreeBuilder") as mock_builder_class, \
                  patch("agent_obs.tree_compressor.CompressionPolicy") as mock_policy_class, \
@@ -502,8 +507,12 @@ class TestTraceTreeEndpoint:
                 
                 mock_apply.return_value = mock_tree
                 
-                # Make the request
+# Make the request
                 response = client.get("/api/v1/traces/test_trace/tree")
+                
+                # Print response details for debugging
+                print(f"Response status: {response.status_code}")
+                print(f"Response text: {response.text}")
                 
                 # Verify response
                 assert response.status_code == 200
@@ -523,6 +532,9 @@ class TestTraceTreeEndpoint:
     
     def test_get_trace_tree_with_summaries(self, client: TestClient) -> None:
         """Test trace tree retrieval with late summaries applied."""
+        # Import MockHotStore for testing
+        from agent_obs.trace_viewer.ui import MockHotStore
+        
         # Mock spans (simple chain that will be compressed)
         mock_spans = [
             {
@@ -571,7 +583,7 @@ class TestTraceTreeEndpoint:
                 "response_embedding": [],
             }
         ]
-        
+    
         # Mock tree_summaries with a summary
         mock_summaries = [
             {
@@ -584,12 +596,14 @@ class TestTraceTreeEndpoint:
             }
         ]
         
+        # Create mock hot store
+        mock_hot_store = MockHotStore()
+        mock_hot_store.get_spans = MagicMock(return_value=mock_spans)
+        mock_hot_store.get_tree_summaries = MagicMock(return_value=mock_summaries)
+        
         # Mock the components
         with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
-            mock_hot_store = MagicMock()
             mock_hot_store_class.return_value = mock_hot_store
-            mock_hot_store.get_spans.return_value = mock_spans
-            mock_hot_store.get_tree_summaries.return_value = mock_summaries
             
             with patch("agent_obs.tree_compressor.TraceTreeBuilder") as mock_builder_class, \
                  patch("agent_obs.tree_compressor.CompressionPolicy") as mock_policy_class, \
@@ -654,16 +668,23 @@ class TestTraceTreeEndpoint:
     
     def test_get_trace_tree_empty(self, client: TestClient) -> None:
         """Test trace tree retrieval with no spans found."""
-        # Mock empty spans
-        mock_spans = []
+        # Import MockHotStore for testing
+        from agent_obs.trace_viewer.ui import MockHotStore
         
+        # Create mock hot store
+        mock_hot_store = MockHotStore()
+        mock_hot_store.get_spans = MagicMock(return_value=[])
+        
+        # Patch the HotStore constructor to return our mock
         with patch("agent_obs.storage.hot.HotStore") as mock_hot_store_class:
-            mock_hot_store = MagicMock()
             mock_hot_store_class.return_value = mock_hot_store
-            mock_hot_store.get_spans.return_value = mock_spans
             
-            # Make the request
+# Make the request
             response = client.get("/api/v1/traces/nonexistent_trace/tree")
+            
+            # Print response details for debugging
+            print(f"Response status: {response.status_code}")
+            print(f"Response text: {response.text}")
             
             # Verify response
             assert response.status_code == 404

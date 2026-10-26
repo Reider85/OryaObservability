@@ -79,7 +79,7 @@ async def _process_tree_summary_job(trace_id: str, summary_node_id: str) -> None
             hot_store, redis_client, content_hash
         )
         
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to process tree summary job for trace=%s node=%s", 
                         trace_id, summary_node_id)
         # Increment failure metric (handled by caller)
@@ -96,7 +96,7 @@ def _extract_subtree_spans(spans: list[dict], summary_node_id: str) -> list[dict
         List of spans in the subtree, sorted by start_time
     """
     # Build parent->children map
-    parent_map = {}
+    parent_map: dict[str, list] = {}
     root_span = None
     
     for span in spans:
@@ -186,7 +186,7 @@ def _check_cache(redis_client, content_hash: str) -> str | None:
         Cached summary text if found, None otherwise
     """
     import os
-    from agent_obs.eval.late_annotation import _FALLBACK_REDIS_TTL
+
     
     cache_ttl = int(os.environ.get("AGENT_OBS_TREE_SUMMARY_CACHE_TTL", "604800"))  # 7 days
     key = f"agent_obs:tree:summary:{content_hash}"
@@ -211,7 +211,7 @@ def _set_cache(redis_client, content_hash: str, summary: str) -> None:
         summary: Summary text to cache
     """
     import os
-    from agent_obs.eval.late_annotation import _FALLBACK_REDIS_TTL
+
     
     cache_ttl = int(os.environ.get("AGENT_OBS_TREE_SUMMARY_CACHE_TTL", "604800"))
     key = f"agent_obs:tree:summary:{content_hash}"
@@ -233,8 +233,9 @@ async def _generate_summary(subtree_spans: list[dict]) -> str:
         Generated summary text
     """
     import os
+
     import httpx
-    from agent_obs.eval.llm_judge_worker import _call_llm
+
     
     # Build prompt
     prompt = _build_summary_prompt(subtree_spans)
@@ -322,7 +323,7 @@ async def _write_summary_annotation(trace_id: str, summary_node_id: str,
     """
     from agent_obs.eval.base import EvalResult
     from agent_obs.eval.late_annotation import annotate_with_fallback
-    from agent_obs.metrics import eval_jobs_completed_total, eval_job_latency_seconds
+    from agent_obs.metrics import eval_job_latency_seconds, eval_jobs_completed_total
     
     start_time = time.time()
     
@@ -365,6 +366,7 @@ def _create_hot_store() -> HotStore:
 def _create_redis_client():
     """Create Redis client for caching."""
     import os
+
     from agent_obs.eval.llm_judge_worker import _create_redis_client as create_redis
     
     # Use the same Redis URL as eval infrastructure

@@ -54,6 +54,9 @@ class MockHotStore:
     def get_eval_results(self, trace_id: str):
         return []
     
+    def get_tree_summaries(self, trace_id: str):
+        return []
+    
     def write_spans_batch(self, spans: list):
         pass
     

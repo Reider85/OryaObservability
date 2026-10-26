@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 
-import hashlib
 from agent_obs.metrics import tree_compression_ratio
 from agent_obs.observability import Span, SpanContext, SpanType
 
@@ -427,6 +427,7 @@ class CompressionPolicy:
         
         try:
             import rq
+
             from agent_obs.metrics import tree_compression_summary_pending_total
             
             # Create Redis connection
