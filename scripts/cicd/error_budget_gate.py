@@ -7,8 +7,8 @@ while ANY catalog SLO has exhausted its rolling-window budget
 its whole allowance of bad events — shipping more change now risks an
 unrecoverable incident, so deploys wait until the refresher sees recovery.
 
-Wiring it into CI (GitHub example — the repo has no workflows yet, PP29 adds
-the canary one)::
+Wiring it into CI (GitHub example — it gates the canary deploy in
+``.github/workflows/canary.yml``)::
 
     - name: Error budget gate
       run: python scripts/cicd/error_budget_gate.py

@@ -32,7 +32,8 @@ policy flag.
   exits 1 while any SLO is exhausted. Wire it as a required status check:
 
   ```yaml
-  # GitHub Actions example (PP29 adds the canary workflow next to it)
+  # GitHub Actions example — .github/workflows/canary.yml runs this as its
+  # first gate (PP29), before the canary ever takes traffic
   - name: Error budget gate
     run: python scripts/cicd/error_budget_gate.py
   ```

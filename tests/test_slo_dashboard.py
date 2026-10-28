@@ -301,10 +301,12 @@ class TestAnnotations:
     def _annotation(self, dashboard_config, name):
         return next(a for a in dashboard_config["annotations"]["list"] if a["name"] == name)
 
-    def test_dashboard_has_three_annotations(self, dashboard_config):
+    def test_dashboard_has_four_annotations(self, dashboard_config):
+        # PP29 added the canary rollback marker next to the PP27 deploy ones.
         names = [a["name"] for a in dashboard_config["annotations"]["list"]]
         assert names == [
             "Deploy freezes",
+            "Canary rollbacks",
             "Error budget state changes",
             "Incident mode (eval sampler)",
         ]
@@ -313,6 +315,7 @@ class TestAnnotations:
         ("name", "action"),
         [
             ("Deploy freezes", "freeze_deploy"),
+            ("Canary rollbacks", "canary_rollback"),
             ("Error budget state changes", "error_budget.state_change"),
             ("Incident mode (eval sampler)", "eval_sampler.mode_change"),
         ],

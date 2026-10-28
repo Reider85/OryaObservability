@@ -81,6 +81,13 @@ _REDACTED_ON_GUARDRAIL_FAILURE = "[REDACTED:guardrail_unavailable]"
 # Environment flag that turns the guardrail on/off when an engine is supplied.
 _GUARDRAIL_ENABLED_ENV = "AGENT_OBS_GUARDRAIL_ENABLED"
 
+# PP29 (T3.6.5): the deploy version stamped onto every exported span as the
+# ``agent_version`` attribute. `spans_hot` has no version column, so the canary
+# gate scopes SLI counts by JSONExtractString(attributes, 'agent_version').
+# When set, the deployment env is authoritative over the version passed into
+# the span context — CI stamps exactly what it deployed.
+_DEPLOY_VERSION_ENV = "AGENT_OBS_DEPLOY_VERSION"
+
 
 class _GuardrailCheck(NamedTuple):
     """A guardrail check cached on a span by a pre-call hook.
@@ -777,6 +784,15 @@ class ObservabilitySDK:
             elif span.span_type == SpanType.AGENT_LOOP:
                 # Root span: flush any remaining micro-spans
                 await self._flush_aggregation()
+
+        # PP29: stamp the deploy version before the span enters the buffer.
+        # spans_hot has no version column — the canary gate scopes SLI counts by
+        # this attribute (JSONExtractString(attributes, 'agent_version')).
+        # AGENT_OBS_DEPLOY_VERSION (set by CI on the canary deployment) wins over
+        # the version in the span context; an explicitly set attribute is kept.
+        _version = os.environ.get(_DEPLOY_VERSION_ENV, "").strip() or span.context.agent_version
+        if _version:
+            span.attributes.setdefault("agent_version", _version)
 
         try:
             self._ring_buffer.put_nowait(span)

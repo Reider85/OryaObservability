@@ -973,6 +973,7 @@ class HotStore:
         sli_kind: str,
         window: timedelta,
         good_threshold: float | None = None,
+        version: str | None = None,
     ) -> tuple[int, int]:
         """Aggregate (good_events, total_events) for an SLO SLI (PP25).
 
@@ -982,6 +983,12 @@ class HotStore:
             good_threshold: Per-event good threshold — latency seconds for
                 "latency", USD for "cost", faithfulness score for "quality".
                 Unused for "availability" (good = status != "error").
+            version: Optional deploy version to scope the counts to (PP29).
+                Matches the span attribute ``agent_version``, stamped into
+                ``span.attributes`` by ``ObservabilitySDK._enqueue`` from
+                ``AGENT_OBS_DEPLOY_VERSION`` (or the context's agent_version).
+                ``None`` keeps the unversioned, whole-fleet query byte-for-byte
+                identical to the pre-PP29 behaviour.
 
         Returns:
             (good_events, total_events). Empty window -> (0, 0); callers apply
@@ -992,6 +999,15 @@ class HotStore:
         """
         cutoff = time.time() - window.total_seconds()
         params: dict = {"cutoff": cutoff}
+        # Span-side version predicate (PP29): spans_hot has no version column,
+        # so the deploy version rides in the attributes JSON. Constant on purpose
+        # — the value is bound, never interpolated.
+        version_predicate = ""
+        if version is not None:
+            version_predicate = (
+                "AND JSONExtractString(attributes, 'agent_version') = %(version)s"
+            )
+            params["version"] = version
 
         if sli_kind in ("availability", "latency"):
             # "Trace" = root span (agent.loop). availability: good = non-error
@@ -1010,6 +1026,7 @@ class HotStore:
                 FROM spans_hot
                 WHERE span_type = 'agent.loop'
                   AND start_time >= toDateTime64(%(cutoff)s, 3)
+                  {version_predicate}
                 """,
                 params,
             )
@@ -1019,12 +1036,13 @@ class HotStore:
             params["threshold"] = float(good_threshold)
             # Per-request cost = sum of cost_usd across all spans of a trace.
             rows = self._execute_clickhouse(
-                """
+                f"""
                 SELECT count(), countIf(trace_cost <= %(threshold)s)
                 FROM (
                     SELECT trace_id, sum(cost_usd) AS trace_cost
                     FROM spans_hot
                     WHERE start_time >= toDateTime64(%(cutoff)s, 3)
+                      {version_predicate}
                     GROUP BY trace_id
                 )
                 """,
@@ -1035,11 +1053,23 @@ class HotStore:
                 raise ValueError("quality SLI requires good_threshold (faithfulness score)")
             params["threshold"] = float(good_threshold)
             # Late-annotated LLM-judge scores, filtered by eval_timestamp.
+            # eval_results_hot has no version column: scope it through the
+            # traces it annotated (trace_id is its primary sort key).
+            version_scope = ""
+            if version is not None:
+                version_scope = """
+                AND trace_id IN (
+                    SELECT trace_id
+                    FROM spans_hot
+                    WHERE start_time >= toDateTime64(%(cutoff)s, 3)
+                      AND JSONExtractString(attributes, 'agent_version') = %(version)s
+                )"""
             rows = self._execute_clickhouse(
-                """
+                f"""
                 SELECT count(), countIf(JSONExtractFloat(scores, 'faithfulness') > %(threshold)s)
                 FROM eval_results_hot
                 WHERE eval_timestamp >= toDateTime64(%(cutoff)s, 3)
+                {version_scope}
                 """,
                 params,
             )

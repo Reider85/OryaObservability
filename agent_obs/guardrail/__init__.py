@@ -9,6 +9,7 @@ from agent_obs.guardrail.audit import (
     RecoveryAuditEvent,
     AuditReasonRequiredError,
     AuditWriteError,
+    CanaryRollbackAuditEvent,
     classify_reason_category,
 )
 from agent_obs.guardrail.engine import (
@@ -32,6 +33,8 @@ __all__ = [
     "AuditReasonRequiredError",
     "AuditWriteError",
     "classify_reason_category",
+    # PP29 canary rollback audit
+    "CanaryRollbackAuditEvent",
     # Existing exports
     "AuditEvent",
     "GuardrailBlockException",

@@ -82,11 +82,12 @@ The target is the dashboard variable `trace_viewer_url` (textbox, default `http:
 
 ## Annotations (deploy + incident markers)
 
-All three are read from the ClickHouse audit trail (`audit_events_hot`) with `$__timeFilter(timestamp)`, so they follow the time picker:
+All four are read from the ClickHouse audit trail (`audit_events_hot`) with `$__timeFilter(timestamp)`, so they follow the time picker:
 
 | Annotation | Source `action` | Shows | Meaning |
 |---|---|---|---|
 | Deploy freezes (purple) | `freeze_deploy` | `<slo> deploy frozen` | PP27 hard action: the error budget hit 0 and the CI/CD gate froze deploys |
+| Canary rollbacks (red) | `canary_rollback` | `rollback <new> -> <old> [<decision>]` | PP29: the canary gate saw the burn rate over threshold and reverted the deploy |
 | Error budget state changes (red) | `error_budget.state_change` | `<slo> budget soft/hard/recover` | Every PP27 ok → soft → hard → recover transition, with the remaining ratio in the text |
 | Incident mode, eval sampler (orange) | `eval_sampler.mode_change` (only `new_mode='incident'`) | `eval sampler -> incident` | The adaptive eval sampler entered incident mode — an incident was declared (PP12/PP14) |
 
@@ -134,5 +135,6 @@ Nothing to do. The refresh cadence (1m dashboard / 5m SLI) means the numbers lag
 
 - `docs/slo-alerts-runbook.md` — PP26 multi-window burn-rate alerting (thresholds 14.4 / 6.0 / 3.0)
 - `docs/error-budget-runbook.md` — PP27 error-budget states and the sampler/eval/deploy actions
+- `docs/canary-runbook.md` — PP29 SLO-gated canary deploys, rollback and the `canary_rollback` audit rows
 - `docs/sampler-dashboard.md` — sampling-rate dashboard (the error-budget low action drops the rate to 5%)
 - `docs/trace-viewer.md` — the built-in PP10 trace viewer (`http://127.0.0.1:8089`)

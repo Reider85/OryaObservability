@@ -51,6 +51,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/e2e/test_trace_viewer_e2e.py`: Playwright e2e tests for trace viewer (requires `playwright install chromium` once)
 - `tests/test_compressed_expand_api.py`: Unit tests for PP19 compressed node expand API with RBAC/MFA support
 - `tests/test_slo_dashboard.py`: PP28 config tests for the Grafana SLO dashboard (`infra/grafana/dashboards/slo.json`) — syncs gauge thresholds/windows with `SLO_CATALOG`
+- `tests/test_canary_deploy.py`: PP29 tests — SLO canary gate exit codes, per-version SLI counts, `canary_rollback` audit rows, Slack/Telegram rollback notifications, and the `canary.yml` workflow shape
 
 ## Lint / typecheck
 
@@ -109,6 +110,13 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_LOG_LEVEL` | `INFO` | Root logging level for SDK and cron scheduler. |
 | `AGENT_OBS_SLO_REFRESH_SECONDS` | `300` | PP25: SLO refresher cadence — how often `slo_actual_sli`/`slo_burn_rate` gauges are recomputed from ClickHouse. |
 | `AGENT_OBS_ERROR_BUDGET_SOFT_THRESHOLD` | `0.2` | PP27: remaining error-budget ratio below which soft actions fire (sampler → 5%, eval budget × 0.5). Hard threshold is fixed at 0. |
+| `AGENT_OBS_DEPLOY_VERSION` | `""` | PP29: deploy version stamped by `_enqueue` as the `agent_version` span attribute (falls back to the span context's `agent_version`). `canary_check.py` scopes SLI counts by it. |
+| `AGENT_OBS_CANARY_WINDOW` | `30m` | PP29: observation window spec `canary_check.py` measures burn rate over (workflow passes `--window <observation_minutes>m`). |
+| `AGENT_OBS_CANARY_BURN_THRESHOLD` | — (per-SLO) | PP29: single burn-rate threshold for every SLO. Default = the SLO's fast-pair alert threshold from `SLO_CATALOG` (14.4 availability/latency, 6.0 quality/cost). |
+| `AGENT_OBS_CANARY_FAIL_OPEN` | `false` | PP29: `1` = allow the ramp when the gate is undeterminable (no telemetry / ClickHouse down). Default fail-closed → rollback. |
+| `CANARY_RAMP_CMD` / `CANARY_ROLLBACK_CMD` / `CANARY_DEPLOY_CMD` | — | PP29: pluggable shell commands executed by `scripts/canary.py` and `.github/workflows/canary.yml` (repo ships no deploy tooling). `CANARY_CMD_TIMEOUT` = 600s. |
+| `SLACK_WEBHOOK_URL` | — | Rollback (PP29) + drift (PC27) + Alertmanager notifications. Empty = notifications skipped, never fail. |
+| `AGENT_OBS_TELEGRAM_BOT_TOKEN` / `AGENT_OBS_TELEGRAM_CHAT_ID` | — | PP29: optional Telegram channel for rollback notifications. Both must be set, otherwise skipped silently. |
 | `AGENT_OBS_USER_HASH_SALT` | `""` | Salt for user hashing (empty = no salt). |
 | `AGENT_OBS_TLS_CA` / `_CERT` / `_KEY` | — | mTLS material for exporters (PP02). |
 | `AGENT_OBS_EVAL_ADAPTIVE_SAMPLER` | `false` | Enable adaptive eval sampler in LLM judge when a judge is supplied. PP14. |

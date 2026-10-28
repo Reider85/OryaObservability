@@ -1,0 +1,136 @@
+# PP29 (T3.6.5) — SLO-gated canary deployment.
+#
+# Flow: deploy 5% -> observe -> gate on burn rate -> ramp or rollback+page.
+#
+# The repo ships no k8s/service-mesh manifests, so the three deploy actions are
+# pluggable shell commands supplied by repository *variables* (Settings ->
+# Variables). The workflow fails fast with a clear error while any is unset:
+#
+#   CANARY_DEPLOY_CMD    deploy new_version at 5% traffic (feature flag / mesh)
+#   CANARY_RAMP_CMD      take new_version to 100% traffic
+#   CANARY_ROLLBACK_CMD  revert to old_version
+#
+# Repository *secrets* used by the gate and the rollback side effects:
+#   CLICKHOUSE_HOST / CLICKHOUSE_PORT / CLICKHOUSE_DB / CLICKHOUSE_USER /
+#   CLICKHOUSE_PASSWORD   destination of the "canary_rollback" audit event
+#   SLACK_WEBHOOK_URL, AGENT_OBS_TELEGRAM_BOT_TOKEN, AGENT_OBS_TELEGRAM_CHAT_ID
+#
+# Optional variables:
+#   PROMETHEUS_URL               for the PP27 error-budget gate
+#   AGENT_OBS_CANARY_BURN_THRESHOLD   single threshold for every SLO
+
+name: canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_version:
+        description: Version being canaried
+        required: true
+        type: string
+      old_version:
+        description: Version traffic returns to on rollback
+        required: true
+        type: string
+      observation_minutes:
+        description: "Minutes of SLO observation before the gate (spec: 30)"
+        required: false
+        default: "30"
+        type: string
+
+# One canary at a time: a second dispatch queues instead of racing the ramp.
+concurrency:
+  group: canary-deploy
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    # 30 min observation + deploy/ramp/rollback overhead.
+    timeout-minutes: 120
+    env:
+      NEW_VERSION: ${{ inputs.new_version }}
+      OLD_VERSION: ${{ inputs.old_version }}
+      OBSERVATION_MINUTES: ${{ inputs.observation_minutes }}
+      PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL }}
+      AGENT_OBS_CANARY_BURN_THRESHOLD: ${{ vars.AGENT_OBS_CANARY_BURN_THRESHOLD }}
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      AGENT_OBS_TELEGRAM_BOT_TOKEN: ${{ secrets.AGENT_OBS_TELEGRAM_BOT_TOKEN }}
+      AGENT_OBS_TELEGRAM_CHAT_ID: ${{ secrets.AGENT_OBS_TELEGRAM_CHAT_ID }}
+      CANARY_DEPLOY_CMD: ${{ vars.CANARY_DEPLOY_CMD }}
+      CANARY_RAMP_CMD: ${{ vars.CANARY_RAMP_CMD }}
+      CANARY_ROLLBACK_CMD: ${{ vars.CANARY_ROLLBACK_CMD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Validate inputs and pluggable commands
+        run: |
+          case "$OBSERVATION_MINUTES" in
+            ''|*[!0-9]*)
+              echo "::error::observation_minutes must be a whole number"
+              exit 1 ;;
+          esac
+          fail=0
+          for v in CANARY_DEPLOY_CMD CANARY_RAMP_CMD CANARY_ROLLBACK_CMD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::repository variable $v is not set (Settings -> Variables)"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # PP27: a frozen error budget blocks the canary before it ever takes traffic.
+      - name: Error budget gate (PP27)
+        run: python scripts/cicd/error_budget_gate.py
+
+      - name: Deploy to canary (5% traffic)
+        id: deployed
+        env:
+          # The deploy command should put this into the canary pods' env so the
+          # SDK stamps it as the agent_version span attribute.
+          AGENT_OBS_DEPLOY_VERSION: ${{ inputs.new_version }}
+        run: eval "$CANARY_DEPLOY_CMD"
+
+      - name: Observe SLO health
+        run: sleep $(( 10#$OBSERVATION_MINUTES * 60 ))
+
+      # exit 0 = healthy, exit 1 = burn rate over threshold,
+      # exit 2 = undeterminable (fail closed -> treated as failure below).
+      - name: SLO gate
+        run: >
+          python scripts/canary_check.py
+          --new-version "$NEW_VERSION"
+          --old-version "$OLD_VERSION"
+          --window "${OBSERVATION_MINUTES}m"
+
+      - name: Ramp to 100%
+        if: success()
+        run: eval "$CANARY_RAMP_CMD"
+
+      # Runs on gate failure, deploy failure or ramp failure; the job stays red
+      # either way, which is what pages the on-call. Skipped when nothing was
+      # ever deployed (the PP27 error-budget gate blocked before the deploy).
+      - name: Rollback, audit and notify on-call
+        if: failure() && steps.deployed.outcome != 'skipped'
+        run: >
+          python scripts/canary.py rollback
+          --new-version "$NEW_VERSION"
+          --old-version "$OLD_VERSION"
+          --window "${OBSERVATION_MINUTES}m"
+
+      - name: Summary
+        if: success()
+        run: echo "canary $NEW_VERSION ramped after $OBSERVATION_MINUTES minutes of healthy SLOs"

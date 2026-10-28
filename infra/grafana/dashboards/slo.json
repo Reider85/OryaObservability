@@ -67,6 +67,25 @@
         }
       },
       {
+        "name": "Canary rollbacks",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+        "enable": true,
+        "iconColor": "red",
+        "titleFormat": "{{new_version}} canary rolled back",
+        "textFormat": "{{reason}}",
+        "target": {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  timestamp AS time,\n  JSONExtractString(resource, 'new_version') AS new_version,\n  JSONExtractString(resource, 'old_version') AS old_version,\n  decision,\n  concat('rollback ', JSONExtractString(resource, 'new_version'), ' -> ', JSONExtractString(resource, 'old_version'), ' [', decision, ']') AS text,\n  reason AS reason\nFROM audit_events_hot\nWHERE action = 'canary_rollback'\n  AND $__timeFilter(timestamp)\nORDER BY timestamp DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      },
+      {
         "name": "Error budget state changes",
         "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
         "enable": true,

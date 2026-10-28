@@ -1097,3 +1097,116 @@ class ErrorBudgetActionAuditEvent:
             self.ip_address,
             self.user_agent,
         )
+
+
+@dataclass
+class CanaryRollbackAuditEvent:
+    """Audit event for an SLO-gated canary rollback (PP29, T3.6.5).
+
+    Recorded once per rollback decision of the canary deploy gate:
+
+    - ``decision="rolled_back"``       — canary unhealthy, revert command ran.
+    - ``decision="rollback_failed"``   — canary unhealthy, but the revert
+      command (or the audit write itself) failed; the on-call is still paged.
+    - ``decision="rollback_simulated"``— ``--dry-run``: no command was run.
+
+    The burn-rate numbers that triggered the gate ride inside ``resource`` so
+    the audit_events_hot DDL stays unchanged and a row is self-contained
+    without cross-referencing (the same rule PC30 applied to sampler rate
+    changes and PP27 applied to error-budget transitions).
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    actor: dict[str, str]
+    resource: dict[str, Any]
+    reason: str
+    action: str = "canary_rollback"
+    decision: str = "rolled_back"  # "rolled_back" | "rollback_failed" | "rollback_simulated"
+    trace_id: str = ""  # always "" — a deploy is not trace-scoped
+    ip_address: str = "127.0.0.1"
+    user_agent: str = "agent-obs/canary"
+
+    @classmethod
+    def for_rollback(
+        cls,
+        new_version: str,
+        old_version: str,
+        slo_name: str,
+        burn_rates: dict[str, float],
+        threshold: float,
+        window: str = "30m",
+        decision: str = "rolled_back",
+        error: str | None = None,
+    ) -> CanaryRollbackAuditEvent:
+        """Create an audit event for one canary rollback.
+
+        Args:
+            new_version: Version that was being canaried.
+            old_version: Version traffic is rolled back to.
+            slo_name: SLO whose burn rate breached the gate ("" if unknown).
+            burn_rates: Per-SLO burn rates measured on ``new_version``.
+            threshold: Gate threshold that was exceeded.
+            window: Measurement window spec (e.g. "30m").
+            decision: "rolled_back" | "rollback_failed" | "rollback_simulated".
+            error: Optional failure detail when the revert command failed.
+        """
+        breached = sorted(
+            name for name, value in burn_rates.items() if value >= threshold
+        ) or sorted(burn_rates)
+        reason = (
+            f"canary {new_version} rolled back to {old_version}: "
+            f"burn rate on {slo_name or breached[0] if breached else 'unknown SLO'} "
+            f"exceeded {threshold} over {window}"
+        )
+        if error:
+            reason = f"{reason} ({error})"
+        return cls(
+            audit_id=f"cy-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "system", "id": "canary-gate"},
+            resource={
+                "type": "canary_deploy",
+                "new_version": new_version,
+                "old_version": old_version,
+                "slo": slo_name,
+                "window": window,
+                "threshold": threshold,
+                "burn_rates": dict(burn_rates),
+                "breached_slos": breached,
+                **({"error": error} if error else {}),
+            },
+            reason=reason,
+            action="canary_rollback",
+            decision=decision,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for JSON consumers (Query API)."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row matching the audit_events_hot DDL."""
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
