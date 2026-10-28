@@ -396,6 +396,23 @@ class VaultClient:
                 vault_recovery_total.labels(reason_category="unknown").inc()
             vault_recovery_duration_seconds.observe(duration)
             
+            # PP23: после восстановления PII инвалидировать drill-down кеш
+            # для (login, trace_id) — восстановленные данные могут отличаться
+            # от закешированных. Best-effort: ошибка не должна ломать recovery.
+            if trace_id:
+                try:
+                    from agent_obs.storage.drill_down import invalidate_drill_down_cache
+                    import redis.asyncio as redis_async
+                    if self.redis_url:
+                        r = redis_async.from_url(self.redis_url)
+                        await invalidate_drill_down_cache(r, trace_id, user=login)
+                        await r.aclose()
+                except Exception as e:
+                    logger.warning(
+                        "drill-down cache invalidation skipped (best-effort): "
+                        "trace=%s user=%s err=%s", trace_id, login, e,
+                    )
+            
             return original
 
         except AuditWriteError:

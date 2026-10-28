@@ -221,6 +221,30 @@ athena_cost_guard_triggered_total = Counter(
     "Athena queries stopped by the cost guard (ATHENA_MAX_SCAN_BYTES exceeded)",
 )
 
+# --- PP23 DrillDown cache metrics -------------------------------------------
+
+drill_down_cache_hits_total = Counter(
+    "agent_obs_drill_down_cache_hits_total",
+    "Drill-down requests served from the Redis cache",
+)
+
+drill_down_cache_misses_total = Counter(
+    "agent_obs_drill_down_cache_misses_total",
+    "Drill-down requests that missed the Redis cache",
+)
+
+drill_down_cache_hit_ratio = Gauge(
+    "agent_obs_drill_down_cache_hit_ratio",
+    "Drill-down cache hit ratio (hits / (hits + misses)), 0..1. "
+    "Expected healthy range 0.3-0.7",
+)
+
+drill_down_cache_size_bytes = Gauge(
+    "agent_obs_drill_down_cache_size_bytes",
+    "Approximate total size of drill-down cache values in Redis (bytes). "
+    "Alert if > 1 GiB",
+)
+
 embeddings_batch_size = Histogram(
     "agent_obs_embeddings_batch_size",
     "Number of embeddings in each ClickHouse batch write",

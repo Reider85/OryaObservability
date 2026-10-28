@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import uvicorn
 from agent_obs.storage.hot import HotStore
+from agent_obs.storage.drill_down import DrillDownRequest
 
 
 class MockHotStore:

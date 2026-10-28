@@ -23,6 +23,27 @@ logger = logging.getLogger(__name__)
 _FALLBACK_REDIS_TTL = 3600
 
 
+async def _invalidate_drill_down_cache_best_effort(
+    redis_client: Any | None, trace_id: str
+) -> None:
+    """PP23: инвалидировать drill-down кеш после late annotation (best-effort).
+    
+    Изменённый trace (новый eval result / summary) не должен отдавать устаревший
+    drill-down кеш. Ошибка инвалидации не должна влиять на annotation —
+    потому что всё обёрнуто в try/except и логируется как warning.
+    """
+    if redis_client is None:
+        return
+    try:
+        from agent_obs.storage.drill_down import invalidate_drill_down_cache
+        await invalidate_drill_down_cache(redis_client, trace_id)
+    except Exception as e:
+        logger.warning(
+            "drill-down cache invalidation skipped (best-effort): trace=%s err=%s",
+            trace_id, e,
+        )
+
+
 async def annotate(eval_result: EvalResult, hot_store: HotStore) -> None:
     """Write an eval result to ClickHouse eval_results_hot table.
 
@@ -81,6 +102,10 @@ async def annotate_with_fallback(
     if hot_store is not None:
         try:
             await annotate(eval_result, hot_store)
+            # PP23: инвалидировать drill-down кеш для этого trace (best-effort).
+            await _invalidate_drill_down_cache_best_effort(
+                redis_client, eval_result.trace_id
+            )
             return
         except Exception:
             logger.warning(
@@ -118,6 +143,10 @@ async def annotate_with_fallback(
             await loop.run_in_executor(None, _store_in_redis)
             eval_annotation_redis_fallback_total.inc()
             eval_annotation_total.labels(status="redis_fallback").inc()
+            # PP23: инвалидировать drill-down кеш для этого trace (best-effort).
+            await _invalidate_drill_down_cache_best_effort(
+                redis_client, eval_result.trace_id
+            )
             logger.info(
                 "Late annotation stored in Redis fallback: trace=%s eval_id=%s (TTL=%ds)",
                 eval_result.trace_id,
