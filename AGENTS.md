@@ -106,6 +106,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_COMPLIANCE_TIER` | `dual` | `dual`/`warm_only`/`hot_only` — which catalog tiers `build_compliance_catalog()` wires (PC34). |
 | `AGENT_OBS_INJECTION_THRESHOLD_LOW` / `_HIGH` | `0.5` / `0.85` | Injection classifier verdict bands: below low = benign, at-or-above high = block. |
 | `AGENT_OBS_LOG_LEVEL` | `INFO` | Root logging level for SDK and cron scheduler. |
+| `AGENT_OBS_SLO_REFRESH_SECONDS` | `300` | PP25: SLO refresher cadence — how often `slo_actual_sli`/`slo_burn_rate` gauges are recomputed from ClickHouse. |
 | `AGENT_OBS_USER_HASH_SALT` | `""` | Salt for user hashing (empty = no salt). |
 | `AGENT_OBS_TLS_CA` / `_CERT` / `_KEY` | — | mTLS material for exporters (PP02). |
 | `AGENT_OBS_EVAL_ADAPTIVE_SAMPLER` | `false` | Enable adaptive eval sampler in LLM judge when a judge is supplied. PP14. |

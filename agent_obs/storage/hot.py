@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -966,6 +967,89 @@ class HotStore:
         )
         logger.info("eval_golden_results written: rows=%d", len(payload))
         return len(payload)
+
+    def get_sli_stats(
+        self,
+        sli_kind: str,
+        window: timedelta,
+        good_threshold: float | None = None,
+    ) -> tuple[int, int]:
+        """Aggregate (good_events, total_events) for an SLO SLI (PP25).
+
+        Args:
+            sli_kind: One of "availability" | "latency" | "quality" | "cost".
+            window: Rolling window length, measured back from now.
+            good_threshold: Per-event good threshold — latency seconds for
+                "latency", USD for "cost", faithfulness score for "quality".
+                Unused for "availability" (good = status != "error").
+
+        Returns:
+            (good_events, total_events). Empty window -> (0, 0); callers apply
+            the empty-is-perfect convention via sli_from_counts().
+
+        Note: the 30d SLO window exceeds hot-tier TTLs (spans 21d, evals 14d),
+        so long-window results are a lower bound until warm rollups land (PP25).
+        """
+        cutoff = time.time() - window.total_seconds()
+        params: dict = {"cutoff": cutoff}
+
+        if sli_kind in ("availability", "latency"):
+            # "Trace" = root span (agent.loop). availability: good = non-error
+            # status (blocked = deliberate refusal, counts as good). latency:
+            # good = wall-clock duration <= good_threshold seconds.
+            if sli_kind == "latency":
+                if good_threshold is None:
+                    raise ValueError("latency SLI requires good_threshold (seconds)")
+                params["threshold"] = float(good_threshold)
+                good_expr = "countIf(end_time - start_time <= %(threshold)s)"
+            else:
+                good_expr = "countIf(status != 'error')"
+            rows = self._execute_clickhouse(
+                f"""
+                SELECT count(), {good_expr}
+                FROM spans_hot
+                WHERE span_type = 'agent.loop'
+                  AND start_time >= toDateTime64(%(cutoff)s, 3)
+                """,
+                params,
+            )
+        elif sli_kind == "cost":
+            if good_threshold is None:
+                raise ValueError("cost SLI requires good_threshold (USD)")
+            params["threshold"] = float(good_threshold)
+            # Per-request cost = sum of cost_usd across all spans of a trace.
+            rows = self._execute_clickhouse(
+                """
+                SELECT count(), countIf(trace_cost <= %(threshold)s)
+                FROM (
+                    SELECT trace_id, sum(cost_usd) AS trace_cost
+                    FROM spans_hot
+                    WHERE start_time >= toDateTime64(%(cutoff)s, 3)
+                    GROUP BY trace_id
+                )
+                """,
+                params,
+            )
+        elif sli_kind == "quality":
+            if good_threshold is None:
+                raise ValueError("quality SLI requires good_threshold (faithfulness score)")
+            params["threshold"] = float(good_threshold)
+            # Late-annotated LLM-judge scores, filtered by eval_timestamp.
+            rows = self._execute_clickhouse(
+                """
+                SELECT count(), countIf(JSONExtractFloat(scores, 'faithfulness') > %(threshold)s)
+                FROM eval_results_hot
+                WHERE eval_timestamp >= toDateTime64(%(cutoff)s, 3)
+                """,
+                params,
+            )
+        else:
+            raise ValueError(f"unknown sli_kind: {sli_kind!r}")
+
+        if not rows:
+            return (0, 0)
+        total, good = int(rows[0][0]), int(rows[0][1])
+        return (good, total)
 
     def close(self) -> None:
         """Close the ClickHouse connection."""

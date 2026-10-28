@@ -484,3 +484,36 @@ tree_embedded_ratio = Gauge(
     "Fraction of tree nodes with embedded subtree (0..1)",
     ["agent_id"],
 )
+
+# --- PP25 SLO metrics (T3.6.1) ------------------------------------------------
+# Names intentionally lack the agent_obs_ prefix: PP26 alert rules and the
+# PP28 Grafana dashboard reference them verbatim (slo_burn_rate{name=...}).
+# All gauges are updated by agent_obs.slo.refresher.SLORefresher (5-min cadence),
+# never by the in-process SDK hot path. Label `name` is a bounded set: the 4
+# keys of SLO_CATALOG (PC0 rule: no unbounded metric cardinality).
+
+slo_target = Gauge(
+    "slo_target",
+    "SLO target value (share of good events, 0..1)",
+    ["name"],
+)
+
+slo_actual_sli = Gauge(
+    "slo_actual_sli",
+    "Actual rolling-window SLI (good/total events), updated every ~5 minutes",
+    ["name"],
+)
+
+# `window` label is the alerting window duration ("5m"|"1h"|"6h"|"1d"), not
+# the short/long role — PP26's SLOBurnRate maps roles onto durations.
+slo_burn_rate = Gauge(
+    "slo_burn_rate",
+    "Error-budget burn rate (1 - SLI) / (1 - target) per alerting window",
+    ["name", "window"],
+)
+
+slo_error_budget_remaining = Gauge(
+    "slo_error_budget_remaining",
+    "Remaining error budget ratio on the rolling window (0..1)",
+    ["name"],
+)
