@@ -278,21 +278,181 @@ groups:
             writes are failing. Check cron logs and the
             agent_obs_cron_errors_total{job_name="nightly_golden_eval"} counter.
 
-    - name: eval-budget
-      rules:
-        # Fires when eval budget is exhausted (100% or more)
-        - alert: EvalBudgetExhausted
-          expr: |
-            budget_utilization_ratio >= 1.0
-          for: 1m
-          labels:
-            severity: warning
-            component: eval-budget
-          annotations:
-            summary: "Eval budget exhausted - eval pipeline paused"
-            description: >-
-              Eval budget utilization is {{ $value }} (100%+ threshold), 
-              triggering hard pause of all eval jobs. Current cost: 
-              sum(eval_cost_today_usd) by (mode) | humanizeBytes. 
-              To resume, reduce eval frequency or increase EVAL_DAILY_BUDGET_USD.
-              Runbook: docs/eval-budget-runbook.md.
+  - name: eval-budget
+    rules:
+      # Fires when eval budget is exhausted (100% or more)
+      - alert: EvalBudgetExhausted
+        expr: |
+          budget_utilization_ratio >= 1.0
+        for: 1m
+        labels:
+          severity: warning
+          component: eval-budget
+        annotations:
+          summary: "Eval budget exhausted - eval pipeline paused"
+          description: >-
+            Eval budget utilization is {{ $value }} (100%+ threshold), 
+            triggering hard pause of all eval jobs. Current cost: 
+            sum(eval_cost_today_usd) by (mode) | humanizeBytes. 
+            To resume, reduce eval frequency or increase EVAL_DAILY_BUDGET_USD.
+            Runbook: docs/eval-budget-runbook.md.
+
+  # PP26 (T3.6.2): multi-window multi-burn-rate alerting (Google SRE Workbook).
+  #
+  # Thresholds and window pairs come verbatim from SLO_CATALOG
+  # (agent_obs/slo/definitions.py). An alert only fires when BOTH windows of
+  # a pair exceed the pair threshold simultaneously — `and on(name)` is
+  # required because the two sides carry different `window` labels (5m vs
+  # 1h): without on(name) the vector matching would never join and the
+  # expression would always be empty.
+  #
+  # Page  (SLOBurnRateHigh):    fast-burn pairs  — wake the on-call.
+  # Ticket (SLOBurnRateSlowBurn): slow-burn pairs — next-business-day work.
+  # In-process counterpart: agent_obs.slo.burn_rate.SLOBurnRate (same math).
+  # Runbook: docs/slo-alerts-runbook.md.
+  - name: slo-burn-rate
+    rules:
+      # --- Page: fast burn (availability / latency_p95: 5m + 1h @ 14.4x) ---
+      - alert: SLOBurnRateHigh
+        expr: |
+          (slo_burn_rate{name="availability",window="5m"} > 14.4)
+          and on(name)
+          (slo_burn_rate{name="availability",window="1h"} > 14.4)
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "Availability SLO burn-rate high (page)"
+          description: >-
+            Availability error budget is burning at >14.4x the sustainable
+            rate over BOTH the 5m and 1h windows ({{ $value | humanize }}).
+            This is a fast burn: the 30d budget will be exhausted in hours.
+            Check recent deploys, upstream dependencies and the SLO dashboard
+            (PP28). Runbook: docs/slo-alerts-runbook.md#availability.
+
+      - alert: SLOBurnRateHigh
+        expr: |
+          (slo_burn_rate{name="latency_p95",window="5m"} > 14.4)
+          and on(name)
+          (slo_burn_rate{name="latency_p95",window="1h"} > 14.4)
+        for: 2m
+        labels:
+          severity: page
+          slo: latency_p95
+        annotations:
+          summary: "Latency SLO burn-rate high (page)"
+          description: >-
+            Latency budget (>3s traces) is burning at >14.4x over BOTH the
+            5m and 1h windows ({{ $value | humanize }}). Fast burn: p95 of
+            traces exceeds 3 seconds persistently. Check agent loop hot
+            paths, LLM provider latency and ClickHouse write latency.
+            Runbook: docs/slo-alerts-runbook.md#latency_p95.
+
+      # --- Page: fast burn (quality / cost_p99: 1h + 6h @ 6.0x) ---
+      # Quality and cost signals are late/noisier, so their "fast" pair is
+      # the (1h, 6h) one — a 5m window would be all noise for LLM-judge
+      # scores and cost rollups.
+      - alert: SLOBurnRateHigh
+        expr: |
+          (slo_burn_rate{name="quality",window="1h"} > 6.0)
+          and on(name)
+          (slo_burn_rate{name="quality",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: page
+          slo: quality
+        annotations:
+          summary: "Quality SLO burn-rate high (page)"
+          description: >-
+            Faithfulness budget is burning at >6x over BOTH the 1h and 6h
+            windows ({{ $value | humanize }}). A prompt, model or data
+            change likely degraded answer quality. Inspect recent eval
+            results and golden-set regressions (PP13).
+            Runbook: docs/slo-alerts-runbook.md#quality.
+
+      - alert: SLOBurnRateHigh
+        expr: |
+          (slo_burn_rate{name="cost_p99",window="1h"} > 6.0)
+          and on(name)
+          (slo_burn_rate{name="cost_p99",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: page
+          slo: cost_p99
+        annotations:
+          summary: "Cost SLO burn-rate high (page)"
+          description: >-
+            Per-request cost budget ($0.05/request) is burning at >6x over
+            BOTH the 1h and 6h windows ({{ $value | humanize }}). Check for
+            runaway token usage, missing prompt caching, or an agent loop
+            regression. Runbook: docs/slo-alerts-runbook.md#cost_p99.
+
+      # --- Ticket: slow burn (availability / latency_p95: 1h + 6h @ 6.0x) ---
+      - alert: SLOBurnRateSlowBurn
+        expr: |
+          (slo_burn_rate{name="availability",window="1h"} > 6.0)
+          and on(name)
+          (slo_burn_rate{name="availability",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: availability
+        annotations:
+          summary: "Availability SLO burn-rate elevated (ticket)"
+          description: >-
+            Availability error budget burning at >6x over BOTH the 1h and 6h
+            windows ({{ $value | humanize }}). Slower burn than the page
+            alert — schedule remediation within the business day. Runbook:
+            docs/slo-alerts-runbook.md#availability.
+
+      - alert: SLOBurnRateSlowBurn
+        expr: |
+          (slo_burn_rate{name="latency_p95",window="1h"} > 6.0)
+          and on(name)
+          (slo_burn_rate{name="latency_p95",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: latency_p95
+        annotations:
+          summary: "Latency SLO burn-rate elevated (ticket)"
+          description: >-
+            Latency budget burning at >6x over BOTH the 1h and 6h windows
+            ({{ $value | humanize }}). Schedule remediation within the
+            business day. Runbook: docs/slo-alerts-runbook.md#latency_p95.
+
+      # --- Ticket: slow burn (quality / cost_p99: 6h + 1d @ 3.0x) ---
+      - alert: SLOBurnRateSlowBurn
+        expr: |
+          (slo_burn_rate{name="quality",window="6h"} > 3.0)
+          and on(name)
+          (slo_burn_rate{name="quality",window="1d"} > 3.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: quality
+        annotations:
+          summary: "Quality SLO burn-rate elevated (ticket)"
+          description: >-
+            Faithfulness budget burning at >3x over BOTH the 6h and 1d
+            windows ({{ $value | humanize }}). Slow degradation — compare
+            recent prompts/models against the last known-good version.
+            Runbook: docs/slo-alerts-runbook.md#quality.
+
+      - alert: SLOBurnRateSlowBurn
+        expr: |
+          (slo_burn_rate{name="cost_p99",window="6h"} > 3.0)
+          and on(name)
+          (slo_burn_rate{name="cost_p99",window="1d"} > 3.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: cost_p99
+        annotations:
+          summary: "Cost SLO burn-rate elevated (ticket)"
+          description: >-
+            Per-request cost budget burning at >3x over BOTH the 6h and 1d
+            windows ({{ $value | humanize }}). Slow cost creep — audit
+            expensive models and token usage trends.
+            Runbook: docs/slo-alerts-runbook.md#cost_p99.

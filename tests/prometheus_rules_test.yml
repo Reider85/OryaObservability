@@ -495,3 +495,115 @@ tests:
       - eval_time: 8h
         alertname: GoldenEvalJobStale
         exp_alerts: []
+
+  # --- PP26: multi-window burn-rate alerting -------------------------------
+  # Both windows of a pair over threshold -> page alert fires; a single hot
+  # window (short OR long) must never fire (multi-window correlation).
+  # for: 2m at interval 1m: condition holds from the first sample, the first
+  # firing evaluation is at >= 2m, so eval_time 5m is safely past it.
+  - interval: 1m
+    name: PP26 both windows over 14.4x fires SLOBurnRateHigh (page)
+    input_series:
+      - series: 'slo_burn_rate{name="availability",window="5m"}'
+        values: "20+0x10"
+      - series: 'slo_burn_rate{name="availability",window="1h"}'
+        values: "15+0x10"
+      - series: 'slo_burn_rate{name="availability",window="6h"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SLOBurnRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: availability
+              name: availability
+              window: 5m
+            exp_annotations:
+              summary: "Availability SLO burn-rate high (page)"
+              description: >-
+                Availability error budget is burning at >14.4x the sustainable
+                rate over BOTH the 5m and 1h windows (20). This is a fast
+                burn: the 30d budget will be exhausted in hours. Check recent
+                deploys, upstream dependencies and the SLO dashboard (PP28).
+                Runbook: docs/slo-alerts-runbook.md#availability.
+
+  - interval: 1m
+    name: PP26 short window only never fires SLOBurnRateHigh
+    input_series:
+      - series: 'slo_burn_rate{name="availability",window="5m"}'
+        values: "100+0x10"
+      - series: 'slo_burn_rate{name="availability",window="1h"}'
+        values: "1+0x10"
+      - series: 'slo_burn_rate{name="availability",window="6h"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SLOBurnRateHigh
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: SLOBurnRateSlowBurn
+        exp_alerts: []
+
+  - interval: 1m
+    name: PP26 long window only never fires SLOBurnRateHigh
+    input_series:
+      - series: 'slo_burn_rate{name="availability",window="5m"}'
+        values: "1+0x10"
+      - series: 'slo_burn_rate{name="availability",window="1h"}'
+        values: "20+0x10"
+      - series: 'slo_burn_rate{name="availability",window="6h"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SLOBurnRateHigh
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: SLOBurnRateSlowBurn
+        exp_alerts: []
+
+  - interval: 1m
+    name: PP26 slow burn pair fires SLOBurnRateSlowBurn (ticket), not the page alert
+    input_series:
+      - series: 'slo_burn_rate{name="availability",window="5m"}'
+        values: "1+0x10"
+      - series: 'slo_burn_rate{name="availability",window="1h"}'
+        values: "7+0x10"
+      - series: 'slo_burn_rate{name="availability",window="6h"}'
+        values: "10+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SLOBurnRateSlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              slo: availability
+              name: availability
+              window: 1h
+            exp_annotations:
+              summary: "Availability SLO burn-rate elevated (ticket)"
+              description: >-
+                Availability error budget burning at >6x over BOTH the 1h and
+                6h windows (7). Slower burn than the page alert — schedule
+                remediation within the business day. Runbook:
+                docs/slo-alerts-runbook.md#availability.
+      - eval_time: 5m
+        alertname: SLOBurnRateHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: PP26 healthy burn rates never fire any SLO alert
+    input_series:
+      - series: 'slo_burn_rate{name="availability",window="5m"}'
+        values: "1+0x10"
+      - series: 'slo_burn_rate{name="availability",window="1h"}'
+        values: "1+0x10"
+      - series: 'slo_burn_rate{name="availability",window="6h"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SLOBurnRateHigh
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: SLOBurnRateSlowBurn
+        exp_alerts: []

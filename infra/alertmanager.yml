@@ -34,6 +34,25 @@ route:
       group_wait: 10s
       repeat_interval: 1h
 
+    # PP26: SLO fast-burn page alerts wake the on-call via PagerDuty.
+    # PAGERDUTY_SERVICE_KEY must be set in infra/.env (see .env.example);
+    # without it alerts here are dropped like the default receiver.
+    - matchers:
+        - severity="page"
+      receiver: pagerduty
+      group_by: [alertname, slo]
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # PP26: SLO slow-burn ticket alerts go to the issue tracker (Jira
+    # incoming webhook). No paging — next business day is fine.
+    - matchers:
+        - severity="ticket"
+      receiver: jira
+      group_by: [alertname, slo]
+      group_wait: 5m
+      repeat_interval: 12h
+
 inhibit_rules:
   # While the cron target is down, Prometheus sees no cron metrics at all, so the
   # staleness alerts stay silent. One noisy "target down" is enough.
@@ -60,10 +79,18 @@ receivers:
           {{ end }}
         send_resolved: true
 
-  # PC27: PagerDuty stub for Level 3 escalation (critical only).
-  # Uncomment and replace PAGERDUTY_SERVICE_KEY when needed:
-  #
-  # - name: pagerduty
-  #   pagerduty_configs:
-  #     - service_key: "${PAGERDUTY_SERVICE_KEY}"
-  #       severity: critical
+  # PP26: PagerDuty receiver for severity="page" SLO burn-rate alerts.
+  # Set PAGERDUTY_SERVICE_KEY in infra/.env before relying on it.
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: "${PAGERDUTY_SERVICE_KEY}"
+        severity: critical
+        summary: "{{ .CommonLabels.alertname }} ({{ .CommonLabels.slo }})"
+
+  # PP26: Jira incoming-webhook receiver for severity="ticket" SLO burn-rate
+  # alerts. Set JIRA_WEBHOOK_URL in infra/.env (e.g. a automation rule
+  # webhook that creates a ticket). No paging.
+  - name: jira
+    webhook_configs:
+      - url: "${JIRA_WEBHOOK_URL}"
+        send_resolved: true
