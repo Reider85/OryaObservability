@@ -9,7 +9,7 @@ import asyncio
 import os
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.responses import HTMLResponse
@@ -157,6 +157,35 @@ class AuditEvent(BaseModel):
     requested_fields: List[str]
     mfa_used: bool
     mfa_token: Optional[str] = None
+    audit_id: str = ""
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to audit_events_hot row (compatible with HotStore.write_audit_event).
+        
+        PP24: ui.AuditEvent previously lacked this method — real ClickHouse writes
+        crashed with AttributeError (only MockHotStore worked). Column layout must
+        match agent_obs.storage.hot.HotStore.write_audit_event INSERT.
+        """
+        import uuid
+        from datetime import timezone
+        if not self.audit_id:
+            self.audit_id = f"dd-{uuid.uuid4().hex[:12]}"
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps({"type": "viewer_user", "id": self.user}),
+            self.action,
+            self.decision,
+            json.dumps({
+                "node_id": self.node_id,
+                "requested_fields": self.requested_fields,
+                "mfa_used": self.mfa_used,
+            }),
+            self.reason,
+            "unknown",
+            "trace-viewer",
+        )
 
 
 class DrillDownResponse(BaseModel):
@@ -167,6 +196,33 @@ class DrillDownResponse(BaseModel):
     mfa_used: bool
     cache_hit: bool = False
     metadata: Dict[str, Any] = {}
+
+
+class DrillDownCapabilitiesResponse(BaseModel):
+    """PP24: что пользователь может делать с drill-down до клика (для UI)."""
+    trace_id: str
+    user: str
+    can_read: bool
+    can_pii_recover: bool
+    rate_limit: int
+    rate_remaining: Optional[int] = None  # None = Redis недоступен (fail-open)
+
+
+class DrillDownHistoryItem(BaseModel):
+    """PP24: одна запись истории drill-down для sidebar."""
+    timestamp: Any = None
+    trace_id: str
+    decision: str
+    reason: str
+    requested_fields: List[str] = []
+    mfa_used: bool = False
+
+
+class DrillDownHistoryResponse(BaseModel):
+    """PP24: последние drill-down запросы пользователя (sidebar, max 10)."""
+    trace_id: str
+    user: str
+    items: List[DrillDownHistoryItem] = []
 
 
 # Helper functions for RBAC, MFA, and audit logging
@@ -266,7 +322,11 @@ def _audit_expand_request(
     )
     
     if hot_store and hasattr(hot_store, 'write_audit_event'):
-        hot_store.write_audit_event(audit_event)
+        try:
+            hot_store.write_audit_event(audit_event)
+        except Exception:
+            # PP24: audit write must never break the request path (e.g. ClickHouse down)
+            pass
 
 
 def _dicts_to_spans(spans_data: List[Dict[str, Any]]) -> List[Any]:
@@ -569,6 +629,7 @@ async def drill_down_trace(
     fields: Optional[str] = Query(None, description="Comma-separated fields to request"),
     request: Request = None,
     drill_down_service: "DrillDownService" = Depends(get_drill_down_service),
+    hot_store: HotStore = Depends(get_hot_store),
 ):
     """Recover specific fields from a trace across tiered storage.
     
@@ -597,8 +658,7 @@ async def drill_down_trace(
             reason="rbac_denied",
             action="drill_down",
             requested_fields=requested_fields,
-            mfa_token=None,
-            hot_store=None,
+            hot_store=hot_store,
         )
         raise HTTPException(
             status_code=403,
@@ -617,7 +677,7 @@ async def drill_down_trace(
             action="drill_down",
             requested_fields=requested_fields,
             mfa_token=request.headers.get("X-OryaObs-MFA"),
-            hot_store=None,
+            hot_store=hot_store,
         )
         raise HTTPException(
             status_code=403,
@@ -636,7 +696,7 @@ async def drill_down_trace(
                 action="drill_down",
                 requested_fields=requested_fields,
                 mfa_token=request.headers.get("X-OryaObs-MFA"),
-                hot_store=None,
+                hot_store=hot_store,
             )
             raise HTTPException(
                 status_code=403,
@@ -655,7 +715,7 @@ async def drill_down_trace(
                 action="drill_down",
                 requested_fields=requested_fields,
                 mfa_token=mfa_token,
-                hot_store=None,
+                hot_store=hot_store,
             )
             raise HTTPException(
                 status_code=403,
@@ -673,7 +733,7 @@ async def drill_down_trace(
                 action="drill_down",
                 requested_fields=requested_fields,
                 mfa_token=mfa_token,
-                hot_store=None,
+                hot_store=hot_store,
             )
             raise HTTPException(
                 status_code=403,
@@ -705,7 +765,7 @@ async def drill_down_trace(
             action="drill_down",
             requested_fields=requested_fields,
             mfa_used=mfa_used,
-            hot_store=None,
+            hot_store=hot_store,
         )
         
         return DrillDownResponse(
@@ -729,7 +789,7 @@ async def drill_down_trace(
             action="drill_down",
             requested_fields=requested_fields,
             mfa_used=mfa_used,
-            hot_store=None,
+            hot_store=hot_store,
         )
         raise HTTPException(status_code=403, detail=str(e))
         
@@ -746,7 +806,7 @@ async def drill_down_trace(
                 action="drill_down",
                 requested_fields=requested_fields,
                 mfa_used=mfa_used,
-                hot_store=None,
+                hot_store=hot_store,
             )
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
         else:
@@ -760,7 +820,7 @@ async def drill_down_trace(
                 action="drill_down",
                 requested_fields=requested_fields,
                 mfa_used=mfa_used,
-                hot_store=None,
+                hot_store=hot_store,
             )
             raise HTTPException(status_code=404, detail=f"Trace {trace_id} not found")
         
@@ -775,9 +835,101 @@ async def drill_down_trace(
             action="drill_down",
             requested_fields=requested_fields,
             mfa_used=mfa_used,
-            hot_store=None,
+            hot_store=hot_store,
         )
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/api/v1/traces/{trace_id}/drill-down/capabilities", response_model=DrillDownCapabilitiesResponse)
+async def drill_down_capabilities(
+    trace_id: str,
+    request: Request = None,
+    drill_down_service: "DrillDownService" = Depends(get_drill_down_service),
+):
+    """PP24: RBAC + rate-limit capabilities для drill-down UI (до клика).
+    
+    Возвращает:
+    - can_read / can_pii_recover — из AGENT_OBS_RBAC_ROLES
+    - rate_limit / rate_remaining — из Redis-счётчика DrillDownService (read-only)
+    """
+    user = request.headers.get("X-OryaObs-User")
+    if not user:
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: X-OryaObs-User header required"
+        )
+    
+    can_read = check_permission(user, "trace:read")
+    can_pii_recover = check_permission(user, "pii:recover")
+    
+    rate_remaining = None
+    try:
+        rate_remaining = await drill_down_service.get_rate_remaining(user)
+    except Exception:
+        rate_remaining = None
+    
+    return DrillDownCapabilitiesResponse(
+        trace_id=trace_id,
+        user=user,
+        can_read=can_read,
+        can_pii_recover=can_pii_recover,
+        rate_limit=drill_down_service.rate_limit,
+        rate_remaining=rate_remaining,
+    )
+
+
+@app.get("/api/v1/traces/{trace_id}/drill-down/history", response_model=DrillDownHistoryResponse)
+async def drill_down_history(
+    trace_id: str,
+    request: Request = None,
+    hot_store: HotStore = Depends(get_hot_store),
+    limit: int = Query(10, description="Max history items (spec: last 10)"),
+):
+    """PP24: история drill-down запросов пользователя (sidebar, последние 10).
+    
+    Источник — audit_events_hot (action="drill_down"), фильтр по actor == user.
+    RBAC: "trace:read" (history привязан к просмотру трейса).
+    """
+    user = request.headers.get("X-OryaObs-User")
+    if not user:
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: X-OryaObs-User header required"
+        )
+    
+    if not check_permission(user, "trace:read"):
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: trace:read permission required"
+        )
+    
+    events: List[Dict[str, Any]] = []
+    if hasattr(hot_store, "get_audit_events"):
+        try:
+            events = hot_store.get_audit_events(action="drill_down", limit=100)
+        except Exception:
+            events = []
+    
+    # Filter by actor (audit rows store actor as JSON {"type": ..., "id": user})
+    items: List[DrillDownHistoryItem] = []
+    for event in events:
+        actor = event.get("actor")
+        actor_id = actor.get("id") if isinstance(actor, dict) else actor
+        if actor_id != user:
+            continue
+        resource = event.get("resource") or {}
+        items.append(DrillDownHistoryItem(
+            timestamp=event.get("timestamp"),
+            trace_id=event.get("trace_id", ""),
+            decision=event.get("decision", ""),
+            reason=event.get("reason", ""),
+            requested_fields=resource.get("requested_fields", []) if isinstance(resource, dict) else [],
+            mfa_used=bool(resource.get("mfa_used")) if isinstance(resource, dict) else False,
+        ))
+        if len(items) >= limit:
+            break
+    
+    return DrillDownHistoryResponse(trace_id=trace_id, user=user, items=items)
 
 
 @app.get("/trace/{trace_id}", response_class=HTMLResponse)
@@ -789,8 +941,17 @@ async def trace_view(
     """Main trace view with expandable events"""
     try:
         spans = hot_store.get_spans(trace_id)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Trace not found: {str(e)}")
+    except Exception:
+        spans = []
+    
+    # PP24: hot-store miss → проба warm/cold тиров (DrillDownService).
+    # Если трейс найден в архиве — рендерим cold-страницу с [COLD]-бейджами
+    # и кнопкой Drill down вместо 404.
+    if not spans:
+        cold_html = await _render_cold_trace_page(trace_id)
+        if cold_html:
+            return cold_html
+        raise HTTPException(status_code=404, detail=f"Trace not found: {trace_id}")
     
     # Convert expand_events param to boolean
     expand_events_flag = expand_events == "events"
@@ -849,6 +1010,405 @@ async def health_check():
     return {"status": "healthy", "service": "trace-viewer"}
 
 
+# ---------------------------------------------------------------------------
+# PP24: Drill-down UI (cold fields) — shared CSS, modal, sidebar, JS
+# ---------------------------------------------------------------------------
+
+DRILL_DOWN_CSS = """
+        .cold-badge { background-color: #17a2b8; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }
+        .cold-field-row { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; padding: 10px; border: 1px solid #ced4da; border-radius: 4px; background-color: #f1f8fb; }
+        .cold-field-name { font-family: monospace; font-weight: bold; color: #495057; }
+        .cold-field-value { font-size: 12px; color: #212529; margin-top: 4px; word-break: break-all; }
+        .cold-field-value.masked { color: #6c757d; font-style: italic; }
+        .drill-down-btn { background-color: #fd7e14; color: white; padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+        .drill-down-btn:hover:not(:disabled) { background-color: #e8590c; }
+        .drill-down-btn:disabled { background-color: #adb5bd; cursor: not-allowed; }
+        .drill-down-tooltip { font-size: 11px; color: #dc3545; margin-left: 8px; }
+        .modal-overlay { display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
+        .modal-content { background: white; margin: 10% auto; padding: 20px; border-radius: 8px; width: 480px; max-width: 90%; }
+        .modal-content h3 { margin-top: 0; }
+        .modal-close { float: right; background: none; border: none; font-size: 18px; cursor: pointer; }
+        .mfa-row { margin: 10px 0; }
+        .mfa-row label { display: block; margin-bottom: 4px; font-weight: bold; }
+        #mfa-input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        .submit-button { background-color: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+        .submit-button:hover { background-color: #0056b3; }
+        .submit-button:disabled { background-color: #adb5bd; cursor: not-allowed; }
+        .error-message { display: none; color: #dc3545; margin-top: 10px; font-weight: bold; }
+        .drill-down-loading { display: none; color: #6c757d; font-style: italic; margin-top: 10px; }
+        .drill-down-result { display: none; margin-top: 10px; padding: 10px; background-color: #f8f9fa; border-radius: 4px; font-family: monospace; font-size: 12px; word-break: break-all; }
+        .tier-badge { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-right: 6px; }
+        .tier-cold { background-color: #17a2b8; color: white; }
+        .tier-warm { background-color: #ffc107; color: #212529; }
+        .tier-hot { background-color: #28a745; color: white; }
+        .drill-down-history { margin-top: 20px; padding: 15px; border: 1px solid #dee2e6; border-radius: 4px; background: #f8f9fa; }
+        .drill-down-history h3 { margin-top: 0; }
+        #drill-down-history-list { list-style: none; padding: 0; margin: 0; }
+        .history-item { padding: 4px 0; font-size: 12px; border-bottom: 1px solid #e9ecef; }
+        .history-item .history-time { color: #6c757d; margin-right: 8px; }
+        .history-item .history-fields { font-family: monospace; }
+        .history-item .history-decision { float: right; font-weight: bold; }
+        .history-item.history-allow .history-decision { color: #28a745; }
+        .history-item.history-deny .history-decision { color: #dc3545; }
+        .no-history { color: #6c757d; font-style: italic; font-size: 12px; }
+"""
+
+
+def render_drill_down_modal() -> str:
+    """PP24: модалка drill-down (MFA-prompt для PII, спиннер, результат)."""
+    return """
+    <div id="drill-down-modal" class="modal-overlay user-modal">
+        <div class="modal-content">
+            <button class="modal-close" onclick="closeDrillDownModal()">&times;</button>
+            <h3>Drill down cold field</h3>
+            <p>Field: <span id="drill-down-field-name" class="cold-field-name"></span></p>
+            <div class="mfa-row" id="mfa-row">
+                <label for="mfa-input">MFA token (TOTP) — required for PII fields:</label>
+                <input type="text" id="mfa-input" placeholder="Enter 6-digit token" autocomplete="off">
+            </div>
+            <button class="submit-button" onclick="submitDrillDown()">Recover value</button>
+            <div id="drill-down-loading" class="loading drill-down-loading">Recovering from cold storage... expected wait &lt; 1 min</div>
+            <div id="drill-down-error" class="error-message"></div>
+            <div id="drill-down-result" class="drill-down-result"></div>
+        </div>
+    </div>
+"""
+
+
+def render_drill_down_sidebar() -> str:
+    """PP24: sidebar с историей drill-down (последние 10 запросов user)."""
+    return """
+    <aside class="drill-down-history">
+        <h3>Drill-down history</h3>
+        <ul id="drill-down-history-list">
+            <li class="no-history">Enter user to see history</li>
+        </ul>
+    </aside>
+"""
+
+
+DRILL_DOWN_JS = r"""
+// ---------------------------------------------------------------------------
+// PP24: Drill-down client (cold fields)
+// ---------------------------------------------------------------------------
+const drillDownState = { canRead: false, canPiiRecover: false, rateLimit: 10, rateRemaining: null };
+let currentDrillDownField = null;
+
+function getViewerUser() {
+    const input = document.getElementById('user-input');
+    return input ? input.value.trim() : '';
+}
+
+function getTraceId() {
+    const el = document.querySelector('.trace-id');
+    return el ? el.textContent.trim() : '';
+}
+
+function isPiiFlag(v) {
+    return v === true || v === '1' || v === 'true';
+}
+
+async function fetchDrillDownCapabilities() {
+    const user = getViewerUser();
+    if (!user) { return; }
+    try {
+        const resp = await fetch(`/api/v1/traces/${getTraceId()}/drill-down/capabilities`, {
+            headers: { 'X-OryaObs-User': user }
+        });
+        if (!resp.ok) {
+            drillDownState.canRead = false;
+            drillDownState.canPiiRecover = false;
+        } else {
+            const caps = await resp.json();
+            drillDownState.canRead = caps.can_read;
+            drillDownState.canPiiRecover = caps.can_pii_recover;
+            drillDownState.rateLimit = caps.rate_limit;
+            drillDownState.rateRemaining = caps.rate_remaining;
+        }
+    } catch (e) {
+        console.error('drill-down capabilities failed:', e);
+    }
+    updateDrillDownButtons();
+}
+
+function drillDownButtonState(isPii) {
+    if (!drillDownState.canRead) {
+        return { enabled: false, tooltip: 'Requires trace:read permission' };
+    }
+    if (isPii && !drillDownState.canPiiRecover) {
+        return { enabled: false, tooltip: 'Requires pii:recover permission' };
+    }
+    if (drillDownState.rateRemaining === 0) {
+        return { enabled: false, tooltip: 'Rate limit reached' };
+    }
+    return { enabled: true, tooltip: '' };
+}
+
+function updateDrillDownButtons() {
+    document.querySelectorAll('.drill-down-btn').forEach(btn => {
+        const isPii = isPiiFlag(btn.dataset.pii);
+        const state = drillDownButtonState(isPii);
+        btn.disabled = !state.enabled;
+        btn.title = state.tooltip;
+        const row = btn.closest('.cold-field-row');
+        const tip = row ? row.querySelector('.drill-down-tooltip') : null;
+        if (tip) { tip.textContent = state.tooltip; }
+    });
+}
+
+function openDrillDownModal(fieldName, isPii) {
+    const pii = isPiiFlag(isPii);
+    const state = drillDownButtonState(pii);
+    if (!state.enabled) { return; }
+    currentDrillDownField = { name: fieldName, pii: pii };
+    document.getElementById('drill-down-field-name').textContent = fieldName;
+    document.getElementById('mfa-row').style.display = pii ? 'block' : 'none';
+    document.getElementById('mfa-input').value = '';
+    document.getElementById('drill-down-loading').style.display = 'none';
+    document.getElementById('drill-down-result').style.display = 'none';
+    const errorEl = document.getElementById('drill-down-error');
+    errorEl.style.display = 'none';
+    errorEl.textContent = '';
+    document.getElementById('drill-down-modal').style.display = 'block';
+}
+
+function closeDrillDownModal() {
+    document.getElementById('drill-down-modal').style.display = 'none';
+    currentDrillDownField = null;
+}
+
+function updateColdFieldRow(fieldName, data) {
+    const row = document.querySelector(`.cold-field-row[data-field="${CSS.escape(fieldName)}"]`);
+    if (!row) { return; }
+    const valueEl = row.querySelector('.cold-field-value');
+    if (valueEl && data.fields && fieldName in data.fields) {
+        valueEl.textContent = JSON.stringify(data.fields[fieldName]);
+        valueEl.classList.remove('masked');
+    }
+}
+
+async function submitDrillDown() {
+    if (!currentDrillDownField) { return; }
+    const user = getViewerUser();
+    const traceId = getTraceId();
+    const loading = document.getElementById('drill-down-loading');
+    const resultEl = document.getElementById('drill-down-result');
+    const errorEl = document.getElementById('drill-down-error');
+    const submitBtn = document.querySelector('#drill-down-modal .submit-button');
+
+    resultEl.style.display = 'none';
+    errorEl.style.display = 'none';
+    errorEl.textContent = '';
+    loading.style.display = 'block';
+    submitBtn.disabled = true;
+
+    const headers = { 'X-OryaObs-User': user };
+    if (currentDrillDownField.pii) {
+        headers['X-OryaObs-MFA'] = document.getElementById('mfa-input').value.trim();
+    }
+
+    try {
+        const resp = await fetch(
+            `/api/v1/traces/${traceId}/drill-down?fields=${encodeURIComponent(currentDrillDownField.name)}`,
+            { headers: headers }
+        );
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 429) {
+            drillDownState.rateRemaining = 0;
+            updateDrillDownButtons();
+            errorEl.textContent = 'Rate limit reached';
+            errorEl.style.display = 'block';
+        } else if (!resp.ok) {
+            errorEl.textContent = data.detail || `Drill-down failed (HTTP ${resp.status})`;
+            errorEl.style.display = 'block';
+        } else {
+            const tier = data.storage_tier || 'unknown';
+            resultEl.innerHTML = `<span class="tier-badge tier-${tier}">${tier.toUpperCase()}</span>` + JSON.stringify(data.fields);
+            resultEl.style.display = 'block';
+            updateColdFieldRow(currentDrillDownField.name, data);
+            loadDrillDownHistory();
+        }
+    } catch (e) {
+        errorEl.textContent = 'Request failed: ' + e.message;
+        errorEl.style.display = 'block';
+    } finally {
+        loading.style.display = 'none';
+        submitBtn.disabled = false;
+    }
+}
+
+async function loadDrillDownHistory() {
+    const user = getViewerUser();
+    const list = document.getElementById('drill-down-history-list');
+    if (!list) { return; }
+    if (!user) {
+        list.innerHTML = '<li class="no-history">Enter user to see history</li>';
+        return;
+    }
+    try {
+        const resp = await fetch(`/api/v1/traces/${getTraceId()}/drill-down/history`, {
+            headers: { 'X-OryaObs-User': user }
+        });
+        if (!resp.ok) {
+            list.innerHTML = '<li class="no-history">History unavailable</li>';
+            return;
+        }
+        const data = await resp.json();
+        if (!data.items || data.items.length === 0) {
+            list.innerHTML = '<li class="no-history">No drill-downs yet</li>';
+            return;
+        }
+        list.innerHTML = data.items.map(item => {
+            let timeStr = '';
+            if (item.timestamp !== null && item.timestamp !== undefined) {
+                const d = (typeof item.timestamp === 'number')
+                    ? new Date(item.timestamp * 1000)
+                    : new Date(item.timestamp);
+                timeStr = isNaN(d.getTime()) ? '' : d.toLocaleString();
+            }
+            return `
+                <li class="history-item history-${item.decision}">
+                    <span class="history-time">${timeStr}</span>
+                    <span class="history-fields">${(item.requested_fields || []).join(', ')}</span>
+                    <span class="history-decision">${item.decision}</span>
+                </li>
+            `;
+        }).join('');
+    } catch (e) {
+        list.innerHTML = '<li class="no-history">History unavailable</li>';
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    // PP24 fail-closed: кнопки disabled, пока capabilities не подтвердили RBAC.
+    updateDrillDownButtons();
+    const userInput = document.getElementById('user-input');
+    if (userInput) {
+        userInput.addEventListener('change', () => {
+            fetchDrillDownCapabilities();
+            loadDrillDownHistory();
+        });
+    }
+    fetchDrillDownCapabilities();
+    loadDrillDownHistory();
+});
+"""
+
+
+async def _render_cold_trace_page(trace_id: str) -> Optional[str]:
+    """PP24: проба warm/cold тиров; рендер cold-страницы с [COLD]-бейджами.
+    
+    Возвращает HTML или None, если trace не найден ни в warm, ни в cold
+    (или tier-сторы недоступны) — тогда вызывающий код отдаёт 404.
+    """
+    try:
+        service = get_drill_down_service()
+    except Exception:
+        return None
+    
+    try:
+        result = await service.drill_down(DrillDownRequest(
+            trace_id=trace_id, fields=[], user="", mfa_used=False
+        ))
+    except Exception:
+        return None
+    
+    if result.storage_tier not in ("warm", "cold") or not result.fields:
+        return None
+    
+    return generate_cold_trace_html(
+        trace_id, result.storage_tier, result.fields,
+        datetime.now(timezone.utc).isoformat()
+    )
+
+
+def generate_cold_trace_html(
+    trace_id: str, tier: str, fields: Dict[str, Any], timestamp: str
+) -> str:
+    """PP24: cold-трейс страница — поля с меткой [COLD] + кнопка Drill down.
+    
+    PII-поля маскируются (значение не покидает страницу без MFA — guardrail
+    fail-closed), non-PII поля (метаданные, sha256, счётчики) показываются.
+    """
+    field_rows = []
+    for name in sorted(fields):
+        is_pii = fields_intersect_pii([name])
+        if is_pii:
+            display_value = "[MASKED — MFA required to recover]"
+        else:
+            display_value = json.dumps(fields[name], default=str)
+            if len(display_value) > 500:
+                display_value = display_value[:500] + "…"
+        pii_js = "true" if is_pii else "false"
+        field_rows.append(f"""
+        <div class="cold-field-row" data-field="{name}" data-pii="{'1' if is_pii else '0'}">
+            <div>
+                <span class="cold-field-name">{name}</span>
+                <span class="cold-badge">[COLD]</span>
+                <div class="cold-field-value{' masked' if is_pii else ''}">{display_value}</div>
+            </div>
+            <div>
+                <button class="drill-down-btn" data-field="{name}" data-pii="{'1' if is_pii else '0'}"
+                        onclick="openDrillDownModal('{name}', {pii_js})">Drill down</button>
+                <span class="drill-down-tooltip"></span>
+            </div>
+        </div>
+        """)
+    
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trace View (COLD) - {trace_id}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f8f9fa; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .header {{ border-bottom: 1px solid #dee2e6; padding-bottom: 15px; margin-bottom: 20px; }}
+        .trace-id {{ font-size: 24px; font-weight: bold; color: #212529; }}
+        .meta {{ color: #6c757d; font-size: 14px; margin-top: 5px; }}
+        .user-input {{ margin-top: 10px; }}
+        .user-input label {{ margin-right: 8px; font-weight: bold; }}
+        .user-input input {{ padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; }}
+        .cold-tier-banner {{ margin: 15px 0; padding: 12px; background-color: #d1ecf1; border-left: 4px solid #17a2b8; border-radius: 4px; color: #0c5460; }}
+        {DRILL_DOWN_CSS}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="trace-id">{trace_id}</div>
+            <div class="meta">Cold trace view (tier: {tier}) — generated at {timestamp}</div>
+            <div class="user-input">
+                <label for="user-input">User (for RBAC):</label>
+                <input type="text" id="user-input" placeholder="Enter username">
+            </div>
+        </div>
+        
+        <div class="cold-tier-banner">
+            This trace was migrated to {tier} tier. Values below are metadata only —
+            use «Drill down» to recover full field values (PII fields require MFA).
+        </div>
+        
+        <div id="cold-fields-container">
+            {''.join(field_rows)}
+        </div>
+        
+        {render_drill_down_sidebar()}
+    </div>
+    
+    {render_drill_down_modal()}
+    
+    <script>
+{DRILL_DOWN_JS}
+    </script>
+</body>
+</html>
+"""
+    return html
+
+
 def generate_trace_html(data: Dict[str, Any]) -> str:
     """Generate HTML with inline JS for trace viewer"""
     trace_id = data["trace_id"]
@@ -904,6 +1464,7 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
         .expand-compressed:hover {{ background-color: #218838; }}
         .compressed-name {{ color: #dc3545; font-weight: bold; }}
         .summary {{ margin-top: 8px; padding: 8px; background-color: #e3f2fd; border-radius: 4px; font-style: italic; color: #1565c0; }}
+        {DRILL_DOWN_CSS}
     </style>
 </head>
 <body>
@@ -925,7 +1486,11 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
         <div id="spans-container">
             {render_span_tree(span_tree, expand_events)}
         </div>
+        
+        {render_drill_down_sidebar()}
     </div>
+    
+    {render_drill_down_modal()}
 
     <script>
         // AggregatedSpanView component
@@ -1206,6 +1771,8 @@ def generate_trace_html(data: Dict[str, Any]) -> str:
                 button.disabled = false;
             }}
         }}
+        
+{DRILL_DOWN_JS}
     </script>
 </body>
 </html>

@@ -197,6 +197,29 @@ class DrillDownService:
                 pass  # Ignore metric errors too
             return True
     
+    async def get_rate_remaining(self, user: str) -> Optional[int]:
+        """PP24: сколько запросов осталось пользователю в текущем минутном окне.
+        
+        Read-only (не инкрементирует счётчик) — предназначена для capabilities
+        endpoint'а trace-viewer, чтобы UI мог заранее показать «Rate limit reached».
+        
+        Returns:
+            Оставшееся количество запросов, None если Redis недоступен
+            (fail-open — лимит считается неизвестным).
+        """
+        if not self.redis_client:
+            return None
+        
+        window = int(time.time() // 60)
+        key = f"agent_obs:drill_down:rate:{user}:{window}"
+        
+        try:
+            raw = await asyncio.to_thread(self.redis_client.get, key)
+            used = int(raw) if raw is not None else 0
+            return max(0, self.rate_limit - used)
+        except Exception:
+            return None
+    
     async def _cache_get(self, cache_key: str) -> Optional[DrillDownResult]:
         """Получить результат из Redis-кеша."""
         if not self.redis_client:

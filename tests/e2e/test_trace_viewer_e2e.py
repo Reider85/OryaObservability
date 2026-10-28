@@ -8,14 +8,14 @@ import pytest
 from playwright.sync_api import Page, expect
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import uvicorn
 import threading
 import time
 import json
 
 # Import the trace viewer app
-from agent_obs.trace_viewer.ui import app as trace_viewer_app
+from agent_obs.trace_viewer.ui import app as trace_viewer_app, DrillDownResponse
 
 
 @pytest.fixture(scope="module")
@@ -675,3 +675,164 @@ class TestTraceViewerE2E:
         
         # Modal should still be open
         expect(user_modal).to_be_visible()
+
+
+class TestDrillDownColdFieldE2E:
+    """PP24 e2e: кнопка Drill down для cold-полей в trace-viewer.
+
+    Сервер отдаёт cold-страницу (hot-store miss -> cold-tier fallback),
+    все drill-down API мокаются через page.route.
+    """
+
+    COLD_CAPS = {
+        "trace_id": "01COLD999", "user": "alice",
+        "can_read": True, "can_pii_recover": True,
+        "rate_limit": 10, "rate_remaining": 5,
+    }
+
+    def _goto_cold_trace(self, page: Page, server_url: str,
+                         caps=None, drill_response=None):
+        """Мокает drill-down API и открывает cold-трейс."""
+        from agent_obs.storage.drill_down import DrillDownResult
+
+        caps = caps if caps is not None else dict(self.COLD_CAPS)
+        drill_response = drill_response or DrillDownResponse(
+            trace_id="01COLD999", storage_tier="cold",
+            fields={"llm.input_text": "secret PII text"},
+            query_latency_ms=12.0, mfa_used=True,
+        ).model_dump()
+
+        cold_service = Mock()
+        cold_service.rate_limit = 10
+        cold_service.get_rate_remaining = AsyncMock(return_value=5)
+        cold_service.drill_down = AsyncMock(return_value=DrillDownResult(
+            fields={"llm.input_text": "secret PII text", "span_count": 3},
+            storage_tier="cold", query_latency_ms=12.0, mfa_used=False,
+        ))
+
+        # Мокаем все drill-down API, чтобы e2e не зависел от Redis/ClickHouse.
+        page.route("**/drill-down/capabilities", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(caps)))
+        page.route("**/drill-down/history", lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({"trace_id": "01COLD999", "user": "alice", "items": [
+                {"timestamp": 1705326600.0, "trace_id": "01COLD999", "decision": "allow",
+                 "reason": "success", "requested_fields": ["llm.input_text"], "mfa_used": True},
+            ]})))
+        page.route("**/drill-down?*", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(drill_response)))
+
+        with patch("agent_obs.trace_viewer.ui.get_drill_down_service", return_value=cold_service):
+            page.goto(f"{server_url.rstrip('/')}/trace/01COLD999")
+
+    @pytest.fixture
+    def cold_page(self, trace_viewer_server):
+        """Cold-страница с замоканными drill-down API (RBAC ok, PII ok)."""
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            self._goto_cold_trace(page, trace_viewer_server)
+            yield page
+            browser.close()
+
+    def test_cold_page_renders_cold_badge_and_button(self, cold_page: Page):
+        """Cold-трейс рендерит [COLD]-бейджи + кнопку Drill down."""
+        expect(cold_page.locator(".trace-id")).to_have_text("01COLD999")
+        expect(cold_page.locator(".cold-badge").first).to_have_text("[COLD]")
+        expect(cold_page.locator(".drill-down-btn").first).to_be_visible()
+
+    def test_pii_field_masked_until_drill_down(self, cold_page: Page):
+        """PII-поле замаскировано до drill-down."""
+        expect(cold_page.locator(".cold-field-value.masked").first).to_contain_text("MASKED")
+        expect(cold_page.locator("#cold-fields-container")).not_to_contain_text("secret PII text")
+
+    def test_drill_down_modal_opens_with_mfa_for_pii(self, cold_page: Page):
+        """Клик по Drill down открывает модалку; PII-поле требует MFA."""
+        cold_page.fill("#user-input", "alice")
+        cold_page.dispatch_event("#user-input", "change")
+        cold_page.wait_for_function(
+            "() => { const b = document.querySelector('.drill-down-btn'); return b && !b.disabled; }",
+            timeout=5000,
+        )
+        cold_page.locator(".drill-down-btn").first.click()
+        expect(cold_page.locator(".user-modal")).to_be_visible()
+        expect(cold_page.locator("#mfa-row")).to_be_visible()
+        expect(cold_page.locator("#mfa-input")).to_be_visible()
+        expect(cold_page.locator("#drill-down-loading")).to_contain_text("1 min")
+
+    def test_drill_down_disabled_without_pii_recover(self, trace_viewer_server):
+        """RBAC: без pii:recover PII-кнопка disabled с tooltip."""
+        from playwright.sync_api import sync_playwright
+
+        caps = dict(self.COLD_CAPS, can_pii_recover=False)
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            self._goto_cold_trace(page, trace_viewer_server, caps=caps)
+            page.fill("#user-input", "alice")
+            page.dispatch_event("#user-input", "change")
+            page.wait_for_function(
+                "() => { const b = document.querySelector('.drill-down-btn'); return b && b.disabled; }",
+                timeout=5000,
+            )
+            btn = page.locator(".drill-down-btn").first
+            expect(btn).to_be_disabled()
+            expect(page.locator(".drill-down-tooltip").first).to_have_text(
+                "Requires pii:recover permission")
+            browser.close()
+
+    def test_drill_down_disabled_on_rate_limit(self, trace_viewer_server):
+        """Rate-limit: при rate_remaining=0 кнопка disabled с tooltip."""
+        from playwright.sync_api import sync_playwright
+
+        caps = dict(self.COLD_CAPS, rate_remaining=0)
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            self._goto_cold_trace(page, trace_viewer_server, caps=caps)
+            page.fill("#user-input", "alice")
+            page.dispatch_event("#user-input", "change")
+            page.wait_for_function(
+                "() => { const b = document.querySelector('.drill-down-btn'); return b && b.disabled; }",
+                timeout=5000,
+            )
+            expect(page.locator(".drill-down-tooltip").first).to_have_text("Rate limit reached")
+            browser.close()
+
+    def test_drill_down_disabled_without_user(self, cold_page: Page):
+        """Без user: capabilities не пройдены -> кнопки disabled (fail-closed)."""
+        btn = cold_page.locator(".drill-down-btn").first
+        cold_page.wait_for_function(
+            "() => { const b = document.querySelector('.drill-down-btn'); return b && b.disabled; }",
+            timeout=5000,
+        )
+        expect(btn).to_be_disabled()
+
+    def test_drill_down_recovers_value_via_api(self, cold_page: Page):
+        """Полный флоу: user + MFA -> drill-down API -> значение в модалке и на странице."""
+        cold_page.fill("#user-input", "alice")
+        cold_page.dispatch_event("#user-input", "change")
+        cold_page.wait_for_function(
+            "() => { const b = document.querySelector('.drill-down-btn'); return b && !b.disabled; }",
+            timeout=5000,
+        )
+        cold_page.locator(".drill-down-btn").first.click()
+        expect(cold_page.locator(".user-modal")).to_be_visible()
+        cold_page.fill("#mfa-input", "123456")
+        cold_page.locator(".submit-button").click()
+
+        expect(cold_page.locator("#drill-down-result")).to_be_visible()
+        expect(cold_page.locator("#drill-down-result")).to_contain_text("secret PII text")
+        expect(cold_page.locator("#cold-fields-container")).to_contain_text("secret PII text")
+
+    def test_history_sidebar_renders_items(self, cold_page: Page):
+        """Sidebar: история drill-down (последние 10) отображается для user."""
+        cold_page.fill("#user-input", "alice")
+        cold_page.dispatch_event("#user-input", "change")
+        expect(cold_page.locator(".drill-down-history")).to_be_visible()
+        item = cold_page.locator(".history-item").first
+        expect(item).to_be_visible()
+        expect(item).to_contain_text("llm.input_text")
+        expect(item.locator(".history-decision")).to_have_text("allow")
