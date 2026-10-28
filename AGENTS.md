@@ -117,6 +117,14 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_RBAC_ROLES` | — | PP19: User→role mapping for compressed expand API (e.g., "alice:admin,bob:developer"). Unknown users fail-closed. |
 | `X-OryaObs-User` | — | PP19: HTTP header with user login for RBAC in compressed expand API. |
 | `X-OryaObs-MFA` | — | PP19: HTTP header with MFA token for PII field requests in compressed expand API. |
+| `DRILL_DOWN_RATE_LIMIT` | `10` | PP21: Max drill-down requests per minute per user. |
+| `DRILL_DOWN_CACHE_TTL` | `600` | PP21: Redis cache TTL in seconds for drill-down results. |
+| `ATHENA_ENABLED` | `false` | PP22: Wire AthenaClient into DrillDownService cold-tier hook (`get_drill_down_service`). Off = PP21 direct-Parquet fallback. |
+| `ATHENA_DATABASE` | `observability` | PP22: Glue database for the `cold_traces` external table. |
+| `ATHENA_OUTPUT_LOCATION` | `s3://cold-traces/athena-results/` | PP22: S3 prefix for Athena query result dumps. |
+| `ATHENA_QUERY_TIMEOUT` | `60` | PP22: Max seconds per Athena query before `stop_query_execution`. |
+| `ATHENA_MAX_SCAN_BYTES` | `1073741824` | PP22: Cost guard — stop query + raise `AthenaCostGuardError` above 1 GiB scanned. |
+| `ATHENA_POLL_INTERVAL` | `0.5` | PP22: Seconds between `get_query_execution` polls. |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
 `AGENT_OBS_CRON_*` family (~30 vars: retention days, specs, batch sizes,

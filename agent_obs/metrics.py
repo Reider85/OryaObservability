@@ -191,6 +191,36 @@ embeddings_redis_fallback_total = Counter(
     "Embedding batches written to Redis fallback after ClickHouse failure",
 )
 
+# --- PC21 DrillDown API metrics ---------------------------------------------
+
+drill_down_latency_seconds = Histogram(
+    "agent_obs_drill_down_latency_seconds",
+    "Drill-down query latency by storage tier",
+    ["tier"],
+    buckets=[0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120])
+
+drill_down_rate_limited_total = Counter(
+    "agent_obs_drill_down_rate_limited_total",
+    "Number of drill-down requests blocked by rate limiting",
+    ["tier", "outcome"])
+
+# --- PP22 Athena integration metrics -----------------------------------------
+
+athena_query_latency_seconds = Histogram(
+    "agent_obs_athena_query_latency_seconds",
+    "Athena cold-storage query latency (start to results fetched)",
+    buckets=[0.5, 1, 2, 5, 10, 30, 60, 120])
+
+athena_data_scanned_bytes_total = Counter(
+    "agent_obs_athena_data_scanned_bytes_total",
+    "Total bytes scanned by Athena queries",
+)
+
+athena_cost_guard_triggered_total = Counter(
+    "agent_obs_athena_cost_guard_triggered_total",
+    "Athena queries stopped by the cost guard (ATHENA_MAX_SCAN_BYTES exceeded)",
+)
+
 embeddings_batch_size = Histogram(
     "agent_obs_embeddings_batch_size",
     "Number of embeddings in each ClickHouse batch write",

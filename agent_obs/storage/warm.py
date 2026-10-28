@@ -356,6 +356,40 @@ class WarmStore:
             )
         return int(deleted) if deleted else 0
 
+    async def get_trace(self, trace_id: str) -> dict | None:
+        """Get a single trace by trace_id from traces_warm.
+
+        Returns the trace row as a dict with JSONB/DECIMAL fields decoded,
+        or None if not found.
+        """
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT {columns}
+                FROM traces_warm
+                WHERE trace_id = $1
+                """.format(
+                    columns=", ".join(TRACES_WARM_COLUMNS)
+                ),
+                trace_id,
+            )
+        
+        if not row:
+            return None
+        
+        # Decode JSONB to dict and DECIMAL to float for consistency
+        trace = dict(row)
+        eval_avg = trace.get("eval_avg")
+        if isinstance(eval_avg, str):
+            import json
+            trace["eval_avg"] = json.loads(eval_avg)
+        cost_usd_total = trace.get("cost_usd_total")
+        if cost_usd_total is not None:
+            trace["cost_usd_total"] = float(cost_usd_total)
+        
+        return trace
+
     # PC34: Compliance catalog methods
     async def get_all_compliance_catalog(self) -> list:
         """Get all compliance catalog rows."""

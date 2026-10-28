@@ -95,6 +95,39 @@ def get_hot_store() -> HotStore:
     """Get ClickHouse hot store instance."""
     return HotStoreFactory.get_hot_store()
 
+
+def get_drill_down_service() -> "DrillDownService":
+    """Get DrillDownService instance with tiered stores."""
+    from agent_obs.storage.drill_down import DrillDownService
+    from agent_obs.storage.maintenance import build_hot_store, build_warm_store, build_cold_trace_store
+    import redis.asyncio as redis
+    
+    # Build tiered stores
+    hot_store = build_hot_store()
+    warm_store = build_warm_store()
+    cold_store = build_cold_trace_store()
+    
+    # Build Redis client
+    redis_url = os.environ.get("AGENT_OBS_REDIS_URL", "redis://localhost:6379")
+    redis_client = redis.from_url(redis_url)
+    
+    # PP22: opt-in Athena hook for cold-tier drill-down (ATHENA_ENABLED=1).
+    # Off by default so deployments without AWS Athena keep the PP21
+    # direct-Parquet fallback path.
+    athena_query = None
+    if os.environ.get("ATHENA_ENABLED", "0") == "1":
+        from agent_obs.storage.athena_client import AthenaClient
+        athena_query = AthenaClient().query_trace_fields
+    
+    return DrillDownService(
+        hot_store=hot_store,
+        warm_store=warm_store,
+        cold_store=cold_store,
+        redis_client=redis_client,
+        athena_query=athena_query,
+    )
+
+
 # Data models
 class TraceResponse(BaseModel):
     trace_id: str
@@ -123,6 +156,16 @@ class AuditEvent(BaseModel):
     requested_fields: List[str]
     mfa_used: bool
     mfa_token: Optional[str] = None
+
+
+class DrillDownResponse(BaseModel):
+    trace_id: str
+    storage_tier: str
+    fields: Dict[str, Any]
+    query_latency_ms: float
+    mfa_used: bool
+    cache_hit: bool = False
+    metadata: Dict[str, Any] = {}
 
 
 # Helper functions for RBAC, MFA, and audit logging
@@ -517,6 +560,223 @@ async def expand_compressed_node(
         children=filtered_subtree,
         children_count=len(filtered_subtree)  # All spans are children
     )
+
+
+@app.get("/api/v1/traces/{trace_id}/drill-down", response_model=DrillDownResponse)
+async def drill_down_trace(
+    trace_id: str,
+    fields: Optional[str] = Query(None, description="Comma-separated fields to request"),
+    request: Request = None,
+    drill_down_service: "DrillDownService" = Depends(get_drill_down_service),
+):
+    """Recover specific fields from a trace across tiered storage.
+    
+    RBAC: requires "trace:read" + (for PII fields) "pii:recover"
+    MFA: required if requested fields contain PII
+    Storage: hot/warm/cold tier resolution
+    """
+    start_time = time.time()
+    
+    # Parse requested fields
+    requested_fields = []
+    if fields:
+        requested_fields = [f.strip() for f in fields.split(",")]
+    
+    # Extract user from header (required for RBAC)
+    user = request.headers.get("X-OryaObs-User")
+    print(f"DEBUG: User extracted from header: {user}")
+    
+    if not user:
+        # Log audit event for missing user header
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id="",
+            user="unknown",
+            decision="deny",
+            reason="rbac_denied",
+            action="drill_down",
+            requested_fields=requested_fields,
+            mfa_token=None,
+            hot_store=None,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: X-OryaObs-User header required"
+        )
+    
+    # RBAC check
+    if not check_permission(user, "trace:read"):
+        # Log audit event for RBAC deny
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id="",
+            user=user,
+            decision="deny",
+            reason="rbac_denied",
+            action="drill_down",
+            requested_fields=requested_fields,
+            mfa_token=request.headers.get("X-OryaObs-MFA"),
+            hot_store=None,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="RBAC: trace:read permission required"
+        )
+    
+    # PII + RBAC check
+    if fields_intersect_pii(requested_fields):
+        if not check_permission(user, "pii:recover"):
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id="",
+                user=user,
+                decision="deny",
+                reason="rbac_denied",
+                action="drill_down",
+                requested_fields=requested_fields,
+                mfa_token=request.headers.get("X-OryaObs-MFA"),
+                hot_store=None,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="RBAC: pii:recover permission required for PII fields"
+            )
+        
+        # MFA check for PII fields
+        mfa_token = request.headers.get("X-OryaObs-MFA")
+        if not mfa_token:
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id="",
+                user=user,
+                decision="deny",
+                reason="mfa_missing",
+                action="drill_down",
+                requested_fields=requested_fields,
+                mfa_token=mfa_token,
+                hot_store=None,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="MFA: X-OryaObs-MFA header required for PII fields"
+            )
+        
+        # Verify MFA token
+        if not await verify_mfa_header(user, mfa_token):
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id="",
+                user=user,
+                decision="deny",
+                reason="mfa_invalid",
+                action="drill_down",
+                requested_fields=requested_fields,
+                mfa_token=mfa_token,
+                hot_store=None,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="MFA: Invalid token provided"
+            )
+        
+        mfa_used = True
+    else:
+        mfa_used = False
+    
+    # Build request and call service
+    drill_request = DrillDownRequest(
+        trace_id=trace_id,
+        fields=requested_fields,
+        user=user,
+        mfa_used=mfa_used
+    )
+    
+    try:
+        result = await drill_down_service.drill_down(drill_request)
+        
+        # Audit successful drill-down
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id="",
+            user=user,
+            decision="allow",
+            reason="success",
+            action="drill_down",
+            requested_fields=requested_fields,
+            mfa_used=mfa_used,
+            hot_store=None,
+        )
+        
+        return DrillDownResponse(
+            trace_id=trace_id,
+            storage_tier=result.storage_tier,
+            fields=result.fields,
+            query_latency_ms=result.query_latency_ms,
+            mfa_used=result.mfa_used,
+            cache_hit=result.cache_hit,
+            metadata=result.metadata
+        )
+        
+    except PermissionError as e:
+        # Audit permission error
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id="",
+            user=user,
+            decision="deny",
+            reason=str(e),
+            action="drill_down",
+            requested_fields=requested_fields,
+            mfa_used=mfa_used,
+            hot_store=None,
+        )
+        raise HTTPException(status_code=403, detail=str(e))
+        
+    except ValueError as e:
+        # Trace not found or rate limit exceeded
+        if "Rate limit exceeded" in str(e):
+            # Audit rate limit
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id="",
+                user=user,
+                decision="deny",
+                reason="rate_limited",
+                action="drill_down",
+                requested_fields=requested_fields,
+                mfa_used=mfa_used,
+                hot_store=None,
+            )
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        else:
+            # Trace not found
+            _audit_expand_request(
+                trace_id=trace_id,
+                node_id="",
+                user=user,
+                decision="deny",
+                reason="trace_not_found",
+                action="drill_down",
+                requested_fields=requested_fields,
+                mfa_used=mfa_used,
+                hot_store=None,
+            )
+            raise HTTPException(status_code=404, detail=f"Trace {trace_id} not found")
+        
+    except Exception as e:
+        # Generic error
+        _audit_expand_request(
+            trace_id=trace_id,
+            node_id="",
+            user=user,
+            decision="deny",
+            reason="server_error",
+            action="drill_down",
+            requested_fields=requested_fields,
+            mfa_used=mfa_used,
+            hot_store=None,
+        )
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @app.get("/trace/{trace_id}", response_class=HTMLResponse)
