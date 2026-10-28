@@ -25,6 +25,7 @@ htmlcov/
 /create_*.py
 /generate_*.py
 /recalculate_*.py
+/fix_*.py
 /simple_*.py
 /step_by_step_*.py
 /test_*.py
