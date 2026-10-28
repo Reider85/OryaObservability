@@ -456,3 +456,44 @@ groups:
             windows ({{ $value | humanize }}). Slow cost creep — audit
             expensive models and token usage trends.
             Runbook: docs/slo-alerts-runbook.md#cost_p99.
+
+  # PP27 (T3.6.3): error-budget level alerts. Burn-rate (above) says how fast
+  # the budget is being spent; these say how much is LEFT. The in-process
+  # policy (agent_obs.slo.error_budget.ErrorBudgetPolicy) reacts to the same
+  # gauge at the same thresholds, firing soft (sampler/eval cost-saving) and
+  # hard (deploy freeze) actions; the alerts route humans to the runbook.
+  # Runbook: docs/error-budget-runbook.md.
+  - name: slo-error-budget
+    rules:
+      - alert: SLOErrorBudgetLow
+        expr: slo_error_budget_remaining < 0.2
+        for: 5m
+        labels:
+          severity: ticket
+          # same label PP26 routes/group_by use; $labels.name is the SLO key
+          slo: "{{ $labels.name }}"
+        annotations:
+          summary: "Error budget low for {{ $labels.name }} (soft actions engaged)"
+          description: >-
+            {{ $labels.name }} has spent >80% of its 30-day error budget
+            (remaining={{ $value | humanize }}). Soft actions are engaged:
+            normal-trace sampling drops to 5% and the eval cost budget is
+            halved to conserve resources. Remediate within the business day
+            — if the budget reaches zero, deploys freeze.
+            Runbook: docs/error-budget-runbook.md#soft.
+
+      - alert: SLOErrorBudgetExhausted
+        expr: slo_error_budget_remaining <= 0
+        for: 2m
+        labels:
+          severity: page
+          slo: "{{ $labels.name }}"
+        annotations:
+          summary: "Error budget EXHAUSTED for {{ $labels.name }} — deploys frozen"
+          description: >-
+            {{ $labels.name }} has consumed 100% of its 30-day error budget
+            (remaining={{ $value | humanize }}). Hard actions are in effect:
+            the CI/CD gate (scripts/cicd/error_budget_gate.py) blocks deploys
+            and the audit trail records freeze_deploy. This is a page — wake
+            the on-call and stabilise before resuming releases.
+            Runbook: docs/error-budget-runbook.md#hard.

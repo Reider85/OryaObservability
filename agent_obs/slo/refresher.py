@@ -10,8 +10,14 @@ gauges (declared in ``agent_obs.metrics``):
   The ``window`` label is the *duration* (``5m``/``1h``/``6h``/``1d``), not
   the short/long role — PP26's ``SLOBurnRate`` maps roles to durations.
 - ``slo_error_budget_remaining{name}`` — gauge 0..1, budget left on the
-  rolling window. Placeholder formula until PP27's ErrorBudget lands:
-  ``1 - burn_rate_over_window``, clamped to [0, 1].
+  rolling window, computed by PP27's :class:`~agent_obs.slo.error_budget.ErrorBudget`
+  from the same (good, total) counts as the SLI.
+- ``slo_error_budget_actions_taken_total{name,action}`` — counter of policy
+  transitions fired by an attached :class:`~agent_obs.slo.error_budget.ErrorBudgetPolicy`.
+
+When an ``ErrorBudgetPolicy`` is attached, every refresh evaluates each SLO's
+budget against it. The policy is transition-triggered (actions fire once per
+state change, not per tick), so a 5-minute cadence is safe.
 
 Never blocks business logic (SDK invariant): ClickHouse failures are logged
 and the gauges simply keep their previous values until the next refresh.
@@ -39,6 +45,7 @@ from agent_obs.slo.definitions import (
     unique_windows,
     window_label,
 )
+from agent_obs.slo.error_budget import ErrorBudget, ErrorBudgetPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,9 @@ class SLORefresher:
         catalog: SLO catalog to evaluate. Defaults to ``SLO_CATALOG``.
         interval_seconds: Refresh cadence. Defaults to
             ``AGENT_OBS_SLO_REFRESH_SECONDS`` env var, falling back to 300s.
+        policy: Optional PP27 :class:`~agent_obs.slo.error_budget.ErrorBudgetPolicy`.
+            When present, every refresh evaluates the rolling-window budget of
+            each SLO against it (soft/hard actions fire on transitions only).
     """
 
     def __init__(
@@ -63,9 +73,11 @@ class SLORefresher:
         hotstore: object,
         catalog: dict[str, SLO] | None = None,
         interval_seconds: float | None = None,
+        policy: ErrorBudgetPolicy | None = None,
     ) -> None:
         self.hotstore = hotstore
         self.catalog = SLO_CATALOG if catalog is None else catalog
+        self.policy = policy
         if interval_seconds is None:
             interval_seconds = float(
                 os.environ.get("AGENT_OBS_SLO_REFRESH_SECONDS", str(DEFAULT_REFRESH_SECONDS))
@@ -92,7 +104,8 @@ class SLORefresher:
 
     def _refresh_one(self, slo: SLO) -> dict[str, float]:
         # 1. Rolling-window SLI (the SLO's own 30d window).
-        sli = self._compute_sli(slo, slo.window)
+        good, total = self._fetch_counts(slo, slo.window)
+        sli = sli_from_counts(good, total)
         slo_target.labels(name=slo.name).set(slo.target)
         slo_actual_sli.labels(name=slo.name).set(sli)
 
@@ -103,14 +116,23 @@ class SLORefresher:
                 if spec in burn_rates:
                     continue
                 window = parse_window(spec)
-                window_sli = sli if window == slo.window else self._compute_sli(slo, window)
+                if window == slo.window:
+                    window_sli = sli
+                else:
+                    window_sli = sli_from_counts(*self._fetch_counts(slo, window))
                 rate = burn_rate(window_sli, slo.target)
                 burn_rates[spec] = rate
                 slo_burn_rate.labels(name=slo.name, window=spec).set(rate)
 
-        # 3. Error budget remaining (placeholder formula, PP27 refines it).
-        remaining = max(0.0, min(1.0, 1.0 - burn_rate(sli, slo.target)))
+        # 3. Error budget remaining (PP27): budget = (1 - target) * total
+        # events on the rolling window; remaining = unspent share.
+        budget = ErrorBudget.from_counts(slo.name, slo.target, good, total)
+        remaining = budget.clamped_remaining
         slo_error_budget_remaining.labels(name=slo.name).set(remaining)
+
+        # 4. Policy actions (soft/hard/recover) fire only on state transitions.
+        if self.policy is not None:
+            self.policy.evaluate(slo.name, budget)
 
         logger.info(
             "SLO %s: sli=%.4f target=%.4f budget_remaining=%.2f burn_rates=%s",
@@ -120,11 +142,10 @@ class SLORefresher:
             f"burn_{w}": r for w, r in burn_rates.items()
         }}
 
-    def _compute_sli(self, slo: SLO, window: timedelta) -> float:
-        good, total = self.hotstore.get_sli_stats(  # type: ignore[attr-defined]
+    def _fetch_counts(self, slo: SLO, window: timedelta) -> tuple[int, int]:
+        return self.hotstore.get_sli_stats(  # type: ignore[attr-defined]
             slo.sli_kind, window, slo.good_threshold
         )
-        return sli_from_counts(good, total)
 
     def run_forever(self, stop_event: threading.Event | None = None) -> None:
         """Blocking refresh loop for embedding in a daemon thread.

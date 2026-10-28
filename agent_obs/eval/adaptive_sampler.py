@@ -35,6 +35,11 @@ class BudgetEnforcer:
     
     Enforces daily budget with soft (80% → 5% rate) and hard (100% → paused) limits.
     Reads cost from Redis and updates metrics.
+
+    PP27: reads the error-budget policy state published by the SLO policy
+    (Redis key ``agent_obs:error_budget:policy_state``) and halves the
+    effective daily budget while the state is soft/hard — "eval cost-budget
+    сокращается до 50%" to free spend while an SLO budget is nearly gone.
     """
     redis_url: str = "redis://localhost:6379/1"
     budget_usd: float = 20.0
@@ -49,6 +54,33 @@ class BudgetEnforcer:
         self._cache_value: dict[str, float] = {}  # {mode: cost}
         self._state: int = 0  # 0=ok, 1=soft, 2=paused
         self._state_lock = asyncio.Lock()
+        # PP27: 1.0 normally; 0.5 while the SLO error-budget policy is in
+        # soft/hard state (eval spend is cut to help the budget recover).
+        self.budget_multiplier: float = 1.0
+
+    @property
+    def effective_budget_usd(self) -> float:
+        """Daily budget after the PP27 error-budget multiplier."""
+        return self.budget_usd * self.budget_multiplier
+
+    def set_budget_multiplier(self, multiplier: float) -> bool:
+        """Apply the PP27 error-budget multiplier. Returns True on change.
+
+        Values outside [0, 1] are rejected (the policy only ever *reduces*
+        eval spend — raising it would defeat the purpose).
+        """
+        if not 0.0 <= multiplier <= 1.0:
+            raise ValueError(f"budget multiplier must be in [0, 1], got {multiplier}")
+        if multiplier == self.budget_multiplier:
+            return False
+        prev = self.budget_multiplier
+        self.budget_multiplier = multiplier
+        logger.info(
+            "eval budget multiplier changed: %.2f -> %.2f (effective budget $%.2f -> $%.2f)",
+            prev, multiplier,
+            self.budget_usd * prev, self.effective_budget_usd,
+        )
+        return True
     
     @property
     def client(self) -> redis.Redis:
@@ -108,9 +140,10 @@ class BudgetEnforcer:
         for mode, cost in costs.items():
             eval_cost_today_usd.labels(mode=mode).set(cost)
         
-        # Update budget utilization ratio
+        # Update budget utilization ratio (against the PP27-adjusted budget)
         total_cost = sum(costs.values())
-        ratio = total_cost / self.budget_usd if self.budget_usd > 0 else 0.0
+        effective = self.effective_budget_usd
+        ratio = total_cost / effective if effective > 0 else 0.0
         budget_utilization_ratio.set(ratio)
         
         # Update state gauge
@@ -122,7 +155,8 @@ class BudgetEnforcer:
         Returns: 0=ok, 1=soft, 2=paused
         """
         total_cost = sum(costs.values())
-        ratio = total_cost / self.budget_usd if self.budget_usd > 0 else 0.0
+        effective = self.effective_budget_usd
+        ratio = total_cost / effective if effective > 0 else 0.0
         
         if ratio >= 1.0:
             return 2  # paused
@@ -130,6 +164,32 @@ class BudgetEnforcer:
             return 1  # soft
         else:
             return 0  # ok
+
+    async def _read_error_budget_policy_state(self) -> str:
+        """Read the PP27 error-budget policy state from Redis.
+
+        Returns "ok" when the key is missing or Redis is unreachable — an
+        unknown SLO budget must not change eval behaviour (fail-open, same as
+        the rest of the eval budget path).
+        """
+        try:
+            from agent_obs.slo.error_budget import POLICY_STATE_REDIS_KEY
+
+            raw = await asyncio.to_thread(self.client.get, POLICY_STATE_REDIS_KEY)
+        except Exception as exc:  # noqa: BLE001 - fail-open: unknown state must not change evals
+            logger.warning("failed to read error-budget policy state: %s", exc)
+            return "ok"
+        if not raw:
+            return "ok"
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            import json
+
+            return str(json.loads(raw).get("state", "ok"))
+        except Exception:  # noqa: BLE001 - malformed value degrades to "ok", never raises
+            # A raw non-JSON value is still a usable signal.
+            return str(raw)
     
     async def _check_state_transition(self, old_state: int, new_state: int) -> bool:
         """Check if state transition requires audit and logging.
@@ -191,6 +251,13 @@ class BudgetEnforcer:
         Returns: 0=ok, 1=soft, 2=paused
         """
         try:
+            # PP27: halve the effective budget while the SLO error-budget
+            # policy is in soft/hard — evaluated before the state check so a
+            # cut budget correctly pushes the enforcer into its own soft/paused.
+            policy_state = await self._read_error_budget_policy_state()
+            self.set_budget_multiplier(
+                0.5 if policy_state in ("soft", "hard") else 1.0
+            )
             costs = await self._read_daily_cost()
             new_state = await self._determine_state(costs)
             

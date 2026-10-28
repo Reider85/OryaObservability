@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Adaptive tail-sampling policy engine (PC30, ticket T2.7.2).
 
-Chooses the keep-rate for *normal* traces from two signals the SDK already
-exports (PC29): ``agent_obs_system_cpu_ratio`` and
-``agent_obs_agent_error_rate_5m``.  The rule set is fixed by the CRITICAL spec::
+Chooses the keep-rate for *normal* traces from three signals the SDK already
+exports: ``agent_obs_system_cpu_ratio`` and ``agent_obs_agent_error_rate_5m``
+(PC29), plus the worst remaining SLO error budget ``slo_error_budget_remaining``
+(PP27, published by SLORefresher).  The rule set is fixed by the CRITICAL
+spec extended with the PP27 soft action::
 
-    if system_cpu_ratio > 0.8:      rate = 0.05
-    elif agent_error_rate_5m > 0.05: rate = 0.30
-    else:                            rate = 0.10
+    if system_cpu_ratio > 0.8:           rate = 0.05
+    elif slo_error_budget_remaining < 0.2: rate = 0.05   # PP27: budget low
+    elif agent_error_rate_5m > 0.05:     rate = 0.30
+    else:                                 rate = 0.10
 
 ``evaluate_rate`` is a pure function so the rules can be tested without any I/O.
 
@@ -35,6 +38,7 @@ import httpx
 
 from agent_obs.guardrail.audit import (
     CPU_HIGH_THRESHOLD,
+    ERROR_BUDGET_SOFT_THRESHOLD,
     ERROR_RATE_THRESHOLD,
     SAMPLER_RATES,
     SamplerRateChangeAuditEvent,
@@ -51,6 +55,11 @@ logger = logging.getLogger(__name__)
 CPU_QUERY = "agent_obs_system_cpu_ratio"
 ERROR_RATE_QUERY = "agent_obs_agent_error_rate_5m"
 
+# PP27: worst (minimum) remaining error budget across every SLO. The gauge is
+# published by SLORefresher; min() picks the most-degraded SLO — the one whose
+# budget policy must drive the sampler.
+ERROR_BUDGET_QUERY = "min(slo_error_budget_remaining)"
+
 # When several agents report an error rate, the policy reacts to the worst one:
 # one broken agent is exactly the case where we most want its traces kept.
 _ERROR_RATE_AGGREGATION = "max"
@@ -65,19 +74,31 @@ def evaluate_rate(
     error_rate_5m: float,
     cpu_threshold: float = CPU_HIGH_THRESHOLD,
     error_threshold: float = ERROR_RATE_THRESHOLD,
+    error_budget_remaining: float | None = None,
+    error_budget_threshold: float = ERROR_BUDGET_SOFT_THRESHOLD,
 ) -> tuple[float, str]:
-    """Pick the normal-trace keep-rate from the two load/error signals.
+    """Pick the normal-trace keep-rate from the load/error/budget signals.
 
     Pure and side-effect free.  Returns ``(rate, reason)`` where ``reason`` is
-    one of ``cpu_high`` | ``error_high`` | ``default``.
+    one of ``cpu_high`` | ``error_budget_low`` | ``error_high`` | ``default``.
 
     The cpu check is evaluated first: a saturated host endangers the export
     path itself, so protecting it takes precedence over retaining the extra
-    error traces.  Thresholds are strict ``>`` — a ratio sitting exactly on the
+    error traces.  The error-budget check (PP27) comes next: when the budget
+    is nearly spent the policy must stop paying full rate for normal traces —
+    that is exactly what the soft action is for.  ``error_budget_remaining``
+    is None when the gauge has not been published yet (no refresher running,
+    or no traffic yet): an unknown budget burns no budget and must not change
+    the rate.  Thresholds are strict ``>`` — a ratio sitting exactly on the
     threshold is not yet a reason to move.
     """
     if cpu_ratio > cpu_threshold:
         return SAMPLER_RATES["cpu_high"], "cpu_high"
+    if (
+        error_budget_remaining is not None
+        and error_budget_remaining < error_budget_threshold
+    ):
+        return SAMPLER_RATES["error_budget_low"], "error_budget_low"
     if error_rate_5m > error_threshold:
         return SAMPLER_RATES["error_high"], "error_high"
     return SAMPLER_RATES["default"], "default"
@@ -100,6 +121,8 @@ class PolicyDecision:
     agent_id: str
     triggering_agent_id: str
     changed: bool
+    #: PP27: worst remaining error budget seen this tick (None = unknown).
+    error_budget_remaining: float | None = None
 
     @property
     def reason_text(self) -> str:
@@ -108,6 +131,16 @@ class PolicyDecision:
             return (
                 f"cpu_high (system_cpu_ratio={self.cpu_ratio:.2f} > "
                 f"{CPU_HIGH_THRESHOLD:.2f})"
+            )
+        if self.reason == "error_budget_low":
+            remaining = (
+                f"{self.error_budget_remaining:.4f}"
+                if self.error_budget_remaining is not None
+                else "<threshold"
+            )
+            return (
+                f"error_budget_low (slo_error_budget_remaining={remaining} < "
+                f"{ERROR_BUDGET_SOFT_THRESHOLD:.2f})"
             )
         if self.reason == "error_high":
             return (
@@ -254,10 +287,30 @@ class PolicyEngine:
         
         return cpu_ratio, error_rate, triggering_agent_id
 
+    async def read_error_budget(self) -> float | None:
+        """Fetch the worst (min) remaining error budget across SLOs (PP27).
+
+        Returns None when no series exists — the SLO refresher may not be
+        running yet, and an unknown budget must not change the rate (the
+        caller treats None as "no signal").
+        """
+        try:
+            series = await self._query(ERROR_BUDGET_QUERY)
+        except Exception as exc:  # noqa: BLE001 - scrape failure = no signal, never raises
+            logger.warning("Prometheus error-budget scrape failed: %s", exc)
+            return None
+        if not series:
+            return None
+        # min() is already applied by the query; take the first (only) series.
+        return min(v for _, v in series)
+
     # --- evaluation --------------------------------------------------------
 
     def evaluate(
-        self, cpu_ratio: float, error_rate_5m: float
+        self,
+        cpu_ratio: float,
+        error_rate_5m: float,
+        error_budget_remaining: float | None = None,
     ) -> PolicyDecision:
         """Evaluate the rules and, on change, update state, metrics and audit.
 
@@ -268,7 +321,11 @@ class PolicyEngine:
         loop.
         """
         rate, reason = evaluate_rate(
-            cpu_ratio, error_rate_5m, self.cpu_threshold, self.error_threshold
+            cpu_ratio,
+            error_rate_5m,
+            self.cpu_threshold,
+            self.error_threshold,
+            error_budget_remaining=error_budget_remaining,
         )
         prev_rate, prev_reason = self.current_rate, self.current_reason
         changed = rate != prev_rate or reason != prev_reason
@@ -283,6 +340,7 @@ class PolicyEngine:
             agent_id=self.agent_id,
             triggering_agent_id=self.triggering_agent_id,
             changed=changed,
+            error_budget_remaining=error_budget_remaining,
         )
 
         if not changed:
@@ -316,6 +374,7 @@ class PolicyEngine:
             agent_error_rate_5m=decision.error_rate_5m,
             agent_id=decision.agent_id,
             triggering_agent_id=decision.triggering_agent_id,
+            error_budget_remaining=decision.error_budget_remaining,
         )
 
     def record_audit(self, decision: PolicyDecision) -> None:
@@ -381,7 +440,8 @@ class PolicyEngine:
         """
         cpu_ratio, error_rate, triggering_agent_id = await self.read_signals()
         self.triggering_agent_id = triggering_agent_id  # Store for PolicyDecision
-        decision = self.evaluate(cpu_ratio, error_rate)
+        error_budget = await self.read_error_budget()
+        decision = self.evaluate(cpu_ratio, error_rate, error_budget)
         if not decision.changed:
             return None
         # Off-loop write: HotStore is a blocking clickhouse-driver client.

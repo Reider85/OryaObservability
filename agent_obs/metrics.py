@@ -517,3 +517,12 @@ slo_error_budget_remaining = Gauge(
     "Remaining error budget ratio on the rolling window (0..1)",
     ["name"],
 )
+
+# PP27: counts error-budget *policy actions* (transitions), not scrapes — one
+# increment per state change (ok->soft, soft->hard, *->ok), never per cycle.
+# `action` is a bounded set: soft | hard | recover.
+slo_error_budget_actions_taken_total = Counter(
+    "slo_error_budget_actions_taken_total",
+    "Error-budget policy actions fired (soft/hard on degradation, recover on return to ok)",
+    ["name", "action"],
+)

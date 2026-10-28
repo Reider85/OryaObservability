@@ -33,6 +33,7 @@ REASON_CATEGORIES = frozenset(
 # cardinality never grows with the float value of the rate itself.
 SAMPLER_POLICY_REASONS = (
     "cpu_high", "error_high", "default",  # PP0 (PC30)
+    "error_budget_low",  # PP27 — error-budget soft action
     "eval_feedback_normal", "eval_feedback_degradation", "eval_feedback_heavy_degradation",  # PP04
     "error_keep", "cost_high_keep", "security_keep", "random",  # PP03
 )
@@ -43,12 +44,22 @@ SAMPLER_POLICY_REASONS = (
 CPU_HIGH_THRESHOLD = 0.8
 ERROR_RATE_THRESHOLD = 0.05
 
+# PP27: soft error-budget threshold — when slo_error_budget_remaining drops
+# below this, the sampler cuts the normal-trace rate to save storage for the
+# degraded period. Mirrors agent_obs.slo.error_budget.DEFAULT_SOFT_THRESHOLD
+# (the sampler process cannot import the SDK-side policy module cheaply, and
+# the audit layer must render the reason without it).
+ERROR_BUDGET_SOFT_THRESHOLD = 0.2
+
 # PC30: the rate each rule selects for "normal" traces. cpu_high wins over
 # error_high — a saturated host is the more immediate threat to the exporter,
-# and PC30 lists the cpu check first.
+# and PC30 lists the cpu check first. error_budget_low (PP27) also wins over
+# error_high: while the budget lasts, saving storage beats keeping extra
+# normal traces; error traces are kept unconditionally anyway (PC0 rule 1).
 SAMPLER_RATES = {
     "cpu_high": 0.05,
     "error_high": 0.30,
+    "error_budget_low": 0.05,
     "default": 0.10,
 }
 
@@ -466,6 +477,7 @@ class SamplerRateChangeAuditEvent:
         agent_id: str = "*",
         triggering_agent_id: str = "*",
         eval_score: float | None = None,
+        error_budget_remaining: float | None = None,
     ) -> "SamplerRateChangeAuditEvent":
         """Create an audit event for one sampling-rate transition.
 
@@ -483,6 +495,18 @@ class SamplerRateChangeAuditEvent:
             detail = (
                 f"agent_error_rate_5m={agent_error_rate_5m:.3f} > "
                 f"{ERROR_RATE_THRESHOLD:.3f}"
+            )
+        elif new_reason == "error_budget_low":
+            # PP27 soft action: the numeric remaining ratio is optional (the
+            # caller may only know the verdict), the threshold is always shown.
+            remaining = (
+                f"{error_budget_remaining:.4f}"
+                if error_budget_remaining is not None
+                else "<threshold"
+            )
+            detail = (
+                f"slo_error_budget_remaining={remaining} < "
+                f"{ERROR_BUDGET_SOFT_THRESHOLD:.2f}"
             )
         elif new_reason.startswith("eval_feedback_"):
             eval_type = new_reason.split("_", 2)[-1]
@@ -567,7 +591,7 @@ class SamplerRateChangeAuditEvent:
             json.dumps(self.actor),
             self.action,
             self.decision,
-            json.dumps(self.resource),
+            json.dumps(resource),
             self.reason,
             self.ip_address,
             self.user_agent,
@@ -963,6 +987,107 @@ class AggregationFlushAuditEvent:
         return (
             self.audit_id,
             datetime.fromtimestamp(self.timestamp, tz=timezone.utc),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
+class ErrorBudgetActionAuditEvent:
+    """Audit event for an error-budget policy action (PP27, T3.6.3).
+
+    Recorded once per state transition of an SLO's error budget:
+
+    - soft (remaining < 0.2):  ``action="error_budget.state_change"`` —
+      cost-saving mode engaged (sampler to 5%, eval budget halved).
+    - hard (remaining <= 0.0): ``action="freeze_deploy"`` — deploys are
+      frozen by the CI/CD gate and the on-call is paged.
+    - recover (back to ok):    ``action="error_budget.state_change"`` —
+      normal rates restored.
+
+    The numeric budget detail rides inside ``resource`` so the audit_events_hot
+    DDL stays unchanged.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    actor: dict[str, str]
+    resource: dict[str, Any]
+    reason: str
+    action: str = "error_budget.state_change"
+    decision: str = "soft"  # "soft" | "hard" | "recover" — the transition kind
+    trace_id: str = ""  # always "" — a budget is not trace-scoped
+    ip_address: str = "127.0.0.1"
+    user_agent: str = "agent-obs/slo"
+
+    @classmethod
+    def for_policy_action(
+        cls,
+        slo_name: str,
+        prev_state: str,
+        new_state: str,
+        remaining_ratio: float,
+        budget_total: float,
+        budget_consumed: float,
+    ) -> ErrorBudgetActionAuditEvent:
+        """Create an audit event for one error-budget state transition.
+
+        The reason embeds the numbers so a row is self-contained without
+        cross-referencing other rows — the same rule PC30 applied to sampler
+        rate-change reasons.
+        """
+        decision = new_state if new_state != "ok" else "recover"
+        # Freeze deploys is the hard action's defining effect (PP27 spec).
+        action = "freeze_deploy" if new_state == "hard" else "error_budget.state_change"
+        reason = (
+            f"error budget {prev_state} -> {new_state} for SLO {slo_name} "
+            f"(remaining={remaining_ratio:.4f}, consumed={budget_consumed:.1f}"
+            f"/{budget_total:.1f} events)"
+        )
+        return cls(
+            audit_id=f"eb-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "system", "id": "error-budget-policy"},
+            resource={
+                "type": "error_budget",
+                "slo": slo_name,
+                "prev_state": prev_state,
+                "new_state": new_state,
+                "remaining_ratio": remaining_ratio,
+                "budget_total": budget_total,
+                "budget_consumed": budget_consumed,
+            },
+            reason=reason,
+            action=action,
+            decision=decision,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for JSON consumers (Query API)."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row matching the audit_events_hot DDL."""
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
             self.trace_id,
             json.dumps(self.actor),
             self.action,

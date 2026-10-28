@@ -107,6 +107,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_INJECTION_THRESHOLD_LOW` / `_HIGH` | `0.5` / `0.85` | Injection classifier verdict bands: below low = benign, at-or-above high = block. |
 | `AGENT_OBS_LOG_LEVEL` | `INFO` | Root logging level for SDK and cron scheduler. |
 | `AGENT_OBS_SLO_REFRESH_SECONDS` | `300` | PP25: SLO refresher cadence — how often `slo_actual_sli`/`slo_burn_rate` gauges are recomputed from ClickHouse. |
+| `AGENT_OBS_ERROR_BUDGET_SOFT_THRESHOLD` | `0.2` | PP27: remaining error-budget ratio below which soft actions fire (sampler → 5%, eval budget × 0.5). Hard threshold is fixed at 0. |
 | `AGENT_OBS_USER_HASH_SALT` | `""` | Salt for user hashing (empty = no salt). |
 | `AGENT_OBS_TLS_CA` / `_CERT` / `_KEY` | — | mTLS material for exporters (PP02). |
 | `AGENT_OBS_EVAL_ADAPTIVE_SAMPLER` | `false` | Enable adaptive eval sampler in LLM judge when a judge is supplied. PP14. |
@@ -147,6 +148,7 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 ## Gotchas
 
 - `_atexit_handler` is defined twice in `agent_obs/observability.py` (lines 1635 and 1649) — the second silently overwrites the first.
+- `SamplerRateChangeAuditEvent.to_clickhouse_row` had a pre-existing bug (fixed in PP27): it built a merged `resource` dict with the rate numbers but serialized the unmerged `self.resource`, so the numbers never reached ClickHouse. If you see rate-related audit rows without `prev_rate`/`new_rate`, you are on a pre-PP27 ClickHouse snapshot.
 - `PilotAgent` in `pilot_agent/agent.py` (line 82) calls `compute_cost(usage, model=config.model, book=self.price_book)` with keyword `book=`, while `llm_call()` in `agent_obs/observability.py` (line 1769) uses positional `price_book=`. These are different call sites — be careful when changing the `compute_cost` signature.
 - Tests in `tests/test_guardrail_engine.py` use a `PIIMatch` from `pii_detector.py` (local re-definition), not from `pii_types.py`. The two classes are structurally identical but not the same type — don't mix imports in tests without checking.
 - The injection classifier loads the HuggingFace model lazily on first `classify()` call. First call is slow (cold-start). In tests, always mock `InjectionClassifier` — never let it download real weights.
