@@ -50,6 +50,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_trace_viewer.py`: TestClient tests for trace viewer UI (requires ClickHouse mocking for full functionality)
 - `tests/e2e/test_trace_viewer_e2e.py`: Playwright e2e tests for trace viewer (requires `playwright install chromium` once)
 - `tests/test_compressed_expand_api.py`: Unit tests for PP19 compressed node expand API with RBAC/MFA support
+- `tests/test_slo_dashboard.py`: PP28 config tests for the Grafana SLO dashboard (`infra/grafana/dashboards/slo.json`) — syncs gauge thresholds/windows with `SLO_CATALOG`
 
 ## Lint / typecheck
 

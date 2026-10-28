@@ -1,0 +1,1309 @@
+{
+  "uid": "slo",
+  "title": "SLO",
+  "description": "PP25-PP28 (T3.6.4): SLO dashboard - SLI, burn-rate and error-budget views for the 4 catalog SLOs (availability, latency_p95, quality, cost_p99), plus an overall health gauge and drill-down into the traces that burned the budget.",
+  "tags": ["agent-obs", "slo", "pp25", "pp26", "pp27", "pp28"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h"],
+    "time_options": ["1h", "6h", "24h", "7d", "30d"]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "trace_viewer_url",
+        "label": "Trace-viewer URL",
+        "description": "Base URL of the trace-viewer used by the drill-down links. Default is Langfuse (E1.5) on :3000 - set it to http://127.0.0.1:8089 to drill into the built-in PP10 trace viewer instead.",
+        "type": "textbox",
+        "query": "http://localhost:3000",
+        "current": {
+          "text": "http://localhost:3000",
+          "value": "http://localhost:3000"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "http://localhost:3000",
+            "value": "http://localhost:3000"
+          }
+        ]
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Open trace-viewer",
+      "url": "${var:trace_viewer_url}",
+      "icon": "external link",
+      "type": "link",
+      "targetBlank": true,
+      "tooltip": "Trace-viewer (Langfuse by default). Set the 'Trace-viewer URL' variable to point it elsewhere."
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Deploy freezes",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+        "enable": true,
+        "iconColor": "purple",
+        "titleFormat": "{{slo}} deploy frozen",
+        "textFormat": "{{reason}}",
+        "target": {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  timestamp AS time,\n  JSONExtractString(resource, 'slo') AS slo,\n  JSONExtractString(resource, 'new_state') AS new_state,\n  concat(JSONExtractString(resource, 'slo'), ' deploy frozen') AS text,\n  reason AS reason\nFROM audit_events_hot\nWHERE action = 'freeze_deploy'\n  AND $__timeFilter(timestamp)\nORDER BY timestamp DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      },
+      {
+        "name": "Error budget state changes",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+        "enable": true,
+        "iconColor": "red",
+        "titleFormat": "{{slo}} budget {{new_state}}",
+        "textFormat": "{{reason}}",
+        "target": {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  timestamp AS time,\n  JSONExtractString(resource, 'slo') AS slo,\n  JSONExtractString(resource, 'new_state') AS new_state,\n  JSONExtractFloat(resource, 'remaining_ratio') AS remaining_ratio,\n  concat('budget ', JSONExtractString(resource, 'new_state'), ' (remaining=', toString(JSONExtractFloat(resource, 'remaining_ratio')), ')') AS text,\n  reason AS reason\nFROM audit_events_hot\nWHERE action = 'error_budget.state_change'\n  AND $__timeFilter(timestamp)\nORDER BY timestamp DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      },
+      {
+        "name": "Incident mode (eval sampler)",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+        "enable": true,
+        "iconColor": "orange",
+        "titleFormat": "eval sampler -> {{new_mode}}",
+        "textFormat": "{{reason}}",
+        "target": {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorMode": "code",
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  timestamp AS time,\n  JSONExtractString(resource, 'old_mode') AS old_mode,\n  JSONExtractString(resource, 'new_mode') AS new_mode,\n  concat('eval sampler -> ', JSONExtractString(resource, 'new_mode')) AS text,\n  reason AS reason\nFROM audit_events_hot\nWHERE action = 'eval_sampler.mode_change'\n  AND JSONExtractString(resource, 'new_mode') = 'incident'\n  AND $__timeFilter(timestamp)\nORDER BY timestamp DESC\nLIMIT 100",
+          "refId": "A"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "SLO overall health",
+      "description": "How many of the 4 catalog SLOs have their error budget at or below the PP27 soft threshold (slo_error_budget_remaining <= 0.2). Green = all 4 in budget, yellow = 1-2 SLOs at risk, red = more than 2 SLOs exhausted. The exhausted definition matches the PP27 soft action, so the gauge turns yellow before a budget is fully spent.",
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 4,
+          "decimals": 0,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "color": "green", "text": "all in budget" },
+                "1": { "color": "yellow", "text": "1 SLO at risk" },
+                "2": { "color": "yellow", "text": "2 SLOs at risk" },
+                "3": { "color": "red", "text": "3 SLOs exhausted" },
+                "4": { "color": "red", "text": "all 4 SLOs exhausted" }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(slo_error_budget_remaining <= 0.2) OR vector(0)",
+          "legendFormat": "SLOs at risk",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Error budget actions (policy transitions)",
+      "description": "slo_error_budget_actions_taken_total by action (soft / hard / recover) - every PP27 policy transition. Correlate spikes with the deploy-freeze and error-budget annotations below. A transition fires once per state change, not per tick.",
+      "gridPos": { "h": 7, "w": 18, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(slo_error_budget_actions_taken_total[1h])) by (action)",
+          "legendFormat": "{{action}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "SLO: availability",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "panels": [
+        {
+          "id": 10,
+          "type": "gauge",
+          "title": "availability: SLI vs target",
+          "description": "slo_actual_sli{name=\"availability\"} - rolling 30d share of non-error root spans (status != 'error'; a guardrail 'blocked' refusal counts as good). Target slo_target{name=\"availability\"} = 0.999: the gauge turns green only at/above it. The SLI is recomputed by the SLO refresher every 5 minutes (AGENT_OBS_SLO_REFRESH_SECONDS).",
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 4,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for availability",
+                  "url": "#/d/slo?viewPanel=13"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 0.999 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_actual_sli{name=\"availability\"}",
+              "legendFormat": "actual SLI",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_target{name=\"availability\"}",
+              "legendFormat": "target",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "availability: burn rate (short + long windows)",
+          "description": "slo_burn_rate{name=\"availability\"} for every alerting window published by the refresher (the PP26 pairs are 5m/1h and 1h/6h). burn_rate = (1 - actual SLI) / (1 - target): 1.0 = burning budget exactly at the sustainable rate. Alert thresholds: > 14.4 on the 5m+1h pair, > 6.0 on the 1h+6h pair (Google SRE Workbook, SLO_CATALOG). Click a point to open the trace-viewer at that moment.",
+          "gridPos": { "h": 8, "w": 12, "x": 6, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": true,
+                  "title": "Open trace-viewer at this moment",
+                  "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 3 },
+                  { "color": "orange", "value": 6 },
+                  { "color": "red", "value": 14.4 }
+                ]
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_burn_rate{name=\"availability\",window=\"5m\"}",
+              "legendFormat": "5m (short)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_burn_rate{name=\"availability\",window=\"1h\"}",
+              "legendFormat": "1h",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "expr": "slo_burn_rate{name=\"availability\",window=\"6h\"}",
+              "legendFormat": "6h (long)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 12,
+          "type": "gauge",
+          "title": "availability: error budget remaining",
+          "description": "slo_error_budget_remaining{name=\"availability\"} - unspent share (0..1) of the rolling-window budget (1 - target) * total events. Red = below the PP27 soft threshold (0.2), where the sampler drops to 5% and the eval budget is halved. At 0 the budget is frozen and the CI/CD gate blocks deploys (PP27 hard action).",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for availability",
+                  "url": "#/d/slo?viewPanel=13"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "orange", "value": 0.2 },
+                  { "color": "green", "value": 0.5 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_error_budget_remaining{name=\"availability\"}",
+              "legendFormat": "remaining",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 13,
+          "type": "table",
+          "title": "availability: degradation traces (error root spans)",
+          "description": "Drill-down detail-view: root spans (span_type='agent.loop') with status='error' in the selected time range - the traces that burn the availability budget. Click a trace_id to open the trace-viewer on that trace; click a timestamp to open it at that moment.",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "trace_id" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace in trace-viewer",
+                        "url": "${var:trace_viewer_url}?trace_id=${__data.fields[\"trace_id\"]}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "time" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace-viewer at this moment",
+                        "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+            "sortBy": [{ "desc": true, "displayName": "time" }]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "clickhouse"
+              },
+              "editorMode": "code",
+              "format": 1,
+              "queryType": "sql",
+              "rawSql": "SELECT\n  trace_id,\n  start_time AS time,\n  name,\n  status\nFROM spans_hot\nWHERE span_type = 'agent.loop'\n  AND status = 'error'\n  AND $__timeFilter(start_time)\nORDER BY start_time DESC\nLIMIT 50",
+              "refId": "A"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {},
+                "indexByName": {},
+                "renameByName": {
+                  "trace_id": "trace_id",
+                  "time": "time",
+                  "name": "root span",
+                  "status": "status"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "SLO: latency_p95",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 8 },
+      "panels": [
+        {
+          "id": 20,
+          "type": "gauge",
+          "title": "latency_p95: SLI vs target",
+          "description": "slo_actual_sli{name=\"latency_p95\"} - rolling 30d share of root spans completing within 3 seconds (end_time - start_time <= 3.0). Target slo_target{name=\"latency_p95\"} = 0.95: the gauge turns green only at/above it. Recomputed every 5 minutes by the SLO refresher.",
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 4,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for latency_p95",
+                  "url": "#/d/slo?viewPanel=23"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 0.95 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_actual_sli{name=\"latency_p95\"}",
+              "legendFormat": "actual SLI",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_target{name=\"latency_p95\"}",
+              "legendFormat": "target",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 21,
+          "type": "timeseries",
+          "title": "latency_p95: burn rate (short + long windows)",
+          "description": "slo_burn_rate{name=\"latency_p95\"} for every alerting window published by the refresher (PP26 pairs 5m/1h and 1h/6h). burn_rate = (1 - actual SLI) / (1 - target). Alert thresholds: > 14.4 on the 5m+1h pair, > 6.0 on the 1h+6h pair. Click a point to open the trace-viewer at that moment.",
+          "gridPos": { "h": 8, "w": 12, "x": 6, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": true,
+                  "title": "Open trace-viewer at this moment",
+                  "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 3 },
+                  { "color": "orange", "value": 6 },
+                  { "color": "red", "value": 14.4 }
+                ]
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_burn_rate{name=\"latency_p95\",window=\"5m\"}",
+              "legendFormat": "5m (short)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_burn_rate{name=\"latency_p95\",window=\"1h\"}",
+              "legendFormat": "1h",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "expr": "slo_burn_rate{name=\"latency_p95\",window=\"6h\"}",
+              "legendFormat": "6h (long)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 22,
+          "type": "gauge",
+          "title": "latency_p95: error budget remaining",
+          "description": "slo_error_budget_remaining{name=\"latency_p95\"} - unspent share (0..1) of the rolling-window budget. Red = below the PP27 soft threshold (0.2): sampler to 5%, eval budget halved. At 0 the budget is frozen and deploys are gated (PP27 hard action).",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for latency_p95",
+                  "url": "#/d/slo?viewPanel=23"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "orange", "value": 0.2 },
+                  { "color": "green", "value": 0.5 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_error_budget_remaining{name=\"latency_p95\"}",
+              "legendFormat": "remaining",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 23,
+          "type": "table",
+          "title": "latency_p95: degradation traces (slow root spans)",
+          "description": "Drill-down detail-view: root spans (span_type='agent.loop') slower than the SLI good threshold (3 seconds) in the selected time range - the traces that burn the latency budget. Click a trace_id to open the trace-viewer on that trace; click a timestamp to open it at that moment.",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "trace_id" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace in trace-viewer",
+                        "url": "${var:trace_viewer_url}?trace_id=${__data.fields[\"trace_id\"]}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "time" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace-viewer at this moment",
+                        "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+            "sortBy": [{ "desc": true, "displayName": "duration_s" }]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "clickhouse"
+              },
+              "editorMode": "code",
+              "format": 1,
+              "queryType": "sql",
+              "rawSql": "SELECT\n  trace_id,\n  start_time AS time,\n  name,\n  end_time - start_time AS duration_s\nFROM spans_hot\nWHERE span_type = 'agent.loop'\n  AND end_time - start_time > 3.0\n  AND $__timeFilter(start_time)\nORDER BY duration_s DESC\nLIMIT 50",
+              "refId": "A"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {},
+                "indexByName": {},
+                "renameByName": {
+                  "trace_id": "trace_id",
+                  "time": "time",
+                  "name": "root span",
+                  "duration_s": "duration_s"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "SLO: quality",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "panels": [
+        {
+          "id": 30,
+          "type": "gauge",
+          "title": "quality: SLI vs target",
+          "description": "slo_actual_sli{name=\"quality\"} - rolling 30d share of late-annotated eval results with faithfulness > 0.7 (source: eval_results_hot, not spans). Target slo_target{name=\"quality\"} = 0.90: the gauge turns green only at/above it. Recomputed every 5 minutes by the SLO refresher.",
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 4,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for quality",
+                  "url": "#/d/slo?viewPanel=33"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 0.9 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_actual_sli{name=\"quality\"}",
+              "legendFormat": "actual SLI",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_target{name=\"quality\"}",
+              "legendFormat": "target",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "quality: burn rate (short + long windows)",
+          "description": "slo_burn_rate{name=\"quality\"} for every alerting window published by the refresher (PP26 pairs 1h/6h and 6h/1d - quality has no sub-hour windows). burn_rate = (1 - actual SLI) / (1 - target). Alert thresholds: > 6.0 on the 1h+6h pair, > 3.0 on the 6h+1d pair. Click a point to open the trace-viewer at that moment.",
+          "gridPos": { "h": 8, "w": 12, "x": 6, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": true,
+                  "title": "Open trace-viewer at this moment",
+                  "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 3 },
+                  { "color": "orange", "value": 6 },
+                  { "color": "red", "value": 14.4 }
+                ]
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_burn_rate{name=\"quality\",window=\"1h\"}",
+              "legendFormat": "1h (short)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_burn_rate{name=\"quality\",window=\"6h\"}",
+              "legendFormat": "6h",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "expr": "slo_burn_rate{name=\"quality\",window=\"1d\"}",
+              "legendFormat": "1d (long)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 32,
+          "type": "gauge",
+          "title": "quality: error budget remaining",
+          "description": "slo_error_budget_remaining{name=\"quality\"} - unspent share (0..1) of the rolling-window budget. Red = below the PP27 soft threshold (0.2): sampler to 5%, eval budget halved (note: halving the eval budget further degrades the quality signal - read docs/error-budget-runbook.md before acting). At 0 the budget is frozen and deploys are gated.",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for quality",
+                  "url": "#/d/slo?viewPanel=33"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "orange", "value": 0.2 },
+                  { "color": "green", "value": 0.5 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_error_budget_remaining{name=\"quality\"}",
+              "legendFormat": "remaining",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 33,
+          "type": "table",
+          "title": "quality: degradation traces (low faithfulness evals)",
+          "description": "Drill-down detail-view: eval results with faithfulness below the SLI good threshold (0.7) in the selected time range - the traces whose answers burned the quality budget. Click a trace_id to open the trace-viewer on that trace; click a timestamp to open it at that moment.",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "trace_id" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace in trace-viewer",
+                        "url": "${var:trace_viewer_url}?trace_id=${__data.fields[\"trace_id\"]}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "time" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace-viewer at this moment",
+                        "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+            "sortBy": [{ "desc": false, "displayName": "faithfulness" }]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "clickhouse"
+              },
+              "editorMode": "code",
+              "format": 1,
+              "queryType": "sql",
+              "rawSql": "SELECT\n  trace_id,\n  eval_timestamp AS time,\n  eval_name,\n  JSONExtractFloat(scores, 'faithfulness') AS faithfulness\nFROM eval_results_hot\nWHERE JSONExtractFloat(scores, 'faithfulness') < 0.7\n  AND $__timeFilter(eval_timestamp)\nORDER BY faithfulness ASC\nLIMIT 50",
+              "refId": "A"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {},
+                "indexByName": {},
+                "renameByName": {
+                  "trace_id": "trace_id",
+                  "time": "time",
+                  "eval_name": "eval",
+                  "faithfulness": "faithfulness"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "SLO: cost_p99",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 },
+      "panels": [
+        {
+          "id": 40,
+          "type": "gauge",
+          "title": "cost_p99: SLI vs target",
+          "description": "slo_actual_sli{name=\"cost_p99\"} - rolling 30d share of traces whose per-request cost (sum of cost_usd across all spans of the trace) stays at or below $0.05. Target slo_target{name=\"cost_p99\"} = 0.95: the gauge turns green only at/above it. Recomputed every 5 minutes by the SLO refresher.",
+          "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 4,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for cost_p99",
+                  "url": "#/d/slo?viewPanel=43"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 0.95 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_actual_sli{name=\"cost_p99\"}",
+              "legendFormat": "actual SLI",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_target{name=\"cost_p99\"}",
+              "legendFormat": "target",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 41,
+          "type": "timeseries",
+          "title": "cost_p99: burn rate (short + long windows)",
+          "description": "slo_burn_rate{name=\"cost_p99\"} for every alerting window published by the refresher (PP26 pairs 1h/6h and 6h/1d - cost has no sub-hour windows). burn_rate = (1 - actual SLI) / (1 - target). Alert thresholds: > 6.0 on the 1h+6h pair, > 3.0 on the 6h+1d pair. Click a point to open the trace-viewer at that moment.",
+          "gridPos": { "h": 8, "w": 12, "x": 6, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": true,
+                  "title": "Open trace-viewer at this moment",
+                  "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 3 },
+                  { "color": "orange", "value": 6 },
+                  { "color": "red", "value": 14.4 }
+                ]
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_burn_rate{name=\"cost_p99\",window=\"1h\"}",
+              "legendFormat": "1h (short)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "slo_burn_rate{name=\"cost_p99\",window=\"6h\"}",
+              "legendFormat": "6h",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "expr": "slo_burn_rate{name=\"cost_p99\",window=\"1d\"}",
+              "legendFormat": "1d (long)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 42,
+          "type": "gauge",
+          "title": "cost_p99: error budget remaining",
+          "description": "slo_error_budget_remaining{name=\"cost_p99\"} - unspent share (0..1) of the rolling-window budget. Red = below the PP27 soft threshold (0.2): sampler to 5%, eval budget halved. At 0 the budget is frozen and deploys are gated (PP27 hard action).",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "decimals": 2,
+              "links": [
+                {
+                  "targetBlank": false,
+                  "title": "Open degradation traces for cost_p99",
+                  "url": "#/d/slo?viewPanel=43"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "orange", "value": 0.2 },
+                  { "color": "green", "value": 0.5 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": ["lastNotNull"],
+              "fields": "",
+              "values": false
+            },
+            "showThresholdLabels": false,
+            "showThresholdMarkers": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "slo_error_budget_remaining{name=\"cost_p99\"}",
+              "legendFormat": "remaining",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "editorMode": "code",
+              "range": true
+            }
+          ]
+        },
+        {
+          "id": 43,
+          "type": "table",
+          "title": "cost_p99: degradation traces (expensive traces)",
+          "description": "Drill-down detail-view: traces whose per-request cost (sum of cost_usd across all spans) exceeds the SLI good threshold ($0.05) in the selected time range - the traces that burn the cost budget. Click a trace_id to open the trace-viewer on that trace; click a timestamp to open it at that moment.",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "filterable": true
+              }
+            },
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "trace_id" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace in trace-viewer",
+                        "url": "${var:trace_viewer_url}?trace_id=${__data.fields[\"trace_id\"]}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "time" },
+                "properties": [
+                  {
+                    "id": "links",
+                    "value": [
+                      {
+                        "targetBlank": true,
+                        "title": "Open trace-viewer at this moment",
+                        "url": "${var:trace_viewer_url}?timestamp=${__value.time:date}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+            "sortBy": [{ "desc": true, "displayName": "trace_cost" }]
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "clickhouse"
+              },
+              "editorMode": "code",
+              "format": 1,
+              "queryType": "sql",
+              "rawSql": "SELECT\n  trace_id,\n  min(start_time) AS time,\n  sum(cost_usd) AS trace_cost\nFROM spans_hot\nWHERE $__timeFilter(start_time)\nGROUP BY trace_id\nHAVING trace_cost > 0.05\nORDER BY trace_cost DESC\nLIMIT 50",
+              "refId": "A"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {},
+                "indexByName": {},
+                "renameByName": {
+                  "trace_id": "trace_id",
+                  "time": "time",
+                  "trace_cost": "trace_cost (USD)"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
