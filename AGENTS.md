@@ -53,6 +53,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_slo_dashboard.py`: PP28 config tests for the Grafana SLO dashboard (`infra/grafana/dashboards/slo.json`) — syncs gauge thresholds/windows with `SLO_CATALOG`
 - `tests/test_canary_deploy.py`: PP29 tests — SLO canary gate exit codes, per-version SLI counts, `canary_rollback` audit rows, Slack/Telegram rollback notifications, and the `canary.yml` workflow shape
 - `tests/test_rbac_roles.py`: PP30 role model tests — 6 canonical roles in `agent_obs/rbac/roles.py`, no-overlap (identical permission sets), `RBAC.check()` fail-closed behaviour, `AGENT_OBS_RBAC_ROLES` env parsing, `PostgresRoleStore` with mocked asyncpg
+- `tests/test_policy_engine.py`: PP31 OPA policy engine — cross-tenant deny, MFA gating for `pii:recover`, Redis 60s decision cache (sha256 key), fail-closed OPA errors; includes `TestRegoPolicy` which runs `opa eval` against `infra/rbac/policies/observability.rego` and skips when the opa binary is not installed
 
 ## Lint / typecheck
 
@@ -129,6 +130,9 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_RBAC_ROLES` | — | PP19: User→role mapping for compressed expand API (e.g., "alice:admin,bob:developer"). Unknown users fail-closed. |
 | `X-OryaObs-User` | — | PP19: HTTP header with user login for RBAC in compressed expand API. |
 | `X-OryaObs-MFA` | — | PP19: HTTP header with MFA token for PII field requests in compressed expand API. |
+| `AGENT_OBS_OPA_URL` | `http://localhost:8181` | PP31: OPA server base URL for `PolicyEngine` decisions (`POST <url>/v1/data/observability/rbac/allow`). In-network: `http://opa:8181`. |
+| `AGENT_OBS_POLICY_CACHE_URL` | — (empty = cache off) | PP31: Redis URL for the 60s policy decision cache. Best-effort: Redis down skips the cache, never blocks a decision. |
+| `AGENT_OBS_POLICY_CACHE_TTL` | `60` | PP31: Policy decision cache TTL in seconds. |
 | `DRILL_DOWN_RATE_LIMIT` | `10` | PP21: Max drill-down requests per minute per user. |
 | `DRILL_DOWN_CACHE_TTL` | `600` | PP21: Redis cache TTL in seconds for drill-down results. |
 | `ATHENA_ENABLED` | `false` | PP22: Wire AthenaClient into DrillDownService cold-tier hook (`get_drill_down_service`). Off = PP21 direct-Parquet fallback. |
@@ -166,3 +170,5 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 - **PC24: Embedding storage sidecar.** Embeddings are stored in `span_embeddings` table, not `spans_hot.response_embedding`. The queue tuple is 5 elements: `(trace_id, span_id, agent_id, tenant_id, embedding)`. `embeddings_stored_total` increments only on successful ClickHouse writes; `embeddings_storage_failed_total` increments on queue-full or CH failure; `embeddings_redis_fallback_total` increments on Redis fallback. HotStore `get_spans()` returns `response_embedding` from spans_hot for compatibility, but drift/Phoenix query `span_embeddings` directly.
 
 - **PP10: Trace viewer e2e tests.** Run with `python -m pytest tests/e2e/ -q 2>&1`. Requires `playwright install chromium` once. Tests automatically skip if Playwright unavailable.
+- **PP31: Rego `in` tests object *values*, not keys.** `input.user.role in role_permissions` never matches (values are permission sets) — `observability.rego` uses the `permissions := role_permissions[input.user.role]` lookup instead, which doubles as the fail-closed unknown-role check. `role_permissions` mirrors `ROLES` in `agent_obs/rbac/roles.py`: change one, change the other (the Python side is guarded by `validate_roles()`, the Rego side by `tests/test_policy_engine.py::TestRegoPolicy`, which needs the `opa` binary or `docker run openpolicyagent/opa check`).
+- **PP31: OPA `--watch` hot-reload does not see host-side edits on Docker Desktop (Windows/macOS).** inotify events from bind-mounted files are not forwarded into the Linux VM — a policy change made on the host will not reload until the container restarts (verified: container-side writes reload within seconds). On Linux hosts bind mounts share the kernel inotify and work as expected. `opa run --watch /policies` itself is proven working; do not "debug" the Rego or the flag when you hit this.

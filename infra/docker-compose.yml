@@ -418,6 +418,46 @@ services:
       retries: 6
       start_period: 10s
 
+  # PP31 (T3.7.2): Open Policy Agent — declarative RBAC (Rego). The SDK-side
+  # PolicyEngine (agent_obs/rbac/policy_engine.py) posts decisions to
+  # :8181/v1/data/observability/rbac/allow; verdicts are cached in Redis for
+  # 60s (AGENT_OBS_POLICY_CACHE_TTL). Policies are mounted read-only from
+  # ./rbac/policies and --watch hot-reloads them on file change — no restart
+  # (PP56 upgrades this to a bundle server with audit). Pinned: 1.21.2
+  # verified against observability.rego (import rego.v1).
+  opa:
+    # The -debug variant ships a shell for operator troubleshooting; the plain
+    # image is distroless. `opa` is on PATH only in -debug, which the
+    # healthcheck below relies on.
+    image: openpolicyagent/opa:1.21.2-debug
+    restart: unless-stopped
+    command:
+      - run
+      - --server
+      - --addr=:8181
+      - --watch
+      - /policies
+    volumes:
+      - ./rbac/policies:/policies:ro
+    ports:
+      - "8181:8181"  # HTTP — SDK / host tools / DoD verification
+    healthcheck:
+      # No curl/wget in the image (busybox ships without the wget applet), so
+      # probe /health through OPA's own http.send builtin. --fail exits
+      # non-zero when the probe errors or is not 200.
+      test:
+        - CMD
+        - opa
+        - eval
+        - --fail
+        - -e
+        - result
+        - 'http.send({"method": "get", "url": "http://localhost:8181/health"}).status_code == 200'
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
   eval-worker:
     build:
       context: ..
