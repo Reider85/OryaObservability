@@ -37,6 +37,7 @@ class DrillDownRequest:
     trace_id: str
     fields: List[str] = field(default_factory=list)  # пустой = все доступные поля tier'а
     user: str = ""
+    tenant_id: str = ""  # tenant заявителя (PP32 tenant isolation)
     mfa_used: bool = False  # endpoint верифицировал MFA до вызова
 
 
@@ -352,11 +353,18 @@ class DrillDownService:
             f"{IDX_USER_TRACE_PREFIX}{user}:{trace_id}",
         )
     
-    async def _hot_tier_recover(self, trace_id: str, fields: List[str]) -> Dict[str, Any]:
-        """Восстановить поля из hot tier (ClickHouse spans_hot)."""
-        spans = await asyncio.to_thread(self.hot_store.get_spans, trace_id)
+    async def _hot_tier_recover(self, trace_id: str, fields: List[str], tenant_id: str = "") -> tuple[Dict[str, Any], str]:
+        """Восстановить поля из hot tier (ClickHouse spans_hot).
+        
+        Returns:
+            Tuple of (recovered_fields, trace_tenant_id)
+        """
+        spans = await asyncio.to_thread(self.hot_store.get_spans, trace_id, tenant_id or None)
         if not spans:
             raise ValueError("Trace not found in hot tier")
+        
+        # Extract tenant_id from first span for comparison (PP32 tenant isolation)
+        trace_tenant = spans[0].get("tenant_id", "")
         
         recovered = {}
         if not fields:
@@ -372,13 +380,20 @@ class DrillDownService:
                         recovered[field_name] = span["attributes"][field_name]
                         break
         
-        return recovered
+        return recovered, trace_tenant
     
-    async def _warm_tier_recover(self, trace_id: str, fields: List[str]) -> Dict[str, Any]:
-        """Восстановить поля из warm tier (Postgres traces_warm)."""
-        trace = await self.warm_store.get_trace(trace_id)
+    async def _warm_tier_recover(self, trace_id: str, fields: List[str], tenant_id: str = "") -> tuple[Dict[str, Any], str]:
+        """Восстановить поля из warm tier (Postgres traces_warm).
+        
+        Returns:
+            Tuple of (recovered_fields, trace_tenant_id)
+        """
+        trace = await self.warm_store.get_trace(trace_id, tenant_id or None)
         if not trace:
             raise ValueError("Trace not found in warm tier")
+        
+        # Extract tenant_id from trace for comparison (PP32 tenant isolation)
+        trace_tenant = trace.get("tenant_id", "")
         
         # Warm tier содержит только метаданные, не сырые тексты
         recovered = {}
@@ -400,7 +415,7 @@ class DrillDownService:
                 if field_name in warm_columns and field_name in trace:
                     recovered[field_name] = trace[field_name]
         
-        return recovered
+        return recovered, trace_tenant
     
     async def _cold_tier_recover(self, trace_id: str, fields: List[str], tenant_id: Optional[str] = None) -> Dict[str, Any]:
         """Восстановить поля из cold tier (S3 Parquet), best-effort.
@@ -477,6 +492,20 @@ class DrillDownService:
         
         raise ValueError("Trace not found in cold tier")
     
+    async def _trace_exists_audit(self, trace_id: str) -> bool:
+        """Check if trace exists for cross-tenant audit probing (PP32)."""
+        try:
+            # Try hot tier first (most recent, best coverage)
+            return await asyncio.to_thread(self.hot_store.trace_exists, trace_id)
+        except Exception:
+            pass
+        
+        try:
+            # Fall back to warm tier (exists only for owner connections)
+            return await self.warm_store.trace_exists(trace_id)
+        except Exception:
+            return False
+    
     async def drill_down(self, request: DrillDownRequest) -> DrillDownResult:
         """Выполнить drill-down запрос для восстановления полей трейса.
         
@@ -506,7 +535,7 @@ class DrillDownService:
         # 3. Кеш проверка (PP23: ключ включает mfa_used — PII-результаты
         # с MFA и без неё не должны разделять один ключ).
         cache_key = CACHE_KEY_PREFIX + hashlib.sha256(
-            f"{request.user}:{request.trace_id}:"
+            f"{request.user}:{request.trace_id}:{request.tenant_id}:"
             f"{','.join(sorted(request.fields))}:{request.mfa_used}".encode()
         ).hexdigest()
         
@@ -527,26 +556,66 @@ class DrillDownService:
         tier = None
         fields = {}
         metadata = {}
+        trace_tenant = ""
         
         # Hot tier
         try:
-            fields = await self._hot_tier_recover(request.trace_id, request.fields)
+            fields, trace_tenant = await self._hot_tier_recover(request.trace_id, request.fields, request.tenant_id)
             tier = "hot"
         except Exception:
             # Warm tier
             try:
-                fields = await self._warm_tier_recover(request.trace_id, request.fields)
+                fields, trace_tenant = await self._warm_tier_recover(request.trace_id, request.fields, request.tenant_id)
                 tier = "warm"
             except Exception:
                 # Cold tier
                 try:
-                    # tenant_id пока неизвестен в запросе — best-effort без tenant
-                    cold_result = await self._cold_tier_recover(request.trace_id, request.fields)
+                    cold_result = await self._cold_tier_recover(request.trace_id, request.fields, request.tenant_id)
                     fields = cold_result["fields"]
                     metadata.update(cold_result["metadata"])
+                    # Cold tenant is not directly available, skip tenant check for cold-only
                     tier = "cold"
                 except Exception:
+                    # All tiers failed — attempt cross-tenant audit if tenant was requested
+                    if request.tenant_id:
+                        trace_exists = await self._trace_exists_audit(request.trace_id)
+                        if trace_exists:
+                            # Cross-tenant access attempt detected (PP32)
+                            from agent_obs.guardrail.audit import CrossTenantAccessAuditEvent
+                            audit_event = CrossTenantAccessAuditEvent.for_attempt(
+                                trace_id=request.trace_id,
+                                user=request.user,
+                                caller_tenant=request.tenant_id,
+                                resource_tenant="<unknown>",  # Cold tenant not available
+                                tier="unknown"
+                            )
+                            if self.hot_store and hasattr(self.hot_store, 'write_audit_event'):
+                                try:
+                                    self.hot_store.write_audit_event(audit_event)
+                                except Exception:
+                                    # PP24: audit write must never block the request path
+                                    pass
+                            raise PermissionError("Cross-tenant access denied")
                     raise ValueError("Trace not found in any tier")
+        
+        # PP32: Tenant isolation check after recovery
+        if request.tenant_id and trace_tenant and trace_tenant != request.tenant_id:
+            # Cross-tenant access detected
+            from agent_obs.guardrail.audit import CrossTenantAccessAuditEvent
+            audit_event = CrossTenantAccessAuditEvent.for_attempt(
+                trace_id=request.trace_id,
+                user=request.user,
+                caller_tenant=request.tenant_id,
+                resource_tenant=trace_tenant,
+                tier=tier
+            )
+            if self.hot_store and hasattr(self.hot_store, 'write_audit_event'):
+                try:
+                    self.hot_store.write_audit_event(audit_event)
+                except Exception:
+                    # PP24: audit write must never block the request path
+                    pass
+            raise PermissionError("Cross-tenant access denied")
         
         latency_ms = (time.time() - start_time) * 1000
         

@@ -36,7 +36,7 @@ ENGINE = ReplicatedMergeTree(
     '{replica}'
 )
 ORDER BY (tenant_id, agent_id, start_time)
-PARTITION BY toYYYYMMDD(start_time)
+PARTITION BY (tenant_id, toYYYYMMDD(start_time))
     TTL start_time + INTERVAL 21 DAY
     SETTINGS index_granularity = 8192;
 

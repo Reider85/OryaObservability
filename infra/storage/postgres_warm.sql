@@ -47,6 +47,23 @@ CREATE INDEX IF NOT EXISTS idx_traces_warm_tenant_agent_start ON traces_warm(ten
 CREATE INDEX IF NOT EXISTS idx_traces_warm_start_time ON traces_warm(start_time);
 CREATE INDEX IF NOT EXISTS idx_traces_warm_status ON traces_warm(status);
 
+-- PP32: Tenant isolation via row-level security
+-- Owner bypasses RLS (warm user in postgres_warm_init.sh) for cross-tenant maintenance.
+-- Application user (warm_user) is fully restricted: unset GUC = 0 rows (fail-closed).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies 
+        WHERE tablename = 'traces_warm' 
+        AND policyname = 'tenant_isolation'
+    ) THEN
+        ALTER TABLE traces_warm ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation ON traces_warm
+            USING (tenant_id = current_setting('app.tenant_id', true))
+            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+    END IF;
+END $$;
+
 -- eval_results_warm table: structure-only eval scores (PC21, T2.3.5)
 --
 -- The hot tier (ClickHouse eval_results_hot) has a 14-day TTL; the daily cron

@@ -133,6 +133,7 @@ class SpanContext:
     user_id: str = ""
     session_id: str = ""
     tool_name: Optional[str] = None
+    tenant_id: str = ""
 
     @classmethod
     def new(
@@ -143,6 +144,7 @@ class SpanContext:
         user_id: str = "",
         session_id: str = "",
         tool_name: Optional[str] = None,
+        tenant_id: str = "",
     ) -> "SpanContext":
         """Create a new span context.
 
@@ -152,6 +154,8 @@ class SpanContext:
         if parent is not None:
             trace_id = parent.trace_id
             parent_span_id = parent.span_id
+            # Child inherits tenant_id from parent (PP32 tenant isolation)
+            tenant_id = parent.tenant_id
         else:
             trace_id = _new_ulid()
             parent_span_id = None
@@ -164,6 +168,7 @@ class SpanContext:
             user_id=user_id,
             session_id=session_id,
             tool_name=tool_name,
+            tenant_id=tenant_id,
         )
 
     def to_dict(self) -> dict:
@@ -177,6 +182,7 @@ class SpanContext:
             "user_id": self.user_id,
             "session_id": self.session_id,
             "tool_name": self.tool_name,
+            "tenant_id": self.tenant_id,
         }
 
 
@@ -371,6 +377,9 @@ _obs_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 _obs_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_obs_session_id", default=""
+)
+_obs_tenant_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_obs_tenant_id", default=""
 )
 _active_span_context: contextvars.ContextVar[Optional[SpanContext]] = (
     contextvars.ContextVar("_active_span_context", default=None)
@@ -703,17 +712,20 @@ class ObservabilitySDK:
         version: str = "",
         user_id: str = "",
         session_id: str = "",
+        tenant_id: str = "",
     ) -> SpanContext:
         """Create a root SpanContext for an agent loop.
 
         user_id/session_id fall back to values stored in the current
         contextvars (``_obs_user_id`` / ``_obs_session_id``).
+        tenant_id falls back to contextvar or environment variable.
         """
         return SpanContext.new(
             agent_id=agent_id,
             agent_version=version,
             user_id=user_id or _obs_user_id.get(),
             session_id=session_id or _obs_session_id.get(),
+            tenant_id=tenant_id or _obs_tenant_id.get(),
         )
 
     async def _enqueue(self, span: Span) -> None:
@@ -793,6 +805,11 @@ class ObservabilitySDK:
         _version = os.environ.get(_DEPLOY_VERSION_ENV, "").strip() or span.context.agent_version
         if _version:
             span.attributes.setdefault("agent_version", _version)
+        
+        # PP32: stamp tenant_id from context or environment
+        _tenant_id = span.context.tenant_id or os.environ.get("AGENT_OBS_TENANT_ID", "").strip()
+        if _tenant_id:
+            span.attributes.setdefault("tenant_id", _tenant_id)
 
         try:
             self._ring_buffer.put_nowait(span)

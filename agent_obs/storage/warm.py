@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DSN = "postgresql://warm:warm@localhost:5433/warm_store"
 
+
+async def setup_connection(conn, tenant_id: str) -> None:
+    """Set app.tenant_id GUC on Postgres connection (PP32 tenant isolation).
+    
+    Args:
+        conn: asyncpg connection
+        tenant_id: Tenant ID to set, or "" for unscoped (owner bypass)
+    """
+    await conn.execute("SELECT set_config('app.tenant_id', $1, false)", tenant_id)
+
 # Columns of eval_results_warm. `reasoning` is intentionally absent: the warm
 # tier stores structure only (scores + timestamp), never judge prose.
 EVAL_RESULTS_WARM_COLUMNS = (
@@ -356,24 +366,37 @@ class WarmStore:
             )
         return int(deleted) if deleted else 0
 
-    async def get_trace(self, trace_id: str) -> dict | None:
+    async def get_trace(self, trace_id: str, tenant_id: str | None = None) -> dict | None:
         """Get a single trace by trace_id from traces_warm.
 
         Returns the trace row as a dict with JSONB/DECIMAL fields decoded,
         or None if not found.
+        
+        Args:
+            trace_id: Trace ID to retrieve
+            tenant_id: Optional tenant filter (PP32 tenant isolation)
         """
         pool = await self.connect()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
+            # Set tenant GUC if provided (PP32 tenant isolation)
+            if tenant_id is not None:
+                await setup_connection(conn, tenant_id)
+            
+            query = """
                 SELECT {columns}
                 FROM traces_warm
                 WHERE trace_id = $1
-                """.format(
-                    columns=", ".join(TRACES_WARM_COLUMNS)
-                ),
-                trace_id,
+            """.format(
+                columns=", ".join(TRACES_WARM_COLUMNS)
             )
+            params = [trace_id]
+            
+            # Add tenant filter if provided
+            if tenant_id is not None:
+                query += " AND tenant_id = $2"
+                params.append(tenant_id)
+            
+            row = await conn.fetchrow(query, *params)
         
         if not row:
             return None
@@ -488,6 +511,22 @@ class WarmStore:
             updated_count
         )
         return updated_count
+
+    async def trace_exists(self, trace_id: str) -> bool:
+        """Check if a trace exists in traces_warm (PP32 audit probing).
+        
+        Returns True if trace exists, False otherwise.
+        Note: Under RLS, this returns existence only for the current tenant context.
+        """
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            # Set unscoped context for existence probing
+            await setup_connection(conn, "")
+            row = await conn.fetchrow(
+                "SELECT 1 FROM traces_warm WHERE trace_id = $1 LIMIT 1",
+                trace_id,
+            )
+            return row is not None
 
     async def close(self) -> None:
         """Close the connection pool."""

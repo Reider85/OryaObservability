@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,44 @@ if TYPE_CHECKING:
     from agent_obs.eval.base import EvalResult
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_tenant_identifier(tenant_id: str) -> None:
+    """Validate tenant identifier for use in ClickHouse identifiers.
+    
+    Raises ValueError if tenant_id contains invalid characters.
+    """
+    if not re.match(r"^[A-Za-z0-9_]+$", tenant_id):
+        raise ValueError(
+            f"Invalid tenant identifier: {tenant_id!r}. "
+            "Only letters, numbers, and underscore are allowed."
+        )
+
+
+def _tenant_user_statements(
+    tenant_id: str, password: str, db: str = "observability"
+) -> list[str]:
+    """Generate SQL statements for creating a per-tenant ClickHouse user and row policy.
+    
+    Args:
+        tenant_id: Tenant identifier (validated by _validate_tenant_identifier)
+        password: Password for the user (will be quoted by ClickHouse)
+        db: Database name (default: observability)
+    
+    Returns:
+        List of SQL statements to execute
+    """
+    _validate_tenant_identifier(tenant_id)
+    
+    user_name = f"ch_user_{tenant_id}"
+    policy_name = f"{tenant_id}_select"
+    
+    return [
+        f"CREATE USER IF NOT EXISTS {user_name} IDENTIFIED WITH sha256_password BY '{password}'",
+        f"CREATE ROW POLICY IF NOT EXISTS {policy_name} ON {db}.spans_hot "
+        f"USING tenant_id = '{tenant_id}' FOR SELECT TO {user_name}",
+        f"GRANT SELECT ON {db}.spans_hot TO {user_name}",
+    ]
 
 
 class HotStore:
@@ -259,25 +298,35 @@ class HotStore:
             rows,
         )
 
-    def get_spans(self, trace_id: str) -> list[dict]:
+    def get_spans(self, trace_id: str, tenant_id: str | None = None) -> list[dict]:
         """Retrieve all spans for a trace from spans_hot.
         
         Includes response_embedding Array(Float32) for drift detection (PC24).
         The primary embedding store is span_embeddings (sidecar), but this method
         returns the embedding field from spans_hot for compatibility.
+        
+        Args:
+            trace_id: Trace ID to retrieve
+            tenant_id: Optional tenant filter (PP32 tenant isolation)
         """
         client = self._get_client()
-        rows = client.execute(
-            """
+        
+        query = """
             SELECT trace_id, span_id, parent_span_id, agent_id, tenant_id, name,
                    span_type, start_time, end_time, status, attributes, events,
                    cost_usd, response_embedding
             FROM spans_hot
             WHERE trace_id = %s
-            ORDER BY start_time ASC
-            """,
-            [trace_id],
-        )
+        """
+        params = [trace_id]
+        
+        if tenant_id is not None:
+            query += " AND tenant_id = %s"
+            params.append(tenant_id)
+        
+        query += " ORDER BY start_time ASC"
+        
+        rows = client.execute(query, params)
 
         spans: list[dict] = []
         for row in rows:
@@ -300,6 +349,19 @@ class HotStore:
                 }
             )
         return spans
+
+    def trace_exists(self, trace_id: str) -> bool:
+        """Check if a trace exists in spans_hot (unscoped, for audit probing).
+        
+        Returns True if trace exists, False otherwise.
+        PP32: Used for cross-tenant access detection when scoped queries return 0 rows.
+        """
+        client = self._get_client()
+        rows = client.execute(
+            "SELECT count() FROM spans_hot WHERE trace_id = %s",
+            [trace_id],
+        )
+        return int(rows[0][0]) > 0
 
     def write_audit_event(self, event) -> None:
         """Write a RecoveryAuditEvent to audit_events_hot table.
@@ -1080,6 +1142,28 @@ class HotStore:
             return (0, 0)
         total, good = int(rows[0][0]), int(rows[0][1])
         return (good, total)
+
+    def create_tenant_user(self, tenant_id: str, password: str) -> None:
+        """Create a ClickHouse user and row policy for a specific tenant.
+        
+        Creates ch_user_{tenant_id} with SELECT access only to rows where
+        tenant_id = '{tenant_id}' on the spans_hot table.
+        
+        Args:
+            tenant_id: Tenant identifier (must be alphanumeric/underscore)
+            password: Password for the user
+            
+        Raises:
+            ValueError: If tenant_id contains invalid characters
+        """
+        statements = _tenant_user_statements(tenant_id, password, self._database)
+        for statement in statements:
+            try:
+                self._execute_clickhouse(statement, [])
+                logger.info("Created tenant user and policy for tenant: %s", tenant_id)
+            except Exception as e:
+                logger.error("Failed to create tenant user for %s: %s", tenant_id, e)
+                raise
 
     def close(self) -> None:
         """Close the ClickHouse connection."""

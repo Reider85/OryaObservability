@@ -644,9 +644,10 @@ async def drill_down_trace(
     if fields:
         requested_fields = [f.strip() for f in fields.split(",")]
     
-    # Extract user from header (required for RBAC)
+    # Extract user and tenant from headers (tenant optional for PP32 tenant isolation)
     user = request.headers.get("X-OryaObs-User")
-    print(f"DEBUG: User extracted from header: {user}")
+    tenant = request.headers.get("X-OryaObs-Tenant", "")
+    print(f"DEBUG: User extracted from header: {user}, tenant: {tenant}")
     
     if not user:
         # Log audit event for missing user header
@@ -749,6 +750,7 @@ async def drill_down_trace(
         trace_id=trace_id,
         fields=requested_fields,
         user=user,
+        tenant_id=tenant,
         mfa_used=mfa_used
     )
     

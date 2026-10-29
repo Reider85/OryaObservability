@@ -180,7 +180,98 @@ class RecoveryAuditEvent:
             json.dumps(self.resource),
             self.reason,
             self.ip_address,
-self.user_agent,
+            self.user_agent,
+        )
+
+
+@dataclass
+class CrossTenantAccessAuditEvent:
+    """Audit event for cross-tenant access attempt (PP32 tenant isolation).
+    
+    Records failed cross-tenant access attempts for security monitoring.
+    Severity warning in resource JSON to maintain 10-column DDL contract.
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    actor: dict[str, str]  # {"type": "user", "id": login}
+    resource: dict[str, Any]  # {"type":"trace","trace_id","caller_tenant","resource_tenant","tier","severity":"warning"}
+    reason: str  # "cross_tenant_denied"
+    action: str = "tenant.cross_tenant_access"
+    decision: str = "deny"  # always deny for cross-tenant
+    trace_id: str = ""
+    ip_address: str = "unknown"
+    user_agent: str = "trace-viewer"
+
+    @classmethod
+    def for_attempt(
+        cls,
+        trace_id: str,
+        user: str,
+        caller_tenant: str,
+        resource_tenant: str,
+        tier: str = "unknown",
+        ip_address: str = "unknown",
+    ) -> "CrossTenantAccessAuditEvent":
+        """Create an audit event for cross-tenant access attempt.
+        
+        Args:
+            trace_id: Trace ID being accessed
+            user: User login making the request
+            caller_tenant: Tenant of the requesting user
+            resource_tenant: Tenant of the requested trace
+            tier: Storage tier where attempt was detected
+            ip_address: Client IP address
+        """
+        return cls(
+            audit_id=f"cta-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "user", "id": user},
+            resource={
+                "type": "trace",
+                "trace_id": trace_id,
+                "caller_tenant": caller_tenant,
+                "resource_tenant": resource_tenant,
+                "tier": tier,
+                "severity": "warning",
+            },
+            reason="cross_tenant_denied",
+            action="tenant.cross_tenant_access",
+            decision="deny",
+            trace_id=trace_id,
+            ip_address=ip_address,
+            user_agent="trace-viewer",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Flatten the access metadata for the Query API."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "decision": self.decision,
+            "resource": self.resource,
+            "reason": self.reason,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to a ClickHouse INSERT row matching the audit_events_hot DDL."""
+        resource = dict(self.resource)
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
         )
     
     @property
