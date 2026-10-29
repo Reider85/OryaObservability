@@ -188,5 +188,20 @@ SELECT
 FROM compliance_catalog 
 GROUP BY tool;
 
+-- PP30 (T3.7.1): user_roles — RBAC user -> role mapping for agent_obs.rbac.
+-- One row per user; role names are constrained to the six canonical roles of
+-- the PP30 role model (agent_obs/rbac/roles.py is the source of truth; keep
+-- the CHECK list in sync with ROLES there). PostgresRoleStore.load() reads
+-- this table into its in-memory cache.
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_login VARCHAR(255) PRIMARY KEY,
+    role VARCHAR(50) NOT NULL CHECK (
+        role IN ('admin', 'sre', 'developer', 'dpo', 'auditor', 'agent')
+    ),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role);
+
 -- Table ownership/grants are handled by postgres_warm_init.sh, which the
 -- postgres entrypoint runs immediately after this file.

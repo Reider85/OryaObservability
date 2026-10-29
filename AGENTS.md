@@ -52,6 +52,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_compressed_expand_api.py`: Unit tests for PP19 compressed node expand API with RBAC/MFA support
 - `tests/test_slo_dashboard.py`: PP28 config tests for the Grafana SLO dashboard (`infra/grafana/dashboards/slo.json`) — syncs gauge thresholds/windows with `SLO_CATALOG`
 - `tests/test_canary_deploy.py`: PP29 tests — SLO canary gate exit codes, per-version SLI counts, `canary_rollback` audit rows, Slack/Telegram rollback notifications, and the `canary.yml` workflow shape
+- `tests/test_rbac_roles.py`: PP30 role model tests — 6 canonical roles in `agent_obs/rbac/roles.py`, no-overlap (identical permission sets), `RBAC.check()` fail-closed behaviour, `AGENT_OBS_RBAC_ROLES` env parsing, `PostgresRoleStore` with mocked asyncpg
 
 ## Lint / typecheck
 
