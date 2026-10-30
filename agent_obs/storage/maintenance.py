@@ -257,9 +257,10 @@ async def run_cron_job_async(job_name: str, coro_fn: Callable[..., Any], *args: 
 def list_kv_keys_recursive(client: Any, path: str, mount_point: str = "secret") -> list[str]:
     """List every secret key under ``path``, descending nested KV v2 paths.
 
-    ``VaultClient.store()`` writes to ``pii/{hex8}/{timestamp}``, so the tree is
-    two levels deep: ``list_secrets("pii")`` yields the ``{hex8}`` segments and
-    each of those yields the timestamps.
+    ``VaultClient.store()`` writes to ``pii/{tenant}/{hex8}/{timestamp}`` when tenant
+    is present, or legacy ``pii/{hex8}/{timestamp}`` format. The tree can be
+    two or three levels deep: ``list_secrets("pii")`` yields ``{tenant}`` segments
+    (if present) or ``{hex8}`` segments, and each of those yields the timestamps.
     """
     keys: list[str] = []
     try:

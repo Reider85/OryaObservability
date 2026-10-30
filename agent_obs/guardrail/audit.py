@@ -137,6 +137,8 @@ class RecoveryAuditEvent:
         trace_id: str = "",
         ip_address: str = "",
         user_agent: str = "",
+        tenant_id: str = "",
+        mask: str = "",
     ) -> "RecoveryAuditEvent":
         """Create audit event for vault recovery operation.
         
@@ -154,14 +156,25 @@ class RecoveryAuditEvent:
             Client IP address (default "unknown")
         user_agent:
             Client user agent (default "cli")
+        tenant_id:
+            Optional tenant identifier for multi-tenant isolation
+        mask:
+            The masked token value (for audit logging)
         """
+        resource = {"type": "pii_vault_key", "id": vault_key}
+        # Add tenant_id and mask to resource if provided (preserve 10-column DDL contract)
+        if tenant_id:
+            resource["tenant_id"] = tenant_id
+        if mask:
+            resource["mask"] = mask
+            
         return cls(
             audit_id=f"rae-{uuid.uuid4().hex[:12]}",
             timestamp=time.time(),
             trace_id=trace_id,
             actor={"type": "engineer", "id": login},
             action="vault.recover",
-            resource={"type": "pii_vault_key", "id": vault_key},
+            resource=resource,
             reason=reason,
             ip_address=ip_address or "unknown",
             user_agent=user_agent or "cli",

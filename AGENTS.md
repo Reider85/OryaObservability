@@ -142,6 +142,13 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `ATHENA_QUERY_TIMEOUT` | `60` | PP22: Max seconds per Athena query before `stop_query_execution`. |
 | `ATHENA_MAX_SCAN_BYTES` | `1073741824` | PP22: Cost guard — stop query + raise `AthenaCostGuardError` above 1 GiB scanned. |
 | `ATHENA_POLL_INTERVAL` | `0.5` | PP22: Seconds between `get_query_execution` polls. |
+| `VAULT_TENANTS` | `tenant_a,tenant_b` | PP33: Comma-separated list of tenant IDs for per-tenant policy and key creation. |
+| `VAULT_JWT` | — | PP33: Optional JWT token for SDK authentication instead of static token. |
+| `VAULT_JWT_OIDC_DISCOVERY_URL` | — | PP33: OIDC discovery URL for JWT authentication (required to enable JWT auth). |
+| `VAULT_JWT_OIDC_ISSUER` | — | PP33: Optional OIDC issuer claim (defaults to discovery URL hostname). |
+| `VAULT_JWT_OIDC_AUDIENCE` | — | PP33: Optional OIDC audience claim (defaults to "vault"). |
+| `VAULT_JWT_USER_CLAIM` | `sub` | PP33: User claim field in JWT token (e.g., "sub", "email"). |
+| `AGENT_OBS_VAULT_TRANSIT_ENABLED` | `1` | PP33: Enable transit encryption for per-tenant PII originals (default: enabled when tenant present). |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
 `AGENT_OBS_CRON_*` family (~30 vars: retention days, specs, batch sizes,
@@ -174,3 +181,4 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 - **PP31: Rego `in` tests object *values*, not keys.** `input.user.role in role_permissions` never matches (values are permission sets) — `observability.rego` uses the `permissions := role_permissions[input.user.role]` lookup instead, which doubles as the fail-closed unknown-role check. `role_permissions` mirrors `ROLES` in `agent_obs/rbac/roles.py`: change one, change the other (the Python side is guarded by `validate_roles()`, the Rego side by `tests/test_policy_engine.py::TestRegoPolicy`, which needs the `opa` binary or `docker run openpolicyagent/opa check`).
 - **PP31: OPA `--watch` hot-reload does not see host-side edits on Docker Desktop (Windows/macOS).** inotify events from bind-mounted files are not forwarded into the Linux VM — a policy change made on the host will not reload until the container restarts (verified: container-side writes reload within seconds). On Linux hosts bind mounts share the kernel inotify and work as expected. `opa run --watch /policies` itself is proven working; do not "debug" the Rego or the flag when you hit this.
 - **PP32: Tenant isolation audit writes must never block.** CrossTenantAccessAuditEvent.to_clickhouse_row() failures are silently ignored in drill-down requests to maintain best-effort availability. Audit events use severity=warning in resource JSON to preserve the 10-column ClickHouse DDL contract.
+- **PP33: Multi-tenant Vault with per-tenant keys and JWT auth.** Run with `python -m pytest tests/test_multi_tenant_vault_pp33.py -q 2>&1`. Tests cover per-tenant policy rendering, transit encryption/decryption, JWT login, cross-tenant access guards, and audit events with tenant_id/mask.

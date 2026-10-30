@@ -407,8 +407,15 @@ services:
       - "8200:8200"
     environment:
       VAULT_LOCAL_CONFIG: '{"storage":{"file":{"path":"/vault/data"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":true}},"default_lease_ttl":"24h","max_lease_ttl":"24h","ui":true}'
+      VAULT_TENANTS: ${VAULT_TENANTS:-tenant_a,tenant_b}
+      VAULT_JWT: ${VAULT_JWT:-}
+      VAULT_JWT_OIDC_DISCOVERY_URL: ${VAULT_JWT_OIDC_DISCOVERY_URL:-}
+      VAULT_JWT_OIDC_ISSUER: ${VAULT_JWT_OIDC_ISSUER:-}
+      VAULT_JWT_OIDC_AUDIENCE: ${VAULT_JWT_OIDC_AUDIENCE:-}
+      VAULT_JWT_USER_CLAIM: ${VAULT_JWT_USER_CLAIM:-sub}
     volumes:
       - vault_data:/vault/data
+      - vault_audit:/vault/audit
       - ./vault/policies:/vault/policies:ro
       - ./vault/vault_init.sh:/vault/vault_init.sh:ro
     healthcheck:
@@ -718,6 +725,7 @@ volumes:
   clickhouse_logs2:
   minio_data:
   vault_data:
+  vault_audit:
   phoenix_data:
   sampler_shared:
   grafana_data:

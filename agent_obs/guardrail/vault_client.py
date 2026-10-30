@@ -9,8 +9,10 @@ PC20 adds audit trail for every recovery with ClickHouse write and reason field.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +32,29 @@ if TYPE_CHECKING:
     from agent_obs.storage.hot import HotStore
 
 logger = logging.getLogger(__name__)
+
+# Tenant identifier validation regex (same as hot.py _validate_tenant_identifier)
+_TENANT_REGEX = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$')
+
+def _validate_tenant_segment(tenant_id: str) -> None:
+    """Validate tenant identifier format.
+    
+    Parameters
+    ----------
+    tenant_id: str
+        Tenant identifier to validate
+        
+    Raises
+    ------
+    ValueError
+        If tenant_id is invalid
+    """
+    if not _TENANT_REGEX.match(tenant_id):
+        raise ValueError(
+            f"Invalid tenant_id format: '{tenant_id}'. "
+            "Must be 1-64 chars, alphanumeric, underscore, hyphen, "
+            "cannot start/end with underscore/hyphen"
+        )
 
 # Prometheus metrics for vault operations
 from prometheus_client import Counter, Histogram
@@ -139,6 +164,7 @@ class VaultClient:
         redis_url: Optional[str] = None,
         audit_store: Optional[HotStore] = None,
         audit_enabled: bool = True,
+        jwt: str = "",
     ) -> None:
         self.addr = addr
         self.token = token
@@ -148,6 +174,7 @@ class VaultClient:
         self.redis_url = redis_url or os.environ.get("VAULT_MFA_REDIS_URL")
         self._audit_store = audit_store
         self._audit_enabled = audit_enabled
+        self.jwt = jwt or os.environ.get("VAULT_JWT", "")
         self._client: Optional[hvac.Client] = None
         self._health_cache: dict = {"available": False, "checked_at": 0}
         self._health_cache_ttl = 30  # Cache health check for 30 seconds
@@ -161,6 +188,25 @@ class VaultClient:
                 namespace=self.namespace,
                 verify=self.verify_tls,
             )
+            
+            # Use JWT authentication if provided instead of static token
+            if self.jwt:
+                try:
+                    # Default role for JWT authentication
+                    role = "default"
+                    # If we have tenant context, use tenant-specific role
+                    if hasattr(self, '_current_tenant') and self._current_tenant:
+                        role = self._current_tenant
+                    
+                    self._client.auth.jwt.login(
+                        jwt=self.jwt,
+                        role=role
+                    )
+                    logger.debug("JWT login successful for role: %s", role)
+                except Exception as e:
+                    logger.error("JWT login failed: %s", str(e))
+                    raise ConnectionError(f"JWT authentication failed: {str(e)}")
+        
         return self._client
     
     def _get_audit_store(self) -> HotStore:
@@ -175,6 +221,7 @@ class VaultClient:
         mask: str,
         original: str,
         ttl_seconds: int = 86400,
+        tenant_id: str = "",
     ) -> str:
         """Store a mask → original mapping and return a vault_key.
 
@@ -186,6 +233,9 @@ class VaultClient:
             The plaintext value that was masked.
         ttl_seconds:
             Time-to-live in seconds (default 24 h).
+        tenant_id:
+            Optional tenant identifier for per-tenant isolation and encryption.
+            If empty, uses legacy flat path and no transit encryption.
 
         Returns
         -------
@@ -193,7 +243,14 @@ class VaultClient:
             A vault_key that can be passed to :meth:`recover`.
             Returns None if Vault is unavailable.
         """
-        vault_key = f"pii/{uuid.uuid4().hex[:8]}/{int(time.time())}"
+        # Validate tenant if provided
+        if tenant_id:
+            _validate_tenant_segment(tenant_id)
+            # Set current tenant for JWT role selection
+            self._current_tenant = tenant_id
+            vault_key = f"pii/{tenant_id}/{uuid.uuid4().hex[:8]}/{int(time.time())}"
+        else:
+            vault_key = f"pii/{uuid.uuid4().hex[:8]}/{int(time.time())}"
         
         try:
             client = self._get_client()
@@ -201,18 +258,36 @@ class VaultClient:
                 logger.error("Vault client not authenticated")
                 return None
 
-            # Store in KV v2 secrets engine
-            path = vault_key
+            # Prepare data for storage
             data = {
                 "data": {
                     "mask": mask,
-                    "original": original,
                     "created_at": time.time(),
                     "ttl_seconds": ttl_seconds,
                 }
             }
 
-            # Use KV v2 with cas=0 to create new secret
+            # Use transit encryption if tenant is present and transit is enabled
+            if tenant_id and os.environ.get("AGENT_OBS_VAULT_TRANSIT_ENABLED", "1") == "1":
+                try:
+                    # Encrypt the original using tenant-specific transit key
+                    transit_key = f"{tenant_id}_pii_key"
+                    encrypt_response = client.secrets.transit.encrypt_data(
+                        key_name=transit_key,
+                        plaintext=base64.b64encode(original.encode()).decode()
+                    )
+                    data["data"]["ciphertext"] = encrypt_response["data"]["ciphertext"]
+                    logger.debug("vault.store encrypted with key: %s", transit_key)
+                except Exception as e:
+                    logger.error("Transit encryption failed for tenant %s: %s", tenant_id, str(e))
+                    # Fail-closed: do not store plaintext as fallback
+                    return None
+            else:
+                # Store plaintext original for legacy or non-tenant scenarios
+                data["data"]["original"] = original
+
+            # Store in KV v2 secrets engine
+            path = vault_key
             response = client.secrets.kv.v2.create_or_update_secret(
                 path=path,
                 secret=data,
@@ -281,6 +356,7 @@ class VaultClient:
         trace_id: str = "",
         ip_address: str = "",
         user_agent: str = "",
+        tenant_id: str = "",
     ) -> str:
         """Recover the original PII value for a given vault_key.
 
@@ -345,12 +421,41 @@ class VaultClient:
             if not client.is_authenticated():
                 raise ConnectionError("Vault client not authenticated")
 
+            # Parse tenant from vault_key path for cross-tenant validation
+            path_parts = vault_key.split('/')
+            key_tenant = ""
+            if len(path_parts) >= 3 and path_parts[1] != uuid.uuid4().hex[:8]:  # Check if second part is not hex (tenant indicator)
+                key_tenant = path_parts[1]
+            
+            # Cross-tenant access guard
+            if tenant_id and key_tenant and tenant_id != key_tenant:
+                logger.warning("Cross-tenant access denied: caller=%s, key=%s", tenant_id, key_tenant)
+                # Write deny audit event before raising
+                audit_store = self._get_audit_store()
+                if audit_store:
+                    try:
+                        audit_event = RecoveryAuditEvent.for_vault_recovery(
+                            vault_key=vault_key,
+                            login=login or "unknown",
+                            reason=reason,
+                            trace_id=trace_id,
+                            ip_address=ip_address,
+                            user_agent=user_agent,
+                            tenant_id=tenant_id,
+                            mask="REDACTED"  # Mask sensitive info in deny event
+                        )
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, audit_store.write_audit_event, audit_event)
+                        vault_audit_write_total.labels(status="deny").inc()
+                    except Exception as e:
+                        logger.warning("Failed to write deny audit event: %s", str(e))
+                raise PermissionError(f"Cross-tenant access denied: cannot access {key_tenant} as {tenant_id}")
+
             # Read from KV v2 secrets engine
             path = vault_key
             response = client.secrets.kv.v2.read_secret_version(path=path)
 
             data = response["data"]["data"]
-            original = data["original"]
             created_at = data["created_at"]
             ttl_seconds = data.get("ttl_seconds", 86400)
 
@@ -358,6 +463,26 @@ class VaultClient:
             if time.time() > created_at + ttl_seconds:
                 logger.warning("vault.recover key=%s expired", vault_key)
                 raise KeyError(f"vault_key expired: {vault_key}")
+
+            # Decrypt original if ciphertext is present (tenant-scored with transit)
+            if "ciphertext" in data:
+                if key_tenant and os.environ.get("AGENT_OBS_VAULT_TRANSIT_ENABLED", "1") == "1":
+                    try:
+                        transit_key = f"{key_tenant}_pii_key"
+                        decrypt_response = client.secrets.transit.decrypt_data(
+                            key_name=transit_key,
+                            ciphertext=data["ciphertext"]
+                        )
+                        original = base64.b64decode(decrypt_response["data"]["plaintext"]).decode()
+                        logger.debug("vault.recover decrypted with key: %s", transit_key)
+                    except Exception as e:
+                        logger.error("Transit decryption failed for key %s: %s", transit_key, str(e))
+                        raise KeyError(f"Decryption failed for vault_key: {vault_key}")
+                else:
+                    raise KeyError(f"Ciphertext found but no transit key available for {key_tenant}")
+            else:
+                # Legacy plaintext original
+                original = data.get("original", "")
 
             logger.debug("vault.recover key=%s", vault_key)
             
@@ -371,6 +496,8 @@ class VaultClient:
                     trace_id=trace_id,
                     ip_address=ip_address,
                     user_agent=user_agent,
+                    tenant_id=tenant_id,
+                    mask=data.get("mask", "")
                 )
                 
                 try:
@@ -658,6 +785,11 @@ async def main() -> None:
         help="Client user agent (optional)",
         default=""
     )
+    recover_parser.add_argument(
+        "--tenant",
+        help="Tenant ID for cross-tenant access validation (optional)",
+        default=""
+    )
     
     args = parser.parse_args()
     
@@ -693,6 +825,7 @@ async def main() -> None:
                 trace_id=args.trace_id,
                 ip_address=args.ip,
                 user_agent=args.ua,
+                tenant_id=args.tenant,
             )
             
             print(f"Recovered PII: {original}")

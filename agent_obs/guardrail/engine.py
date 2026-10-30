@@ -15,6 +15,7 @@ The engine is designed for synchronous hot-path execution (< 5 ms p99 on CPU).
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -259,12 +260,16 @@ class GuardrailEngine:
 
         # --- Step 2: Vault store (fail-closed: masking already applied) ---
         vault_available = True
+        # Get tenant_id from context or environment fallback
+        tenant_id = getattr(context, "tenant_id", "") or os.environ.get("AGENT_OBS_TENANT_ID", "")
+        
         for match in pii_matches:
             try:
                 await self.vault_client.store(
                     mask=match.mask,
                     original=match.value,
                     ttl_seconds=self.config.vault_ttl_seconds,
+                    tenant_id=tenant_id,
                 )
             except Exception:
                 vault_available = False
