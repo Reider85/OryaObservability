@@ -356,35 +356,34 @@ services:
       REPMGR_SERVICE: "primary"
       REPMGR_DATA_DIRECTORY: "/var/lib/postgresql/data"
       REPMGR_LOG_LEVEL: INFO
-# mTLS client identity for repmgr/libpq connections (PP02): CN=repmgr
-       # matches the database role required by `cert clientcert=verify-full`
-       PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
-       PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
-       PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
-     entrypoint: /ha/postgres/docker-entrypoint-ha.sh
-     command:
-       - postgres
-       - -c
-       - ssl=on
-       - -c
-       - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
-       - -c
-       - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
-       - -c
-       - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
-       - -c
-       - ssl_min_protocol_version=TLSv1.2
-       - -c
-       - hba_file=/etc/postgresql/pg_hba.conf
-       - -c
-       - wal_level=replica
-       - -c
-       - max_wal_senders=3
-       - -c
-       - max_replication_slots=3
-       - -c
-       - hot_standby=on
+      # mTLS client identity for repmgr/libpq connections (PP02): CN=repmgr
+      # matches the database role required by `cert clientcert=verify-full`
+      PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
+      PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
+      PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
     entrypoint: /ha/postgres/docker-entrypoint-ha.sh
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=3
+      - -c
+      - max_replication_slots=3
+      - -c
+      - hot_standby=on
     volumes:
       - postgres_primary_data:/var/lib/postgresql/data
       - ./ha/postgres/docker-entrypoint-ha.sh:/ha/postgres/docker-entrypoint-ha.sh:ro
@@ -436,32 +435,32 @@ services:
       POSTGRES_REPLICATION_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
       POSTGRES_PRIMARY_CONNINFO: "host=pg-primary port=5432 user=repmgr password=${REPMGR_PASSWORD:-repmgr} dbname=${POSTGRES_DB:-langfuse}"
 # mTLS client identity for repmgr/libpq connections (PP02)
-       PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
-       PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
-       PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
-     entrypoint: /ha/postgres/docker-entrypoint-ha.sh
-     command:
-       - postgres
-       - -c
-       - ssl=on
-       - -c
-       - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
-       - -c
-       - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
-       - -c
-       - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
-       - -c
-       - ssl_min_protocol_version=TLSv1.2
-       - -c
-       - hba_file=/etc/postgresql/pg_hba.conf
-       - -c
-       - wal_level=replica
-       - -c
-       - max_wal_senders=3
-       - -c
-       - max_replication_slots=3
-       - -c
-       - hot_standby=on
+      PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
+      PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
+      PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
+    entrypoint: /ha/postgres/docker-entrypoint-ha.sh
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=3
+      - -c
+      - max_replication_slots=3
+      - -c
+      - hot_standby=on
     volumes:
       - postgres_replica1_data:/var/lib/postgresql/data
       - ./ha/postgres/docker-entrypoint-ha.sh:/ha/postgres/docker-entrypoint-ha.sh:ro
@@ -511,32 +510,32 @@ services:
       POSTGRES_REPLICATION_PASSWORD: ${REPMGR_PASSWORD:-repmgr}
       POSTGRES_PRIMARY_CONNINFO: "host=pg-primary port=5432 user=repmgr password=${REPMGR_PASSWORD:-repmgr} dbname=${POSTGRES_DB:-langfuse}"
 # mTLS client identity for repmgr/libpq connections (PP02)
-       PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
-       PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
-       PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
-     entrypoint: /ha/postgres/docker-entrypoint-ha.sh
-     command:
-       - postgres
-       - -c
-       - ssl=on
-       - -c
-       - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
-       - -c
-       - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
-       - -c
-       - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
-       - -c
-       - ssl_min_protocol_version=TLSv1.2
-       - -c
-       - hba_file=/etc/postgresql/pg_hba.conf
-       - -c
-       - wal_level=replica
-       - -c
-       - max_wal_senders=3
-       - -c
-       - max_replication_slots=3
-       - -c
-       - hot_standby=on
+      PGSSLROOTCERT: /var/lib/postgresql/certs/ca.pem
+      PGSSLCERT: /var/lib/postgresql/certs/repmgr.pem
+      PGSSLKEY: /var/lib/postgresql/certs/repmgr-key.pem
+    entrypoint: /ha/postgres/docker-entrypoint-ha.sh
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/certs/postgres.pem
+      - -c
+      - ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/certs/ca.pem
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=3
+      - -c
+      - max_replication_slots=3
+      - -c
+      - hot_standby=on
     volumes:
       - postgres_replica2_data:/var/lib/postgresql/data
       - ./ha/postgres/docker-entrypoint-ha.sh:/ha/postgres/docker-entrypoint-ha.sh:ro
@@ -583,89 +582,89 @@ services:
       start_period: 10s
     ports:
       - "6432:6432"  # Connection pool port
-deploy:
-       replicas: 1
-       placement:
-         constraints:
-           - node.role == manager
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
 
-   # pgBouncer for warm-tier connection pooling
-   pgbouncer-warm:
-     image: eduardoborba/pgbouncer:1.22-alpine
-     restart: unless-stopped
-     depends_on:
-       certs-init:
-         condition: service_completed_successfully
-       pg-primary:
-         condition: service_healthy
-       pg-replica-1:
-         condition: service_healthy
-       pg-replica-2:
-         condition: service_healthy
-     entrypoint: >
-       sh -c 'cp -n /seed/dynamic.conf /etc/pgbouncer/dynamic.conf; exec pgbouncer /etc/pgbouncer/pgbouncer-warm.ini'
-     environment:
-       PGBOUNCER_AUTH_FILE: /etc/pgbouncer/users.txt
-       PGBOUNCER_HBA_FILE: /etc/pgbouncer/pg_hba.conf
-     volumes:
-       - ./ha/postgres/pgbouncer-warm.ini:/etc/pgbouncer/pgbouncer-warm.ini:ro
-       - ./ha/postgres/pgbouncer-users.txt:/etc/pgbouncer/users.txt:ro
-       # mTLS (PP02): client-side verify-full, upstream verify-full as warm
-       - certs_pgbouncer_warm:/certs:ro
-       # Shared volume for dynamic configuration
-       - ./ha/postgres/pgbouncer-warm-dynamic.conf:/seed/dynamic.conf:ro
-       - pgbouncer_dynamic:/etc/pgbouncer:rw
-     healthcheck:
-       test: ["CMD-SHELL", "pgbounce -c /etc/pgbouncer/pgbouncer-warm.ini --check"]
-       interval: 30s
-       timeout: 5s
-       retries: 3
-       start_period: 10s
-     ports:
-       - "6433:6433"  # Warm tier connection pool port
-     deploy:
-       replicas: 1
-       placement:
-         constraints:
-           - node.role == manager
+# pgBouncer for warm-tier connection pooling
+  pgbouncer-warm:
+    image: eduardoborba/pgbouncer:1.22-alpine
+    restart: unless-stopped
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      pg-primary:
+        condition: service_healthy
+      pg-replica-1:
+        condition: service_healthy
+      pg-replica-2:
+        condition: service_healthy
+    entrypoint: >
+      sh -c 'cp -n /seed/dynamic.conf /etc/pgbouncer/dynamic.conf; exec pgbouncer /etc/pgbouncer/pgbouncer-warm.ini'
+    environment:
+      PGBOUNCER_AUTH_FILE: /etc/pgbouncer/users.txt
+      PGBOUNCER_HBA_FILE: /etc/pgbouncer/pg_hba.conf
+    volumes:
+      - ./ha/postgres/pgbouncer-warm.ini:/etc/pgbouncer/pgbouncer-warm.ini:ro
+      - ./ha/postgres/pgbouncer-users.txt:/etc/pgbouncer/users.txt:ro
+      # mTLS (PP02): client-side verify-full, upstream verify-full as warm
+      - certs_pgbouncer_warm:/certs:ro
+      # Shared volume for dynamic configuration
+      - ./ha/postgres/pgbouncer-warm-dynamic.conf:/seed/dynamic.conf:ro
+      - pgbouncer_dynamic:/etc/pgbouncer:rw
+    healthcheck:
+      test: ["CMD-SHELL", "pgbounce -c /etc/pgbouncer/pgbouncer-warm.ini --check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    ports:
+      - "6433:6433"  # Warm tier connection pool port
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
 
-   # pg-init-warm: Initialize warm tier database and schema
-   pg-init-warm:
-     image: postgres:17
-     restart: on-failure
-     depends_on:
-       certs-init:
-         condition: service_completed_successfully
-       pg-primary:
-         condition: service_healthy
-       pg-replica-1:
-         condition: service_healthy
-       pg-replica-2:
-         condition: service_healthy
-     command: [postgres, -c, ssl=on, -c, ssl_cert_file=/var/lib/postgresql/certs/postgres.pem, -c, ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem, -c, ssl_ca_file=/var/lib/postgresql/certs/ca.pem, -c, ssl_min_protocol_version=TLSv1.2, -c, hba_file=/etc/postgresql/pg_hba.conf]
-     environment:
-       POSTGRES_USER: ${POSTGRES_USER:-langfuse}
-       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
-       POSTGRES_DB: ${POSTGRES_DB:-langfuse}
-     volumes:
-       - ./ha/postgres/init-warm-store.sh:/docker-entrypoint-initdb.d/init-warm-store.sh:ro
-       - ./ha/postgres/postgres_warm.sql:/docker-entrypoint-initdb.d/postgres_warm.sql:ro
-       # mTLS (PP02): server cert + cert-only pg_hba
-       - ./ha/postgres/pg_hba_mtls.conf:/etc/postgresql/pg_hba.conf:ro
-       - certs_postgres:/var/lib/postgresql/certs:ro
-     healthcheck:
-       test: ["CMD-SHELL", "test -f /tmp/warm-initialized"]
-       interval: 10s
-       timeout: 5s
-       retries: 6
-       start_period: 30s
-     deploy:
-       replicas: 1
-       placement:
-         constraints:
-           - node.role == manager
+  # pg-init-warm: Initialize warm tier database and schema
+  pg-init-warm:
+    image: postgres:17
+    restart: on-failure
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      pg-primary:
+        condition: service_healthy
+      pg-replica-1:
+        condition: service_healthy
+      pg-replica-2:
+        condition: service_healthy
+    command: [postgres, -c, ssl=on, -c, ssl_cert_file=/var/lib/postgresql/certs/postgres.pem, -c, ssl_key_file=/var/lib/postgresql/certs/postgres-key.pem, -c, ssl_ca_file=/var/lib/postgresql/certs/ca.pem, -c, ssl_min_protocol_version=TLSv1.2, -c, hba_file=/etc/postgresql/pg_hba.conf]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langfuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langfuse}
+      POSTGRES_DB: ${POSTGRES_DB:-langfuse}
+    volumes:
+      - ./ha/postgres/init-warm-store.sh:/docker-entrypoint-initdb.d/init-warm-store.sh:ro
+      - ./ha/postgres/postgres_warm.sql:/docker-entrypoint-initdb.d/postgres_warm.sql:ro
+      # mTLS (PP02): server cert + cert-only pg_hba
+      - ./ha/postgres/pg_hba_mtls.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs_postgres:/var/lib/postgresql/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/warm-initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
 
-   # --- Redis HA: master + 2 replicas + 3 sentinel ---
+# --- Redis HA: master + 2 replicas + 3 sentinel ---
   redis-master:
     image: redis:7
     restart: unless-stopped
@@ -1493,8 +1492,8 @@ volumes:
   certs_vault_unseal:
   certs_clickhouse:
   certs_nginx:
-certs_otel:
-   certs_langfuse:
-   certs_sdk:
-   certs_pgbouncer_warm:
-   pgbouncer_dynamic:
+  certs_otel:
+  certs_langfuse:
+  certs_sdk:
+  certs_pgbouncer_warm:
+  pgbouncer_dynamic:
