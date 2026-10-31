@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 import hvac
 import pyotp
@@ -32,6 +32,11 @@ if TYPE_CHECKING:
     from agent_obs.storage.hot import HotStore
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# Cooldown per dead Vault address before it is retried (PP37, mirrors PP35)
+REPLICA_COOLDOWN_SECONDS = 30.0
 
 # Tenant identifier validation regex (same as hot.py _validate_tenant_identifier)
 _TENANT_REGEX = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$')
@@ -135,16 +140,65 @@ class _VaultEntry:
         return time.time() > self.created_at + self.ttl_seconds
 
 
+def _resolve_vault_addrs(
+    addr: str | None = None,
+    addrs: list[str] | str | None = None,
+) -> list[str]:
+    """Build the ordered Vault address list (PP37).
+
+    Priority: explicit ``addrs`` argument > ``VAULT_ADDRS`` env > explicit
+    ``addr`` argument > ``VAULT_ADDR`` env > pre-PP37 default.
+
+    ``VAULT_ADDRS`` is a comma-separated list of full URLs, e.g.
+    ``https://vault-1:8200,https://vault-2:8200,https://vault-3:8200``.
+    """
+    if addrs is None:
+        raw = os.environ.get("VAULT_ADDRS", "").strip()
+        addrs = [part.strip() for part in raw.split(",") if part.strip()] if raw else None
+
+    if not addrs:
+        single = addr or os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
+        return [single]
+
+    if isinstance(addrs, str):
+        return [part.strip() for part in addrs.split(",") if part.strip()]
+    return list(addrs)
+
+
+def _vault_failover_errors() -> tuple[type[BaseException], ...]:
+    """Connection-level errors that justify trying the next Vault replica.
+
+    ``hvac.exceptions.InvalidRequest`` / ``ServerError`` / ``Forbidden`` are
+    deliberately absent: a server-side error would fail on every replica and
+    retrying only burns time and obscures the real error.
+    """
+    import requests
+
+    return (
+        ConnectionError,
+        TimeoutError,
+        OSError,
+        requests.ConnectionError,
+        requests.Timeout,
+    )
+
+
 class VaultClient:
     """HashiCorp Vault client for storing mask → original PII mappings with TTL.
 
     Uses hvac library to communicate with HashiCorp Vault via HTTP API.
     Supports TTL expiration and batch operations for performance.
+    PP37 adds replica failover (mirrors HotStore._with_failover, PP35) and
+    optional mTLS client certificates.
 
     Parameters
     ----------
     addr:
-        Vault server address (e.g., "http://127.0.0.1:8200").
+        Vault server address (e.g., "http://127.0.0.1:8200"). Used when
+        ``addrs`` is not given.
+    addrs:
+        Ordered list of Vault addresses for failover. Overrides ``addr``
+        and the ``VAULT_ADDRS`` / ``VAULT_ADDR`` env vars.
     token:
         Vault auth token for authentication.
     namespace:
@@ -152,6 +206,8 @@ class VaultClient:
     verify_tls:
         Whether to verify TLS certificates (default True for production).
         Set to False for development with self-signed certificates.
+        When True and ``VAULT_TLS_CA`` (or ``VAULT_CACERT``) points to a CA
+        bundle, that bundle is used for verification.
     """
 
     def __init__(
@@ -165,8 +221,10 @@ class VaultClient:
         audit_store: Optional[HotStore] = None,
         audit_enabled: bool = True,
         jwt: str = "",
+        addrs: Optional[list[str] | str] = None,
     ) -> None:
-        self.addr = addr
+        self._addrs = _resolve_vault_addrs(addr, addrs)
+        self.addr = self._addrs[0]
         self.token = token
         self.namespace = namespace
         self.verify_tls = verify_tls
@@ -175,39 +233,124 @@ class VaultClient:
         self._audit_store = audit_store
         self._audit_enabled = audit_enabled
         self.jwt = jwt or os.environ.get("VAULT_JWT", "")
-        self._client: Optional[hvac.Client] = None
+        # mTLS material (PP37): both must be set to enable client certs.
+        self._client_cert = os.environ.get("VAULT_CLIENT_CERT") or None
+        self._client_key = os.environ.get("VAULT_CLIENT_KEY") or None
+        self._ca_bundle = os.environ.get("VAULT_TLS_CA") or os.environ.get("VAULT_CACERT") or None
+        # Failover state (PP37)
+        self._active_idx = 0
+        self._dead_until: dict[int, float] = {}
+        self._clients: dict[int, hvac.Client] = {}
         self._health_cache: dict = {"available": False, "checked_at": 0}
         self._health_cache_ttl = 30  # Cache health check for 30 seconds
 
+    def _hvac_verify(self) -> bool | str:
+        """Resolve the ``verify`` argument for hvac/requests."""
+        if not self.verify_tls:
+            return False
+        return self._ca_bundle or True
+
+    def _hvac_cert(self) -> tuple[str, str] | None:
+        if self._client_cert and self._client_key:
+            return (self._client_cert, self._client_key)
+        return None
+
+    def _connect(self, addr: str) -> hvac.Client:
+        client = hvac.Client(
+            url=addr,
+            token=self.token,
+            namespace=self.namespace,
+            verify=self._hvac_verify(),
+            cert=self._hvac_cert(),
+        )
+        # Use JWT authentication if provided instead of static token
+        if self.jwt:
+            try:
+                role = "default"
+                if hasattr(self, "_current_tenant") and self._current_tenant:
+                    role = self._current_tenant
+                client.auth.jwt.login(jwt=self.jwt, role=role)
+                logger.debug("JWT login successful for role: %s", role)
+            except Exception as e:
+                logger.error("JWT login failed: %s", str(e))
+                raise ConnectionError(f"JWT authentication failed: {str(e)}")
+        return client
+
     def _get_client(self) -> hvac.Client:
-        """Get or create hvac client instance."""
-        if self._client is None:
-            self._client = hvac.Client(
-                url=self.addr,
-                token=self.token,
-                namespace=self.namespace,
-                verify=self.verify_tls,
-            )
-            
-            # Use JWT authentication if provided instead of static token
-            if self.jwt:
-                try:
-                    # Default role for JWT authentication
-                    role = "default"
-                    # If we have tenant context, use tenant-specific role
-                    if hasattr(self, '_current_tenant') and self._current_tenant:
-                        role = self._current_tenant
-                    
-                    self._client.auth.jwt.login(
-                        jwt=self.jwt,
-                        role=role
-                    )
-                    logger.debug("JWT login successful for role: %s", role)
-                except Exception as e:
-                    logger.error("JWT login failed: %s", str(e))
-                    raise ConnectionError(f"JWT authentication failed: {str(e)}")
-        
-        return self._client
+        """Return the client for the active address (no failover).
+
+        Prefer :meth:`_with_failover` for operations that should survive a
+        single node being down.
+        """
+        return self._client_for(self._active_idx)
+
+    def _client_for(self, idx: int) -> hvac.Client:
+        client = self._clients.get(idx)
+        if client is None:
+            client = self._connect(self._addrs[idx])
+            self._clients[idx] = client
+        self._active_idx = idx
+        return client
+
+    def _drop_client(self, idx: int) -> None:
+        client = self._clients.pop(idx, None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001, S110 — best-effort teardown
+                pass
+
+    def _select_addr(self, exclude: set[int] | None = None) -> int:
+        """Pick the next address to use, skipping cooled-down and excluded ones."""
+        exclude = exclude or set()
+        n = len(self._addrs)
+        now = time.monotonic()
+        for offset in range(n):
+            idx = (self._active_idx + offset) % n
+            if idx in exclude:
+                continue
+            if self._dead_until.get(idx, 0.0) > now:
+                continue
+            return idx
+        for offset in range(n):
+            idx = (self._active_idx + offset) % n
+            if idx not in exclude:
+                return idx
+        return self._active_idx
+
+    def _mark_dead(self, idx: int) -> None:
+        self._dead_until[idx] = time.monotonic() + REPLICA_COOLDOWN_SECONDS
+
+    def _with_failover(self, fn: Callable[[hvac.Client], T]) -> T:
+        """Run ``fn(client)`` against the active address, failing over on
+        connection-level errors (PP37).
+
+        Each address is tried at most once per call. If every address fails,
+        the last connection error propagates — callers see the same exception
+        type they would have seen pre-PP37 from a single-host client.
+        """
+        tried: set[int] = set()
+        last_exc: BaseException | None = None
+        failover_errors = _vault_failover_errors()
+        for _ in range(len(self._addrs)):
+            idx = self._select_addr(exclude=tried)
+            tried.add(idx)
+            try:
+                return fn(self._client_for(idx))
+            except failover_errors as exc:
+                last_exc = exc
+                self._mark_dead(idx)
+                self._drop_client(idx)
+                remaining = len(self._addrs) - len(tried)
+                logger.warning(
+                    "Vault operation failed on %s (%s: %s) — %s",
+                    self._addrs[idx],
+                    type(exc).__name__,
+                    exc,
+                    f"failing over, {remaining} address(es) left" if remaining else "no addresses left",
+                )
+        assert last_exc is not None  # loop always runs >= 1 iteration
+        raise last_exc
     
     def _get_audit_store(self) -> HotStore:
         """Get or create audit store instance."""
@@ -253,24 +396,19 @@ class VaultClient:
             vault_key = f"pii/{uuid.uuid4().hex[:8]}/{int(time.time())}"
         
         try:
-            client = self._get_client()
-            if not client.is_authenticated():
-                logger.error("Vault client not authenticated")
-                return None
+            def _do_store(client: hvac.Client) -> str:
+                if not client.is_authenticated():
+                    raise ConnectionError("Vault client not authenticated")
 
-            # Prepare data for storage
-            data = {
-                "data": {
-                    "mask": mask,
-                    "created_at": time.time(),
-                    "ttl_seconds": ttl_seconds,
+                data = {
+                    "data": {
+                        "mask": mask,
+                        "created_at": time.time(),
+                        "ttl_seconds": ttl_seconds,
+                    }
                 }
-            }
 
-            # Use transit encryption if tenant is present and transit is enabled
-            if tenant_id and os.environ.get("AGENT_OBS_VAULT_TRANSIT_ENABLED", "1") == "1":
-                try:
-                    # Encrypt the original using tenant-specific transit key
+                if tenant_id and os.environ.get("AGENT_OBS_VAULT_TRANSIT_ENABLED", "1") == "1":
                     transit_key = f"{tenant_id}_pii_key"
                     encrypt_response = client.secrets.transit.encrypt_data(
                         key_name=transit_key,
@@ -278,24 +416,19 @@ class VaultClient:
                     )
                     data["data"]["ciphertext"] = encrypt_response["data"]["ciphertext"]
                     logger.debug("vault.store encrypted with key: %s", transit_key)
-                except Exception as e:
-                    logger.error("Transit encryption failed for tenant %s: %s", tenant_id, str(e))
-                    # Fail-closed: do not store plaintext as fallback
-                    return None
-            else:
-                # Store plaintext original for legacy or non-tenant scenarios
-                data["data"]["original"] = original
+                else:
+                    data["data"]["original"] = original
 
-            # Store in KV v2 secrets engine
-            path = vault_key
-            response = client.secrets.kv.v2.create_or_update_secret(
-                path=path,
-                secret=data,
-                cas=0,  # Create only, don't overwrite
-            )
+                client.secrets.kv.v2.create_or_update_secret(
+                    path=vault_key,
+                    secret=data,
+                    cas=0,
+                )
+                return vault_key
 
-            logger.debug("vault.store key=%s ttl=%d", vault_key, ttl_seconds)
-            return vault_key
+            result = self._with_failover(_do_store)
+            logger.debug("vault.store key=%s ttl=%d", result, ttl_seconds)
+            return result
 
         except VaultError as e:
             logger.error("vault.store failed for mask=%s: %s", mask, str(e))
@@ -417,16 +550,13 @@ class VaultClient:
         start_time = time.time()
         
         try:
-            client = self._get_client()
-            if not client.is_authenticated():
-                raise ConnectionError("Vault client not authenticated")
-
             # Parse tenant from vault_key path for cross-tenant validation
+            # (guard runs BEFORE the read — a denied tenant must never touch the secret)
             path_parts = vault_key.split('/')
             key_tenant = ""
             if len(path_parts) >= 3 and path_parts[1] != uuid.uuid4().hex[:8]:  # Check if second part is not hex (tenant indicator)
                 key_tenant = path_parts[1]
-            
+
             # Cross-tenant access guard
             if tenant_id and key_tenant and tenant_id != key_tenant:
                 logger.warning("Cross-tenant access denied: caller=%s, key=%s", tenant_id, key_tenant)
@@ -451,11 +581,13 @@ class VaultClient:
                         logger.warning("Failed to write deny audit event: %s", str(e))
                 raise PermissionError(f"Cross-tenant access denied: cannot access {key_tenant} as {tenant_id}")
 
-            # Read from KV v2 secrets engine
-            path = vault_key
-            response = client.secrets.kv.v2.read_secret_version(path=path)
+            def _do_read(client: hvac.Client) -> dict:
+                if not client.is_authenticated():
+                    raise ConnectionError("Vault client not authenticated")
+                return client.secrets.kv.v2.read_secret_version(path=vault_key)["data"]["data"]
 
-            data = response["data"]["data"]
+            data = self._with_failover(_do_read)
+
             created_at = data["created_at"]
             ttl_seconds = data.get("ttl_seconds", 86400)
 
@@ -469,11 +601,13 @@ class VaultClient:
                 if key_tenant and os.environ.get("AGENT_OBS_VAULT_TRANSIT_ENABLED", "1") == "1":
                     try:
                         transit_key = f"{key_tenant}_pii_key"
-                        decrypt_response = client.secrets.transit.decrypt_data(
-                            key_name=transit_key,
-                            ciphertext=data["ciphertext"]
-                        )
-                        original = base64.b64decode(decrypt_response["data"]["plaintext"]).decode()
+                        def _do_decrypt(client: hvac.Client) -> str:
+                            resp = client.secrets.transit.decrypt_data(
+                                key_name=transit_key,
+                                ciphertext=data["ciphertext"]
+                            )
+                            return base64.b64decode(resp["data"]["plaintext"]).decode()
+                        original = self._with_failover(_do_decrypt)
                         logger.debug("vault.recover decrypted with key: %s", transit_key)
                     except Exception as e:
                         logger.error("Transit decryption failed for key %s: %s", transit_key, str(e))
@@ -659,7 +793,7 @@ class VaultClient:
             logger.warning("Failed to reset rate limit for %s: %s", login, str(e))
 
     def is_available(self) -> bool:
-        """Return True if Vault backend is reachable.
+        """Return True if Vault backend is reachable (any address, PP37).
 
         Uses a cached health check result for 30 seconds to avoid hammering Vault.
         """
@@ -668,11 +802,12 @@ class VaultClient:
             return self._health_cache["available"]
 
         try:
-            client = self._get_client()
-            # Lightweight health check
-            response = client.sys.health_check()
-            available = response.get("initialized", False) and response.get("sealed", False) is False
-            
+            def _health(client: hvac.Client) -> bool:
+                response = client.sys.health_check()
+                return response.get("initialized", False) and response.get("sealed", False) is False
+
+            available = self._with_failover(_health)
+
             self._health_cache = {
                 "available": available,
                 "checked_at": now,
@@ -693,9 +828,8 @@ class VaultClient:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Async context manager exit."""
-        if self._client:
-            self._client.close()
-            self._client = None
+        for idx in list(self._clients):
+            self._drop_client(idx)
 
 
 # ---------------------------------------------------------------------------

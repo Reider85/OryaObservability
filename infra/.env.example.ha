@@ -44,13 +44,13 @@ REDIS_PORT=6379
 SENTINEL_PORT=26379
 REDIS_AUTH=orya-local-redis-secret
 
-# Vault HA settings
-VAULT_NODES=vault-1,vault-2
+# Vault HA settings (PP37: 3-node raft + auto-unseal via transit)
+VAULT_NODES=vault-1,vault-2,vault-3
 VAULT_PORT=8200
+VAULT_HOST_PORTS=8210,8211,8212
 VAULT_ROOT_TOKEN=s.root-token
+# Fixed-id transit token minted by unseal-init.sh; consumed by raft seal blocks
 VAULT_TRANSIT_TOKEN=vault-transit-token
-VAULT_UNSEAL_TOKEN=vault-unseal-token
-VAULT_NODE_ID=vault-1
 
 # MinIO distributed settings
 MINIO_NODES=minio1,minio2,minio3,minio4

@@ -115,17 +115,24 @@ Integration test: `python -m pytest tests/ha/test_pp35_clickhouse_replication.py
 
 - `infra/ha/redis/sentinel.conf`: Redis Sentinel configuration
 
-### Vault HA
+### Vault HA (PP37)
 
-- **2 nodes**: Raft-based storage
-- **Auto-unseal**: Transit backend integration
+- **3 nodes**: Raft-based storage (quorum 2 — survives 1 node loss)
+- **Auto-unseal**: Transit backend on dedicated `vault-unseal` (file storage)
 - **Leader election**: Automatic failover
-- **Multi-region support**: Cross-AZ replication
+- **mTLS**: All inter-node and client traffic requires client certs (PP02)
 
 #### Configuration Files
 
-- `infra/ha/vault/vault-raft.hcl`: Vault Raft configuration
-- `infra/ha/vault/unseal-init.sh`: Unseal initialization script
+- `infra/ha/vault/vault-raft-{1,2,3}.hcl`: Static per-node Raft configs (Vault HCL does NOT expand `${VAR:-default}`)
+- `infra/ha/vault/unseal-init.sh`: Transit-Vault bootstrap (init, self-unseal, `autounseal` key, fixed-id token)
+- `infra/ha/vault/raft-init.sh`: One-shot raft-cluster bootstrap (operator init, policies, quorum wait)
+
+#### Bootstrap Flow
+
+1. `vault-unseal` starts, `unseal-init.sh` initializes itself, unseals, creates the `autounseal` transit key and mints a periodic token with the fixed id `vault-transit-token`.
+2. `vault-1/2/3` start with `VAULT_TOKEN=vault-transit-token`; each auto-unseals via the transit seal.
+3. `vault-init-ha` (one-shot) runs `raft-init.sh`: `vault operator init` on vault-1, waits for auto-unseal, applies policies/transit/JWT, waits for 3-peer quorum.
 
 ### MinIO Distributed
 

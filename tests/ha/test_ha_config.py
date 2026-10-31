@@ -50,7 +50,7 @@ class TestHAConfig:
             "pgbouncer",
             "redis-master", "redis-replica1", "redis-replica2",
             "redis-sentinel1", "redis-sentinel2", "redis-sentinel3",
-            "vault-1", "vault-2",
+            "vault-1", "vault-2", "vault-3", "vault-init-ha",
             "minio1", "minio2", "minio3", "minio4",
             "otel-collector-1", "otel-collector-2", "otel-collector-3",
             "langfuse-1", "langfuse-2", "langfuse-3",
@@ -147,7 +147,7 @@ class TestHAConfig:
             pytest.fail("Redis Sentinel ping check failed")
     
     def test_vault_ha_configuration(self):
-        """Test Vault HA configuration"""
+        """Test Vault HA configuration (PP37: 3-node raft)"""
         # Test Vault unseal status
         try:
             result = subprocess.run([
@@ -159,14 +159,14 @@ class TestHAConfig:
         except subprocess.CalledProcessError:
             pytest.fail("Vault status check failed")
         
-        # Test Vault cluster status
+        # Test Vault cluster status — PP37 expects 3 raft peers
         try:
             result = subprocess.run([
                 "docker", "compose", "-f", "infra/docker-compose.ha.yml", "exec", "vault-1",
                 "vault", "operator", "raft", "list-peers", "-format=json"
             ], capture_output=True, text=True, check=True)
             peers = json.loads(result.stdout)
-            assert len(peers) >= 1
+            assert len(peers) == 3
         except subprocess.CalledProcessError:
             pytest.fail("Vault cluster status check failed")
     
@@ -445,30 +445,30 @@ class TestHAFailover:
         assert "role:master" in new_master.stdout
     
     def test_vault_failover(self, setup_cluster):
-        """Test Vault failover scenario"""
+        """Test Vault failover scenario (PP37: 3-node raft survives 1 loss)"""
         # Get initial cluster status
         initial_status = subprocess.run([
             "docker", "compose", "-f", "infra/docker-compose.ha.yml", "exec", "vault-1",
             "vault", "operator", "raft", "list-peers", "-format=json"
         ], capture_output=True, text=True, check=True)
         
-        # Stop a node
+        # Stop a follower (vault-3, not the leader — leader is elected dynamically)
         subprocess.run([
-            "docker", "compose", "-f", "infra/docker-compose.ha.yml", "stop", "vault-1"
+            "docker", "compose", "-f", "infra/docker-compose.ha.yml", "stop", "vault-3"
         ], check=True)
         
         # Wait for failover
         time.sleep(30)
         
-        # Check cluster status after failover
+        # Check cluster status after failover — should still have quorum (2/3)
         final_status = subprocess.run([
-            "docker", "compose", "-f", "infra/docker-compose.ha.yml", "exec", "vault-2",
+            "docker", "compose", "-f", "infra/docker-compose.ha.yml", "exec", "vault-1",
             "vault", "operator", "raft", "list-peers", "-format=json"
         ], capture_output=True, text=True, check=True)
         
         # Verify that cluster is still functional
         peers = json.loads(final_status.stdout)
-        assert len(peers) >= 1
+        assert len(peers) >= 2
 
 
 if __name__ == "__main__":

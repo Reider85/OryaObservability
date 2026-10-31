@@ -4,7 +4,7 @@
 
 set -e
 
-VAULT_NODES=("vault-1" "vault-2")
+VAULT_NODES=("vault-1" "vault-2" "vault-3")
 VAULT_PORT=8200
 VAULT_UNSEAL_PORT=8200
 VAULT_ROOT_TOKEN="${VAULT_ROOT_TOKEN:-s.root-token}"

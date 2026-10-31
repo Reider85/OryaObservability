@@ -120,9 +120,10 @@ openssl s_client -connect localhost:3000 -CAfile infra/ha/certs/internal-ca/ca.p
   endpoints (Redis 6380, ClickHouse 8443/9440).
 - **MinIO** is not part of the certificate list in the PP02 ticket and remains
   plaintext.
-- **Vault SDK client**: `agent_obs.guardrail.vault_client` accepts
-  `verify_tls` but not yet a client certificate; connecting it to the mTLS
-  Vault requires a follow-up SDK change.
+- **Vault SDK client**: `agent_obs.guardrail.vault_client` supports mTLS client
+  certificates since PP37 (`VAULT_CLIENT_CERT`/`VAULT_CLIENT_KEY` env, plus
+  `VAULT_TLS_CA`/`VAULT_CACERT` for the CA bundle). The backlog item about
+  missing client-cert support is resolved.
 - pgBouncer private key ownership may need adjustment
   (`chown <pgbouncer-user>`) depending on the image user — verify with
   `docker compose -f infra/docker-compose.ha.yml logs pgbouncer` after boot.

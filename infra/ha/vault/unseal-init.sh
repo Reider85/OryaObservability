@@ -1,7 +1,17 @@
 #!/bin/bash
-# Vault unseal bootstrap script
-# This script initializes the transit vault and unseals the raft nodes
-# mTLS (PP02): the transit vault listener requires client certificates.
+# Vault transit unseal bootstrap (PP37).
+#
+# Runs inside the dedicated vault-unseal container (file storage, Shamir).
+# Responsibilities:
+#   1. Init the transit Vault if it is not yet initialized (keys persisted to
+#      the vault_unseal_data volume, NOT /tmp — /tmp dies with the container).
+#   2. Unseal it with the generated keys (self-unseal: the script holds them).
+#   3. Enable the transit engine and create the "autounseal" key.
+#   4. Mint a periodic orphan token with the FIXED id "vault-transit-token"
+#      (the raft HCL seal blocks expect exactly this id via VAULT_TOKEN).
+#
+# mTLS (PP02): every call presents the vault-unseal mesh certificate and
+# trusts the internal CA (no -k / insecure flags anywhere).
 
 set -e
 
@@ -9,11 +19,12 @@ VAULT_ADDR="https://localhost:8200"
 VAULT_CACERT="${VAULT_CACERT:-/vault/certs/ca.pem}"
 VAULT_CLIENT_CERT="${VAULT_CLIENT_CERT:-/vault/certs/vault-unseal.pem}"
 VAULT_CLIENT_KEY="${VAULT_CLIENT_KEY:-/vault/certs/vault-unseal-key.pem}"
-VAULT_TRANSIT_TOKEN="vault-transit-token"
-VAULT_UNSEAL_TOKEN="vault-unseal-token"
 
-# Every call presents the vault-unseal mesh certificate and trusts the
-# internal CA (no -k / insecure flags anywhere).
+# Persisted on the vault_unseal_data volume so a container restart can re-unseal.
+KEYS_FILE="/vault/data/unseal_keys.txt"
+TOKEN_FILE="/vault/data/root_token.txt"
+TRANSIT_TOKEN_ID="vault-transit-token"
+
 vtls() {
     curl --cacert "${VAULT_CACERT}" \
          --cert "${VAULT_CLIENT_CERT}" \
@@ -21,141 +32,95 @@ vtls() {
          "$@"
 }
 
-echo "Starting Vault unseal initialization..."
+echo "Starting Vault transit bootstrap..."
 
-# Wait for Vault to be ready
-until vtls -f -s "${VAULT_ADDR}/v1/sys/health"; do
-    echo "Waiting for Vault to be ready..."
+# Wait for the listener to answer (sealed-but-initialized returns 501/503).
+until curl --cacert "${VAULT_CACERT}" \
+           --cert "${VAULT_CLIENT_CERT}" \
+           --key "${VAULT_CLIENT_KEY}" \
+           -s -o /dev/null -w '%{http_code}' "${VAULT_ADDR}/v1/sys/health" \
+       | grep -qE '200|429|501|503'; do
+    echo "Waiting for Vault listener..."
     sleep 2
 done
 
-# Initialize Vault if not already initialized
-if ! vtls -f -s "${VAULT_ADDR}/v1/sys/init" | grep -q "initialized.*true"; then
-    echo "Initializing Vault..."
+INITIALIZED=$(vtls -s "${VAULT_ADDR}/v1/sys/init" | jq -r '.initialized')
+
+if [ "$INITIALIZED" != "true" ]; then
+    echo "Initializing transit Vault..."
     INIT_RESPONSE=$(vtls -s -X PUT "${VAULT_ADDR}/v1/sys/init" \
         -H "Content-Type: application/json" \
-        -d '{"secret_shares": 5, "secret_threshold": 3, "recovery_shares": 5, "recovery_threshold": 3}')
-    
+        -d '{"secret_shares": 5, "secret_threshold": 3}')
+
     ROOT_TOKEN=$(echo "$INIT_RESPONSE" | jq -r '.root_token')
-    UNSEAL_KEYS=$(echo "$INIT_RESPONSE" | jq -r '.unseal_keys_b64[]')
-    
-    echo "Vault initialized!"
-    echo "Root token: $ROOT_TOKEN"
-    echo "Unseal keys:"
-    echo "$UNSEAL_KEYS"
-    
-    # Store unseal keys in a temporary file for this session
-    echo "$UNSEAL_KEYS" > /tmp/unseal_keys.txt
-    echo "$ROOT_TOKEN" > /tmp/root_token.txt
-    
-    # Enable transit backend
-    echo "Enabling transit backend..."
-    vtls -s -X PUT "${VAULT_ADDR}/v1/sys/mounts/transit" \
-        -H "X-Vault-Token: $ROOT_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d '{"type": "transit"}'
-    
-    # Create a token for auto-unseal
-    echo "Creating transit token for auto-unseal..."
-    TRANSIT_TOKEN_RESPONSE=$(vtls -s -X POST "${VAULT_ADDR}/v1/auth/token/create" \
-        -H "X-Vault-Token: $ROOT_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d '{"policies": ["root"], "ttl": "24h", "renewable": true}')
-    
-    VAULT_TRANSIT_TOKEN=$(echo "$TRANSIT_TOKEN_RESPONSE" | jq -r '.auth.client_token')
-    echo "Transit token: $VAULT_TRANSIT_TOKEN"
-    
-    # Configure auto-unseal keys in transit backend
-    echo "Configuring auto-unseal keys in transit backend..."
-    KEY_NAME="vault-unseal-key"
-    
-    # Create the key
-    vtls -s -X POST "${VAULT_ADDR}/v1/transit/keys/${KEY_NAME}" \
-        -H "X-Vault-Token: $ROOT_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d '{"type": "aes256-gcm96", "exportable": true}'
-    
-    # Store unseal keys in the transit backend
-    while IFS= read -r unseal_key; do
-        if [ -n "$unseal_key" ]; then
-            vtls -s -X POST "${VAULT_ADDR}/v1/transit/encrypt/${KEY_NAME}" \
-                -H "X-Vault-Token: $ROOT_TOKEN" \
-                -H "Content-Type: application/json" \
-                -d '{"plaintext": "'"$(echo -n "$unseal_key" | base64 -w 0)"'"}' | \
-                jq -r '.data.ciphertext' > /tmp/encrypted_key.txt
-            
-            # Store encrypted key in a variable for later use
-            ENCRYPTED_KEY=$(cat /tmp/encrypted_key.txt)
-            echo "Encrypted unseal key stored in transit backend"
-        fi
-    done <<< "$UNSEAL_KEYS"
-    
-    # Configure auto-unseal for the raft nodes
-    echo "Configuring auto-unseal for raft nodes..."
-    
-    # Create a configuration file for the raft nodes
-    cat > /tmp/vault-raft-config.hcl << EOF
-storage "raft" {
-  path = "/vault/data"
-  node_id = "vault-1"
-}
-
-seal "transit" {
-  address = "https://vault-unseal:8200"
-  token = "$VAULT_TRANSIT_TOKEN"
-  tls_ca_cert = "/vault/certs/ca.pem"
-  disable_renewal = "false"
-  mount_path = "transit/"
-  key_name = "$KEY_NAME"
-}
-
-listener "tcp" {
-  address = "0.0.0.0:8200"
-  tls_cert_file = "/vault/certs/vault.pem"
-  tls_key_file = "/vault/certs/vault-key.pem"
-  tls_ca_cert_file = "/vault/certs/ca.pem"
-  tls_disable_client_certs = false
-}
-
-api_addr = "https://localhost:8200"
-cluster_addr = "https://vault-1:8200"
-EOF
-    
-    # Copy the configuration to the raft nodes
-    echo "Vault unseal initialization complete!"
-    echo "Transit token: $VAULT_TRANSIT_TOKEN"
-    echo "Key name: $KEY_NAME"
-    echo "Configuration file created at /tmp/vault-raft-config.hcl"
-    
-    # Output the configuration for debugging
-    echo "Vault configuration:"
-    cat /tmp/vault-raft-config.hcl
-    
+    echo "$INIT_RESPONSE" | jq -r '.unseal_keys_b64[]' > "$KEYS_FILE"
+    echo "$ROOT_TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$KEYS_FILE" "$TOKEN_FILE"
+    echo "Transit Vault initialized; keys persisted to ${KEYS_FILE}."
 else
-    echo "Vault already initialized. Proceeding with unseal..."
-    
-    # Try to unseal using existing keys
-    if [ -f /tmp/unseal_keys.txt ]; then
-        echo "Using existing unseal keys..."
-        while IFS= read -r unseal_key; do
-            if [ -n "$unseal_key" ]; then
-                vtls -s -X PUT "${VAULT_ADDR}/v1/sys/unseal" \
-                    -H "Content-Type: application/json" \
-                    -d '{"key": "'"$unseal_key"'"}' | \
-                    jq -r '.sealed'
-            fi
-        done < /tmp/unseal_keys.txt
-    else
-        echo "No existing unseal keys found. Please provide them manually."
-        exit 1
-    fi
+    echo "Transit Vault already initialized."
+    ROOT_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null || true)
 fi
 
-# Check if Vault is unsealed
-SEALED_STATUS=$(vtls -s "${VAULT_ADDR}/v1/sys/health" | jq -r '.sealed')
-if [ "$SEALED_STATUS" = "false" ]; then
-    echo "Vault successfully unsealed!"
+# Self-unseal: submit keys until unsealed (persisted keys survive restarts).
+if [ -f "$KEYS_FILE" ]; then
+    while [ "$(vtls -s "${VAULT_ADDR}/v1/sys/health" | jq -r '.sealed')" = "true" ]; do
+        UNSEALED=false
+        while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            vtls -s -X PUT "${VAULT_ADDR}/v1/sys/unseal" \
+                -H "Content-Type: application/json" \
+                -d "{\"key\": \"${key}\"}" > /dev/null || true
+            if [ "$(vtls -s "${VAULT_ADDR}/v1/sys/health" | jq -r '.sealed')" = "false" ]; then
+                UNSEALED=true
+                break
+            fi
+        done < "$KEYS_FILE"
+        if [ "$UNSEALED" = "true" ]; then
+            echo "Transit Vault unsealed."
+            break
+        fi
+        echo "Still sealed, retrying key submission..."
+        sleep 2
+    done
 else
-    echo "Vault is still sealed. Please check the logs."
+    echo "ERROR: no ${KEYS_FILE} — cannot unseal a previously initialized Vault."
     exit 1
 fi
+
+if [ -z "$ROOT_TOKEN" ]; then
+    echo "ERROR: no root token in ${TOKEN_FILE}; cannot configure transit."
+    exit 1
+fi
+
+auth() { vtls -s -H "X-Vault-Token: ${ROOT_TOKEN}" "$@"; }
+
+echo "Enabling transit engine..."
+auth -X PUT "${VAULT_ADDR}/v1/sys/mounts/transit" \
+    -H "Content-Type: application/json" \
+    -d '{"type": "transit"}' > /dev/null || echo "Transit engine already enabled."
+
+echo "Creating autounseal key..."
+auth -X POST "${VAULT_ADDR}/v1/transit/keys/autounseal" \
+    -H "Content-Type: application/json" \
+    -d '{"type": "aes256-gcm96"}' > /dev/null || echo "Key autounseal already exists."
+
+# Minimal policy: encrypt/decrypt only on the autounseal key.
+echo "Writing transit policy..."
+auth -X PUT "${VAULT_ADDR}/v1/sys/policy/transit-autounseal" \
+    -H "Content-Type: application/json" \
+    -d '{"policy":"path \"transit/encrypt/autounseal\" { capabilities = [\"update\"] }\npath \"transit/decrypt/autounseal\" { capabilities = [\"update\"] }\npath \"transit/keys/autounseal\" { capabilities = [\"read\"] }"}' > /dev/null
+
+# Mint the transit token with a FIXED id so the seal HCL (VAULT_TOKEN env) is
+# stable across reboots. If the id already exists (restart), skip creation.
+if auth -s "${VAULT_ADDR}/v1/auth/token/lookup/${TRANSIT_TOKEN_ID}" | jq -e '.data.id' > /dev/null 2>&1; then
+    echo "Transit token ${TRANSIT_TOKEN_ID} already exists; keeping it."
+else
+    echo "Minting periodic transit token ${TRANSIT_TOKEN_ID}..."
+    auth -X POST "${VAULT_ADDR}/v1/auth/token/create" \
+        -H "Content-Type: application/json" \
+        -d "{\"policies\": [\"transit-autounseal\"], \"ttl\": \"768h\", \"period\": \"768h\", \"renewable\": true, \"id\": \"${TRANSIT_TOKEN_ID}\"}" > /dev/null
+    echo "Transit token ${TRANSIT_TOKEN_ID} minted."
+fi
+
+echo "Transit bootstrap complete: unsealed, autounseal key + fixed-id token ready."

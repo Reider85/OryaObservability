@@ -93,8 +93,8 @@ wait_for_health() {
     return 1
 }
 
-# Vault: restart secondary first, then primary to maintain quorum
-for svc in vault-2 vault-1; do
+# Vault: restart secondaries first, then primary to maintain quorum (PP37: 3 nodes)
+for svc in vault-3 vault-2 vault-1; do
     run dc restart "${svc}"
     if ! wait_for_health "${svc}"; then
         echo "ERROR: ${svc} failed to become healthy, ROLLING BACK" >&2
@@ -152,7 +152,7 @@ rollback_on_failure() {
     run cp -r "${BACKUP_DIR}"/* "${CERTS_DIR}/"
     run dc run --rm --no-deps certs-init
     # Restart services with old certs (quick health checks not needed for rollback)
-    for svc in vault-1 vault-2 pg-primary pg-replica-1 pg-replica-2 pgbouncer otel-collector-1 otel-collector-2 otel-collector-3; do
+    for svc in vault-1 vault-2 vault-3 pg-primary pg-replica-1 pg-replica-2 pgbouncer otel-collector-1 otel-collector-2 otel-collector-3; do
         run dc restart "${svc}"
     done
     for svc in nginx-langfuse nginx-otel; do

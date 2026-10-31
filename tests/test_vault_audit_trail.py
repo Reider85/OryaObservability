@@ -242,7 +242,8 @@ class TestVaultRecoveryWithAudit:
                 audit_enabled=True,
             )
             # Pre-set the mocked client to avoid hvac.Client() call
-            client._client = mock_hvac
+            # (PP37: _client was replaced by the _clients dict for failover)
+            client._clients[0] = mock_hvac
             return client
 
     @pytest.mark.asyncio

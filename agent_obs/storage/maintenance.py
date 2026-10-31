@@ -369,12 +369,15 @@ def cleanup_vault_expired(
     import hvac
 
     from agent_obs.guardrail.audit import LeaseExpiryAuditEvent
+    from agent_obs.guardrail.vault_client import _resolve_vault_addrs
 
     result = VaultCleanupResult()
     now = time.time()
 
+    # PP37: resolve the address list (VAULT_ADDRS > vault_addr arg > VAULT_ADDR)
+    addrs = _resolve_vault_addrs(vault_addr)
     client = hvac.Client(
-        url=vault_addr or os.environ.get("VAULT_ADDR", "http://localhost:8200"),
+        url=addrs[0],
         token=vault_token if vault_token is not None else os.environ.get("VAULT_TOKEN", ""),
         namespace=vault_namespace or os.environ.get("VAULT_NAMESPACE", "") or None,
         verify=verify_tls,

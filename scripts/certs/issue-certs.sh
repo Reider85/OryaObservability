@@ -52,7 +52,7 @@ extra_sans_for() {
         postgres)
             echo "DNS:pg-primary,DNS:pg-replica-1,DNS:pg-replica-2" ;;
         vault)
-            echo "DNS:vault-1,DNS:vault-2" ;;
+            echo "DNS:vault-1,DNS:vault-2,DNS:vault-3,DNS:vault.observability.local" ;;
         redis)
             echo "DNS:redis-master,DNS:redis-replica-1,DNS:redis-replica-2" ;;
         langfuse)
