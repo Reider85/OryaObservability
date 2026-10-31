@@ -11,9 +11,11 @@
 #   clickhouse-driver <- agent_obs.storage.hot (audit_events_hot writes)
 #   pyotp            <- agent_obs.guardrail.vault_client
 #   hvac             <- agent_obs.guardrail.vault_client
+#   openpyxl         <- agent_obs.compliance.gdpr_export (unconditional import)
 httpx>=0.27
 prometheus-client>=0.20
 pyyaml>=6.0
 clickhouse-driver>=0.2.7
 pyotp>=2.9
 hvac>=2.0.0
+openpyxl>=3.1
