@@ -1,15 +1,11 @@
-; PgBouncer user authentication configuration
-; Format: "username" "password"
-; Passwords are stored as MD5 hashes
+; PgBouncer user authentication configuration for warm tier
+; Format: "username" "md5<md5(md5(password)+username)>"
 
-; Langfuse application user
-"langfuse" "md5"$(echo -n "langfuse" | md5sum | cut -d' ' -f1)
+; Warm tier user for SDK connections
+"warm" "md5cc512516d433b0572e262f274177403c"
 
-; repmgr user for cluster management
-"repmgr" "md5"$(echo -n "repmgr" | md5sum | cut -d' ' -f1)
+; pgbouncer admin user
+"pgbouncer" "md5be5544d3807b54dd0637f2439ecb03b9"
 
-; PgBouncer admin user
-"pgbouncer" "md5"$(echo -n "pgbouncer" | md5sum | cut -d' ' -f1)
-
-; Additional users for different applications
-; "warm" "md5"$(echo -n "warm" | md5sum | cut -d' ' -f1)
+; Note: langfuse and repmgr users are not used by warm tier
+; They remain in the original pgbouncer.ini for completeness

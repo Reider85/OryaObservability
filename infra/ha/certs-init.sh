@@ -43,5 +43,6 @@ install_set "${DST_ROOT}/certs_nginx"        0:0     nginx-langfuse nginx-otel
 install_set "${DST_ROOT}/certs_otel"         0:0     otel-collector
 install_set "${DST_ROOT}/certs_langfuse"     0:0     langfuse
 install_set "${DST_ROOT}/certs_sdk"          0:0     sdk
+install_set "${DST_ROOT}/certs_pgbouncer_warm" 0:0     pgbouncer warm
 
 echo "mTLS cert volumes populated under ${DST_ROOT}"

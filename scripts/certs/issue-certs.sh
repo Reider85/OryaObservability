@@ -37,6 +37,7 @@ DEFAULT_SERVICES=(
     nginx-langfuse
     nginx-otel
     pgbouncer
+    pgbouncer-warm
     sdk
 )
 
@@ -56,6 +57,8 @@ extra_sans_for() {
             echo "DNS:redis-master,DNS:redis-replica-1,DNS:redis-replica-2" ;;
         langfuse)
             echo "DNS:langfuse-1,DNS:langfuse-2,DNS:langfuse-3" ;;
+        pgbouncer)
+            echo "DNS:pgbouncer,DNS:pgbouncer-warm" ;;
         *)
             echo "" ;;
     esac

@@ -1,8 +1,6 @@
 #!/bin/bash
-# PostgreSQL HA entrypoint script with repmgr
-# This script initializes PostgreSQL nodes for streaming replication and repmgr
-
-set -e
+# PostgreSQL HA entrypoint with repmgr (proper entrypoint override)
+set -euo pipefail
 
 # Wait for PostgreSQL to be ready
 until pg_isready -U "${POSTGRES_USER:-langfuse}" -d "${POSTGRES_DB:-langfuse}"; do
@@ -14,24 +12,30 @@ done
 if [ "${REPMGR_PRIMARY}" = "true" ]; then
     echo "Initializing repmgr primary node..."
     
-    # Create repmgr user and database
-    psql -U "${POSTGRES_USER:-langfuse}" -d "${POSTGRES_DB:-langfuse}" -c "CREATE USER repmgr WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD:-repmgr}';"
-    psql -U "${POSTGRES_USER:-langfuse}" -d "${POSTGRES_DB:-langfuse}" -c "CREATE DATABASE repmgr;"
+    # Create repmgr user and database (idempotent)
+    psql -U "${POSTGRES_USER:-langfuse}" -d "${POSTGRES_DB:-langfuse}" -c "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'repmgr') THEN
+            CREATE ROLE repmgr WITH SUPERUSER LOGIN PASSWORD '${REPMGR_PASSWORD:-repmgr}';
+        END IF;
+    END \$\$;
+    "
+    
+    psql -U "${POSTGRES_USER:-langfuse}" -d "${POSTGRES_DB:-langfuse}" -c "
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'repmgr') THEN
+            CREATE DATABASE repgr OWNER repmgr;
+        END IF;
+    END \$\$
+    "
     
     # Initialize repmgr
     repmgr -f /etc/repmgr.conf primary register
     
-    # Enable streaming replication
+    # Enable streaming replication (already in command-line -c flags, but add to pg_hba)
     echo "host replication repmgr ${REPMGR_PASSWORD:-repmgr} 0.0.0.0/0 md5" >> /var/lib/postgresql/data/pg_hba.conf
-    
-    # Configure wal_level for streaming replication
-    echo "wal_level = replica" >> /var/lib/postgresql/data/postgresql.conf
-    echo "max_wal_senders = 3" >> /var/lib/postgresql/data/postgresql.conf
-    echo "max_replication_slots = 3" >> /var/lib/postgresql/data/postgresql.conf
-    echo "hot_standby = on" >> /var/lib/postgresql/data/postgresql.conf
-    
-    # Restart PostgreSQL to apply changes
-    pg_ctl restart -D /var/lib/postgresql/data
     
     echo "Primary node initialized successfully"
 else
@@ -44,26 +48,18 @@ else
         sleep 5
     done
     
-    # Clone from primary
-    repmgr -f /etc/repmgr.conf standby clone "${POSTGRES_PRIMARY_CONNINFO}" --fast-checkpoint
+    # Clone from primary if data directory is empty
+    if [ ! -s "/var/lib/postgresql/data/PG_VERSION" ]; then
+        echo "Cloning primary database..."
+        repmgr -f /etc/repmgr.conf standby clone "${POSTGRES_PRIMARY_CONNINFO}" --fast-checkpoint
+    else
+        # Data directory exists, rejoin if needed
+        echo "Rejoining existing standby database..."
+        repmgr -f /etc/repmgr.conf standby rejoin "${POSTGRES_PRIMARY_CONNINFO}" --log-level=INFO
+    fi
     
-    # Start standby
-    pg_ctl start -D /var/lib/postgresql/data
-    
-    # Register standby
-    repmgr -f /etc/repmgr.conf standby register
-    
-    # Enable streaming replication
+    # Enable streaming replication (already in command-line -c flags, but add to pg_hba)
     echo "host replication repmgr ${REPMGR_PASSWORD:-repmgr} 0.0.0.0/0 md5" >> /var/lib/postgresql/data/pg_hba.conf
-    
-    # Configure wal_level for streaming replication
-    echo "wal_level = replica" >> /var/lib/postgresql/data/postgresql.conf
-    echo "max_wal_senders = 3" >> /var/lib/postgresql/data/postgresql.conf
-    echo "max_replication_slots = 3" >> /var/lib/postgresql/data/postgresql.conf
-    echo "hot_standby = on" >> /var/lib/postgresql/data/postgresql.conf
-    
-    # Restart PostgreSQL to apply changes
-    pg_ctl restart -D /var/lib/postgresql/data
     
     echo "Standby node initialized successfully"
 fi

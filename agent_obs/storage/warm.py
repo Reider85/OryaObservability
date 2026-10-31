@@ -21,6 +21,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_DSN = "postgresql://warm:warm@localhost:5433/warm_store"
 
 
+def _pgbouncer_opts(dsn: str) -> dict[str, Any]:
+    """Return asyncpg options for pgbouncer transaction pooling.
+    
+    For DSNs pointing to pgbouncer (port 6432/6433 or 'pgbouncer' in host),
+    disable prepared statement cache to avoid conflicts with transaction pooling.
+    """
+    opts = {}
+    if ":6432" in dsn or ":6433" in dsn or "pgbouncer" in dsn:
+        opts["statement_cache_size"] = 0
+    return opts
+
+
 async def setup_connection(conn, tenant_id: str) -> None:
     """Set app.tenant_id GUC on Postgres connection (PP32 tenant isolation).
     
@@ -28,7 +40,7 @@ async def setup_connection(conn, tenant_id: str) -> None:
         conn: asyncpg connection
         tenant_id: Tenant ID to set, or "" for unscoped (owner bypass)
     """
-    await conn.execute("SELECT set_config('app.tenant_id', $1, false)", tenant_id)
+    await conn.execute("SELECT set_config('app.tenant_id', $1, true)", tenant_id)
 
 # Columns of eval_results_warm. `reasoning` is intentionally absent: the warm
 # tier stores structure only (scores + timestamp), never judge prose.
@@ -82,15 +94,18 @@ class WarmStore:
     def __init__(
         self,
         dsn: str | None = None,
+        read_dsn: str | None = None,
         min_size: int = 1,
         max_size: int = 5,
         command_timeout: float = 30.0,
     ) -> None:
         self._dsn = dsn or os.environ.get("WARM_PG_DSN", DEFAULT_DSN)
+        self._read_dsn = read_dsn or os.environ.get("WARM_PG_READ_DSN") or self._dsn
         self._min_size = min_size
         self._max_size = max_size
         self._command_timeout = command_timeout
         self._pool: Any | None = None
+        self._read_pool: Any | None = None
 
     async def connect(self) -> Any:
         """Create the connection pool if it does not exist yet."""
@@ -103,14 +118,38 @@ class WarmStore:
                     "Install with: pip install 'agent-obs[cron]'"
                 )
 
+            opts = _pgbouncer_opts(self._dsn)
             self._pool = await asyncpg.create_pool(
                 dsn=self._dsn,
                 min_size=self._min_size,
                 max_size=self._max_size,
                 command_timeout=self._command_timeout,
+                **opts,
             )
             logger.info("Warm Postgres pool created: dsn=%s", _redact_dsn(self._dsn))
         return self._pool
+
+    async def connect_read(self) -> Any:
+        """Create the read connection pool if it does not exist yet."""
+        if self._read_pool is None:
+            try:
+                import asyncpg
+            except ImportError:
+                raise RuntimeError(
+                    "asyncpg is required for WarmStore. "
+                    "Install with: pip install 'agent-obs[cron]'"
+                )
+
+            opts = _pgbouncer_opts(self._read_dsn)
+            self._read_pool = await asyncpg.create_pool(
+                dsn=self._read_dsn,
+                min_size=self._min_size,
+                max_size=self._max_size,
+                command_timeout=self._command_timeout,
+                **opts,
+            )
+            logger.info("Warm Postgres read pool created: dsn=%s", _redact_dsn(self._read_dsn))
+        return self._read_pool
 
     async def ping(self) -> bool:
         """Return True if the warm Postgres database answers a trivial query."""
@@ -376,30 +415,40 @@ class WarmStore:
             trace_id: Trace ID to retrieve
             tenant_id: Optional tenant filter (PP32 tenant isolation)
         """
-        pool = await self.connect()
+        pool = await self.connect_read()
         async with pool.acquire() as conn:
-            # Set tenant GUC if provided (PP32 tenant isolation)
+            # Set tenant GUC if provided (PP32 tenant isolation) - transaction-local
             if tenant_id is not None:
-                await setup_connection(conn, tenant_id)
-            
-            query = """
-                SELECT {columns}
-                FROM traces_warm
-                WHERE trace_id = $1
-            """.format(
-                columns=", ".join(TRACES_WARM_COLUMNS)
-            )
-            params = [trace_id]
-            
-            # Add tenant filter if provided
-            if tenant_id is not None:
-                query += " AND tenant_id = $2"
-                params.append(tenant_id)
-            
-            row = await conn.fetchrow(query, *params)
-        
-        if not row:
-            return None
+                async with conn.transaction():
+                    await setup_connection(conn, tenant_id)
+                    query = """
+                        SELECT {columns}
+                        FROM traces_warm
+                        WHERE trace_id = $1
+                    """.format(
+                        columns=", ".join(TRACES_WARM_COLUMNS)
+                    )
+                    params = [trace_id]
+                    
+                    # Add tenant filter if provided
+                    if tenant_id is not None:
+                        query += " AND tenant_id = $2"
+                        params.append(tenant_id)
+                    
+                    row = await conn.fetchrow(query, *params)
+                if not row:
+                    return None
+            else:
+                query = """
+                    SELECT {columns}
+                    FROM traces_warm
+                    WHERE trace_id = $1
+                """.format(
+                    columns=", ".join(TRACES_WARM_COLUMNS)
+                )
+                row = await conn.fetchrow(query, trace_id)
+                if not row:
+                    return None
         
         # Decode JSONB to dict and DECIMAL to float for consistency
         trace = dict(row)
