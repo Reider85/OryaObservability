@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!-- PP35: ClickHouse Keeper node 3 (raft server_id=3, quorum 2/3).
+     Each keeper service MUST have a unique server_id — a shared config with
+     server_id=1 on all three nodes prevents the raft quorum from forming. -->
+<clickhouse>
+    <!-- Keeper binds loopback-only unless told otherwise; CH nodes reach it via the network -->
+    <listen_host>0.0.0.0</listen_host>
+    <logger>
+        <!-- Required: with only this file passed as the config path, a missing <logger>
+             block makes keeper exit silently (code 115) before any output. -->
+        <level>information</level>
+        <console>true</console>
+    </logger>
+    <keeper_server>
+        <tcp_port>9181</tcp_port>
+        <!-- raft has its OWN port in 26.x: it must differ from tcp_port (RAFT_ERROR otherwise) -->
+        <raft_port>9234</raft_port>
+        <server_id>3</server_id>
+        <log_storage_path>/var/lib/clickhouse/keeper/log</log_storage_path>
+        <snapshot_storage_path>/var/lib/clickhouse/keeper/snapshots</snapshot_storage_path>
+        <!-- PP35: only settings accepted by clickhouse-keeper 26.x are listed.
+             election/heartbeat/log/snapshot_request timeout keys were removed
+             from Coordination settings (UNKNOWN_SETTING aborts startup);
+             keeper uses its own defaults for those. -->
+        <coordination_settings>
+            <operation_timeout_ms>10000</operation_timeout_ms>
+            <session_timeout_ms>30000</session_timeout_ms>
+        </coordination_settings>
+        <raft_configuration>
+            <server>
+                <id>1</id>
+                <hostname>clickhouse-keeper1</hostname>
+                <port>9234</port>
+            </server>
+            <server>
+                <id>2</id>
+                <hostname>clickhouse-keeper2</hostname>
+                <port>9234</port>
+            </server>
+            <server>
+                <id>3</id>
+                <hostname>clickhouse-keeper3</hostname>
+                <port>9234</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+</clickhouse>

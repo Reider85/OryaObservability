@@ -20,6 +20,11 @@ CLICKHOUSE_REPLICAS=2
 CLICKHOUSE_SHARDS=2
 CLICKHOUSE_KEEPER_NODES=3
 CLICKHOUSE_CLUSTER_NAME=observability_cluster
+# PP35: SDK replica list for automatic failover (HotStore). Comma-separated
+# host[:port] specs, tried in order; a connection-level failure moves writes
+# to the next replica for 30s. Use in-network names for SDK processes running
+# inside the compose network, localhost:9001..9004 from the host.
+CLICKHOUSE_HOSTS=clickhouse1:9000,clickhouse2:9000,clickhouse3:9000,clickhouse4:9000
 
 # PostgreSQL HA settings
 POSTGRES_PRIMARY=pg-primary

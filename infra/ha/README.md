@@ -44,18 +44,51 @@ docker compose -f infra/docker-compose.ha.yml down
 
 ## Architecture
 
-### ClickHouse HA
+### ClickHouse HA (PP35)
 
 - **4 nodes**: 2 shards × 2 replicas
-- **3 Keeper nodes**: Quorum-based coordination
-- **ReplicatedMergeTree engines**: Automatic replication
-- **Distributed tables**: Cross-shard querying
+- **3 Keeper nodes**: Quorum-based coordination (raft, quorum 2/3)
+- **ReplicatedMergeTree engines**: Automatic replication via Keeper
+- **Distributed tables**: Cross-shard querying + SDK writes
+- **SDK failover**: `HotStore` reads `CLICKHOUSE_HOSTS` and fails over to the
+  next replica on connection-level errors (30 s cooldown per dead replica)
 
 #### Configuration Files
 
-- `infra/ha/clickhouse-cluster.xml`: ClickHouse cluster configuration
-- `infra/ha/keeper.xml`: Keeper configuration
-- `infra/storage/clickhouse_ddl_ha.sql`: HA DDL with ReplicatedMergeTree
+- `infra/ha/clickhouse-cluster.xml`: `remote_servers` + `zookeeper` client config
+  (mounted into every CH node; deliberately has **no** `<keeper_server>` — that
+  would start a conflicting embedded Keeper on each server)
+- `infra/ha/keeper1.xml`, `keeper2.xml`, `keeper3.xml`: per-node Keeper config.
+  Each node has a **unique raft `server_id`** (1/2/3) — a shared config with
+  `server_id=1` on all three nodes prevents the quorum from forming
+- `infra/ha/clickhouse-macros{1..4}.xml`: per-node `<macros>` shard/replica —
+  required for the `{shard}`/`{replica}` placeholders in the
+  `ReplicatedMergeTree` DDL (the stock image does not derive them from
+  `CLICKHOUSE_SHARD_NUM`/`CLICKHOUSE_REPLICA_NUM` env vars)
+- `infra/storage/clickhouse_ddl_ha.sql`: HA DDL with ReplicatedMergeTree +
+  Distributed tables (`ON CLUSTER observability_cluster`)
+
+#### Keeper quorum check
+
+```bash
+for n in 1 2 3; do
+  docker compose -f infra/docker-compose.ha.yml exec -T clickhouse-keeper$n \
+    clickhouse-keeper-client --host 127.0.0.1 --port 9181 --query srvr
+done
+```
+
+#### SDK failover (PP35)
+
+Set the replica list for any process using `HotStore` (SDK exports, cron,
+drill-down API):
+
+```bash
+CLICKHOUSE_HOSTS=clickhouse1:9000,clickhouse2:9000,clickhouse3:9000,clickhouse4:9000
+```
+
+Connection-level failures (`NetworkError`, refused, timeout) move the client
+to the next replica; query errors surface immediately without hopping.
+Integration test: `python -m pytest tests/ha/test_pp35_clickhouse_replication.py`.
 
 ### PostgreSQL HA
 

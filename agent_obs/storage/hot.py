@@ -1,7 +1,14 @@
-"""ClickHouse hot-tier storage client with connection pooling.
+"""ClickHouse hot-tier storage client with connection pooling and HA failover.
 
 Provides read/write access to spans_hot, eval_results_hot, and audit_events_hot
 tables in the ClickHouse observability database.
+
+PP35 (T3.8.1): the client understands a replica list (``CLICKHOUSE_HOSTS``)
+and automatically fails over to the next replica on connection-level errors.
+Query errors (syntax, missing table) are never retried on another replica —
+they would fail identically everywhere. Writes target the Distributed tables,
+so after a replica is lost the surviving replica of the shard accepts writes
+and the dead one resyncs from Keeper-tracked parts on restart.
 """
 
 from __future__ import annotations
@@ -11,13 +18,107 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from agent_obs.eval.base import EvalResult
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# A replica that failed with a connection-level error is skipped for this many
+# seconds before it is tried again (PP35). Keeps a flapping host from being
+# re-probed on every single operation while the healthy replica serves traffic.
+REPLICA_COOLDOWN_SECONDS = 30.0
+
+
+def _parse_replica(target: str, default_port: int) -> tuple[str, int]:
+    """Parse one ``host`` or ``host:port`` replica spec."""
+    target = target.strip()
+    if not target:
+        raise ValueError("empty replica spec in CLICKHOUSE_HOSTS")
+    if ":" in target:
+        host, _, port_s = target.rpartition(":")
+        if not host:
+            raise ValueError(f"invalid replica spec: {target!r}")
+        return (host, int(port_s))
+    return (target, default_port)
+
+
+def _resolve_replicas(
+    hosts: list[str] | str | None = None,
+    default_port: int | None = None,
+) -> list[tuple[str, int]]:
+    """Build the ordered replica list.
+
+    Priority: explicit ``hosts`` argument > ``CLICKHOUSE_HOSTS`` env >
+    single-host ``CLICKHOUSE_HOST``/``CLICKHOUSE_PORT`` fallback (pre-PP35
+    behaviour, byte-for-byte).
+
+    ``CLICKHOUSE_HOSTS`` is a comma-separated list of ``host[:port]`` specs,
+    e.g. ``clickhouse1:9000,clickhouse2:9000,clickhouse3:9000,clickhouse4:9000``.
+    """
+    if default_port is None:
+        default_port = int(os.environ.get("CLICKHOUSE_PORT", "9000"))
+
+    if hosts is None:
+        raw = os.environ.get("CLICKHOUSE_HOSTS", "").strip()
+        hosts = [part for part in (p.strip() for p in raw.split(",")) if part] if raw else None
+
+    if not hosts:
+        single = os.environ.get("CLICKHOUSE_HOST", "localhost")
+        return [_parse_replica(single, default_port)]
+
+    if isinstance(hosts, str):
+        hosts = [part for part in (p.strip() for p in hosts.split(",")) if part]
+
+    return [_parse_replica(spec, default_port) for spec in hosts]
+
+
+def _to_datetime64(value: Any) -> Any:
+    """Coerce span timestamps for clickhouse-driver DateTime64 columns (PP35).
+
+    The driver accepts ``datetime`` (and bare int seconds, bypassing tz
+    handling), but span dicts carry epoch floats (``time.time()``) or ISO-8601
+    strings (``Span.to_dict``) — both crashed the driver with
+    ``AttributeError: 'float' object has no attribute 'tzinfo'`` the first
+    time a real cluster INSERT was attempted. Epoch values become aware UTC
+    datetimes (absolute instants survive server-tz conversion); anything else
+    passes through untouched so existing datetime callers are unaffected.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, tz=UTC)
+    if isinstance(value, str) and value:
+        try:
+            # py3.11+ fromisoformat accepts the trailing 'Z' directly (FURB162).
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _failover_errors() -> tuple[type[BaseException], ...]:
+    """Connection-level errors that justify retrying on another replica.
+
+    ServerException is deliberately absent: a query error would fail on every
+    replica, and retrying only burns time and obscures the real error.
+    """
+    errors: list[type[BaseException]] = [ConnectionError, TimeoutError, OSError, EOFError]
+    # NB: EOFError covers accept-then-close handshake races (a port proxy whose
+    # backend just died, or a server still starting up) — the driver surfaces
+    # it raw from receive_hello(), not wrapped in NetworkError, and without it
+    # the very write that is supposed to fail over would instead propagate.
+    try:
+        from clickhouse_driver import errors as ch_errors
+    except ImportError:
+        return tuple(errors)
+    errors.extend([ch_errors.NetworkError, ch_errors.SocketTimeoutError])
+    return tuple(errors)
 
 
 def _validate_tenant_identifier(tenant_id: str) -> None:
@@ -52,10 +153,33 @@ def _tenant_user_statements(
     
     return [
         f"CREATE USER IF NOT EXISTS {user_name} IDENTIFIED WITH sha256_password BY '{password}'",
-        f"CREATE ROW POLICY IF NOT EXISTS {policy_name} ON {db}.spans_hot "
-        f"USING tenant_id = '{tenant_id}' FOR SELECT TO {user_name}",
+        (
+            f"CREATE ROW POLICY IF NOT EXISTS {policy_name} ON {db}.spans_hot "
+            f"USING tenant_id = '{tenant_id}' FOR SELECT TO {user_name}"
+        ),
         f"GRANT SELECT ON {db}.spans_hot TO {user_name}",
     ]
+
+
+class _FailoverExecutor:
+    """Execute-only proxy returned by :meth:`HotStore._get_client`.
+
+    Presents the ``execute`` surface that every existing call site uses, but
+    routes each call through the owning store's failover executor. Any other
+    attribute (``disconnect``, driver internals) passes through to the raw
+    client.
+    """
+
+    __slots__ = ("_store",)
+
+    def __init__(self, store: HotStore) -> None:
+        self._store = store
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        return self._store._with_failover(lambda client: client.execute(*args, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store._raw_client(), name)
 
 
 class HotStore:
@@ -63,6 +187,11 @@ class HotStore:
 
     Connection is lazily established on first call. Pool size and timeout
     are configurable via constructor args or environment variables.
+
+    PP35: when a replica list is configured (``CLICKHOUSE_HOSTS`` or the
+    ``hosts`` argument), connection-level failures trigger automatic failover
+    to the next replica. All public read/write methods go through the
+    failover executor; single-host setups behave exactly as before.
     """
 
     def __init__(
@@ -75,9 +204,14 @@ class HotStore:
         connect_timeout: int = 10,
         send_receive_timeout: int = 30,
         pool_size: int = 10,
+        hosts: list[str] | str | None = None,
     ) -> None:
-        self._host = host or os.environ.get("CLICKHOUSE_HOST", "localhost")
-        self._port = port or int(os.environ.get("CLICKHOUSE_PORT", "9000"))
+        if hosts is not None or (host is None and os.environ.get("CLICKHOUSE_HOSTS", "").strip()):
+            self._replicas = _resolve_replicas(hosts, port)
+        elif host is not None:
+            self._replicas = [(host, port if port is not None else int(os.environ.get("CLICKHOUSE_PORT", "9000")))]
+        else:
+            self._replicas = _resolve_replicas(None, port)
         self._database = database or os.environ.get("CLICKHOUSE_DB", "observability")
         self._user = user or os.environ.get("CLICKHOUSE_USER", "observability_user")
         self._password = password or os.environ.get("CLICKHOUSE_PASSWORD", "observability_password")
@@ -85,43 +219,137 @@ class HotStore:
         self._send_receive_timeout = send_receive_timeout
         self._pool_size = pool_size
         self._client: Any | None = None
+        self._active_idx = 0
+        # Host:port the current ``_client`` is connected to. Set to the first
+        # replica in __init__ so a client injected by tests (``store._client =
+        # mock``) is treated as already being on the active replica.
+        self._client_host: tuple[str, int] = self._replicas[0]
+        self._dead_until: dict[int, float] = {}
+        self._failover_errors = _failover_errors()
 
-    def _get_client(self) -> Any:
-        """Lazy initialization of ClickHouse client with connection pooling."""
+    def _connect(self, host: str, port: int) -> Any:
+        """Create a raw clickhouse-driver client for one replica."""
+        try:
+            from clickhouse_driver import Client as CHClient
+        except ImportError:
+            raise RuntimeError(
+                "clickhouse-driver is required for HotStore. "
+                "Install with: pip install clickhouse-driver"
+            ) from None
+        client = CHClient(
+            host=host,
+            port=port,
+            database=self._database,
+            user=self._user,
+            password=self._password,
+            connect_timeout=self._connect_timeout,
+            send_receive_timeout=self._send_receive_timeout,
+            settings={"max_pool_size": self._pool_size},
+        )
+        logger.info(
+            "ClickHouse connection established to %s:%d/%s",
+            host,
+            port,
+            self._database,
+        )
+        return client
+
+    def _get_client(self) -> _FailoverExecutor:
+        """Lazy initialization of ClickHouse client with failover (PP35).
+
+        Returns a thin executor proxy: existing call sites keep using
+        ``client.execute(...)``, but every call is routed through
+        :meth:`_with_failover`.
+        """
+        return _FailoverExecutor(self)
+
+    def _raw_client(self) -> Any:
         if self._client is None:
-            try:
-                from clickhouse_driver import Client as CHClient
-
-                self._client = CHClient(
-                    host=self._host,
-                    port=self._port,
-                    database=self._database,
-                    user=self._user,
-                    password=self._password,
-                    connect_timeout=self._connect_timeout,
-                    send_receive_timeout=self._send_receive_timeout,
-                    settings={"max_pool_size": self._pool_size},
-                )
-                logger.info(
-                    "ClickHouse connection established to %s:%d/%s",
-                    self._host,
-                    self._port,
-                    self._database,
-                )
-            except ImportError:
-                raise RuntimeError(
-                    "clickhouse-driver is required for HotStore. "
-                    "Install with: pip install clickhouse-driver"
-                )
+            self._client = self._connect(*self._client_host)
         return self._client
 
+    def _drop_client(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.disconnect()
+            except Exception:  # noqa: BLE001, S110 — best-effort teardown, mirrors close()
+                pass
+            self._client = None
+
+    def _select_replica(self, exclude: set[int] | None = None) -> int:
+        """Pick the next replica to use, skipping cooled-down and excluded ones."""
+        exclude = exclude or set()
+        n = len(self._replicas)
+        now = time.monotonic()
+        # Prefer the active replica, then round-robin forward.
+        for offset in range(n):
+            idx = (self._active_idx + offset) % n
+            if idx in exclude:
+                continue
+            if self._dead_until.get(idx, 0.0) > now:
+                continue
+            return idx
+        # Everything is excluded or cooling down — take the next non-excluded
+        # anyway (cooldown is a hint, not a hard fence), else the active one.
+        for offset in range(n):
+            idx = (self._active_idx + offset) % n
+            if idx not in exclude:
+                return idx
+        return self._active_idx
+
+    def _client_for(self, idx: int) -> Any:
+        """Return a client connected to replica ``idx``, reconnecting if needed."""
+        replica = self._replicas[idx]
+        if self._client is None or replica != self._client_host:
+            self._drop_client()
+            self._client = self._connect(*replica)
+            self._client_host = replica
+        self._active_idx = idx
+        return self._client
+
+    def _mark_dead(self, idx: int) -> None:
+        self._dead_until[idx] = time.monotonic() + REPLICA_COOLDOWN_SECONDS
+
+    def _with_failover(self, fn: Callable[[Any], T]) -> T:
+        """Run ``fn(client)`` against the active replica, failing over on
+        connection-level errors (PP35).
+
+        Each replica is tried at most once per call. If every replica fails,
+        the last connection error propagates — callers see the same exception
+        type they would have seen pre-PP35 from a single-host client.
+        """
+        tried: set[int] = set()
+        last_exc: BaseException | None = None
+        for _ in range(len(self._replicas)):
+            idx = self._select_replica(exclude=tried)
+            tried.add(idx)
+            try:
+                return fn(self._client_for(idx))
+            except self._failover_errors as exc:
+                last_exc = exc
+                host, port = self._replicas[idx]
+                self._mark_dead(idx)
+                self._drop_client()
+                remaining = len(self._replicas) - len(tried)
+                logger.warning(
+                    "ClickHouse operation failed on %s:%d (%s: %s) — %s",
+                    host,
+                    port,
+                    type(exc).__name__,
+                    exc,
+                    f"failing over, {remaining} replica(s) left"
+                    if remaining
+                    else "no replicas left",
+                )
+        assert last_exc is not None  # loop always runs >= 1 iteration
+        raise last_exc
+
     def is_available(self) -> bool:
-        """Check if ClickHouse is reachable."""
+        """Check if ClickHouse is reachable (any replica, PP35)."""
         try:
-            client = self._get_client()
-            client.execute("SELECT 1")
+            self._with_failover(lambda client: client.execute("SELECT 1"))
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001 — any failure means "not available"
             return False
 
     def write_eval_result(self, result: EvalResult) -> None:
@@ -278,8 +506,8 @@ class HotStore:
                     span.get("tenant_id", ""),
                     span.get("name", ""),
                     span.get("span_type", ""),
-                    span.get("start_time", 0.0),
-                    span.get("end_time", 0.0),
+                    _to_datetime64(span.get("start_time", 0.0)),
+                    _to_datetime64(span.get("end_time", 0.0)),
                     span.get("status", ""),
                     json.dumps(span.get("attributes", {})),
                     json.dumps(span.get("events", [])),
@@ -1166,10 +1394,8 @@ class HotStore:
                 raise
 
     def close(self) -> None:
-        """Close the ClickHouse connection."""
-        if self._client is not None:
-            try:
-                self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
+        """Close the ClickHouse connection and reset failover state."""
+        self._drop_client()
+        self._dead_until.clear()
+        self._active_idx = 0
+        self._client_host = self._replicas[0]

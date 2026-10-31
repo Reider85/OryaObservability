@@ -40,16 +40,6 @@ PARTITION BY (tenant_id, toYYYYMMDD(start_time))
     TTL start_time + INTERVAL 21 DAY
     SETTINGS index_granularity = 8192;
 
--- IDEMPOTENT MIGRATION (PC24): heal existing volumes created before the
--- response_embedding column existed (CREATE TABLE IF NOT EXISTS never adds
--- columns to existing tables). Re-run via docker compose run --rm clickhouse-init-ha.
-ALTER TABLE spans_hot_local ON CLUSTER 'observability_cluster'
-    ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
--- The Distributed table keeps its own metadata copy of the structure, so it
--- needs the ALTER too (metadata-only; local data is untouched).
-ALTER TABLE spans_hot ON CLUSTER 'observability_cluster'
-    ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
-
 -- span_embeddings_local: response embeddings for drift detection + Phoenix
 -- export (PC24 sidecar). Embeddings arrive asynchronously and no production
 -- writer emits full span rows into spans_hot, so a partial INSERT would only
@@ -215,30 +205,47 @@ TTL nightly_ts + INTERVAL 90 DAY
 SETTINGS index_granularity = 8192;
 
 -- Distributed tables for querying across shards (same as base setup)
+-- NB (PP35): sharding key must evaluate to an integer on 26.x — a bare String
+-- column raises TYPE_MISMATCH — and it must EXIST in the local table: only
+-- spans_hot has tenant_id; eval/tree/audit shard by trace_id, embeddings and
+-- compliance by agent_id, golden evals by question_id.
 -- These reference the local ReplicatedMergeTree tables and provide
 -- automatic routing to the appropriate replica
 CREATE TABLE IF NOT EXISTS spans_hot ON CLUSTER 'observability_cluster' AS spans_hot_local
-ENGINE = Distributed('observability_cluster', 'observability', 'spans_hot_local', tenant_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'spans_hot_local', cityHash64(tenant_id));
+
+-- IDEMPOTENT MIGRATION (PC24): heal existing volumes created before the
+-- response_embedding column existed (CREATE TABLE IF NOT EXISTS never adds
+-- columns to existing tables). Re-run via docker compose run --rm clickhouse-init-ha.
+-- NB (PP35): these sit AFTER the CREATEs above â€” on a fresh volume an ALTER
+-- issued before its table exists aborts the whole multiquery (UNKNOWN_TABLE)
+-- and the remaining DDL never runs.
+ALTER TABLE spans_hot_local ON CLUSTER 'observability_cluster'
+    ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
+-- The Distributed table keeps its own metadata copy of the structure, so it
+-- needs the ALTER too (metadata-only; local data is untouched).
+ALTER TABLE spans_hot ON CLUSTER 'observability_cluster'
+    ADD COLUMN IF NOT EXISTS response_embedding Array(Float32) DEFAULT [];
 
 CREATE TABLE IF NOT EXISTS span_embeddings ON CLUSTER 'observability_cluster' AS span_embeddings_local
-ENGINE = Distributed('observability_cluster', 'observability', 'span_embeddings_local', agent_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'span_embeddings_local', cityHash64(agent_id));
 
 CREATE TABLE IF NOT EXISTS eval_results_hot ON CLUSTER 'observability_cluster' AS eval_results_hot_local
-ENGINE = Distributed('observability_cluster', 'observability', 'eval_results_hot_local', tenant_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'eval_results_hot_local', cityHash64(trace_id));
 
 CREATE TABLE IF NOT EXISTS tree_summaries ON CLUSTER 'observability_cluster' AS tree_summaries_local
-ENGINE = Distributed('observability_cluster', 'observability', 'tree_summaries_local', tenant_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'tree_summaries_local', cityHash64(trace_id));
 
 CREATE TABLE IF NOT EXISTS audit_events_hot ON CLUSTER 'observability_cluster' AS audit_events_hot_local
-ENGINE = Distributed('observability_cluster', 'observability', 'audit_events_hot_local', tenant_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'audit_events_hot_local', cityHash64(trace_id));
 
 -- PC34: Distributed compliance catalog hot table
 CREATE TABLE IF NOT EXISTS compliance_catalog_hot ON CLUSTER 'observability_cluster' AS compliance_catalog_hot_local
-ENGINE = Distributed('observability_cluster', 'observability', 'compliance_catalog_hot_local', tenant_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'compliance_catalog_hot_local', cityHash64(agent_id));
 
 -- PP13: Distributed golden-eval results table
 CREATE TABLE IF NOT EXISTS eval_golden_results ON CLUSTER 'observability_cluster' AS eval_golden_results_local
-ENGINE = Distributed('observability_cluster', 'observability', 'eval_golden_results_local', question_id);
+ENGINE = Distributed('observability_cluster', 'observability', 'eval_golden_results_local', cityHash64(question_id));
 
 -- Create views for easier querying (using Distributed tables)
 -- These views provide the same interface as the base setup but use HA tables
@@ -279,7 +286,10 @@ SELECT
     updated_at
 FROM compliance_catalog_hot;
 
--- Grant permissions to observability user (will be created in init script)
--- This will be executed by the init script after creating the user
--- The observability_user.xml provides the user definition, this grants table permissions
-GRANT SELECT, INSERT, ALTER ON TABLE spans_hot_local, span_embeddings_local, eval_results_hot_local, tree_summaries_local, audit_events_hot_local, compliance_catalog_hot_local, drift_history, eval_golden_results_local TO observability_user ON CLUSTER 'observability_cluster';
+-- PP35: permissions are granted in storage/observability_user.xml (<grants> on
+-- observability.*) instead of SQL. The old statement here failed twice over on
+-- 26.x: ON TABLE tbl1, tbl2 is not valid grammar (needs db-qualified single
+-- grants), and neither provisioning account holds WITH GRANT OPTION, so every
+-- GRANT ... TO observability_user aborts with ACCESS_DENIED (497) on a fresh
+-- cluster — taking the rest of the init script down with it. Config-defined
+-- grants land on SYSTEM RELOAD CONFIG (the init script reloads users.d first).

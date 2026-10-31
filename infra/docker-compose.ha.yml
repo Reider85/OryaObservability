@@ -92,7 +92,8 @@ services:
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
       # Cluster config for shard 1, replica 1
       - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      # PP35: shard/replica macros — required for ReplicatedMergeTree {shard}/{replica}
+      - ./ha/clickhouse-macros1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
@@ -133,7 +134,8 @@ services:
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
       # Cluster config for shard 1, replica 2
       - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      # PP35: shard/replica macros — required for ReplicatedMergeTree {shard}/{replica}
+      - ./ha/clickhouse-macros2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
@@ -174,7 +176,8 @@ services:
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
       # Cluster config for shard 2, replica 1
       - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      # PP35: shard/replica macros — required for ReplicatedMergeTree {shard}/{replica}
+      - ./ha/clickhouse-macros3.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
@@ -215,7 +218,8 @@ services:
       - ./storage/clickhouse_init.sh:/docker-entrypoint-initdb.d/init.sh:ro
       # Cluster config for shard 2, replica 2
       - ./ha/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      # PP35: shard/replica macros — required for ReplicatedMergeTree {shard}/{replica}
+      - ./ha/clickhouse-macros4.xml:/etc/clickhouse-server/config.d/macros.xml:ro
       - ./storage/observability_user.xml:/etc/clickhouse-server/users.d/observability_user.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
@@ -232,7 +236,9 @@ services:
         constraints:
           - node.role == manager
 
-  # ClickHouse Keeper quorum (3 nodes)
+  # ClickHouse Keeper quorum (3 nodes, PP35)
+  # Each node MUST mount its own config: raft server_id must be unique (1/2/3),
+  # a shared server_id=1 config prevents the quorum from forming.
   clickhouse-keeper1:
     image: clickhouse/clickhouse-server:26.9
     restart: unless-stopped
@@ -240,13 +246,15 @@ services:
     command: clickhouse-keeper --config /etc/clickhouse-server/config.d/keeper.xml
     volumes:
       - keeper_data1:/var/lib/clickhouse/keeper
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./ha/keeper1.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-keeper --check-config --config /etc/clickhouse-server/config.d/keeper.xml"]
+      # "srvr" round-trips the keeper client against the local raft listener —
+      # a dead/unelected keeper fails here, a mere config check would not.
+      test: ["CMD-SHELL", "clickhouse-keeper-client --host 127.0.0.1 --port 9181 --query srvr"]
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
       placement:
@@ -260,13 +268,13 @@ services:
     command: clickhouse-keeper --config /etc/clickhouse-server/config.d/keeper.xml
     volumes:
       - keeper_data2:/var/lib/clickhouse/keeper
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./ha/keeper2.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-keeper --check-config --config /etc/clickhouse-server/config.d/keeper.xml"]
+      test: ["CMD-SHELL", "clickhouse-keeper-client --host 127.0.0.1 --port 9181 --query srvr"]
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
       placement:
@@ -280,13 +288,13 @@ services:
     command: clickhouse-keeper --config /etc/clickhouse-server/config.d/keeper.xml
     volumes:
       - keeper_data3:/var/lib/clickhouse/keeper
-      - ./ha/keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+      - ./ha/keeper3.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-keeper --check-config --config /etc/clickhouse-server/config.d/keeper.xml"]
+      test: ["CMD-SHELL", "clickhouse-keeper-client --host 127.0.0.1 --port 9181 --query srvr"]
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 10s
+      start_period: 15s
     deploy:
       replicas: 1
       placement:
@@ -322,7 +330,6 @@ services:
       - ./storage/clickhouse_ddl_ha.sql:/init/clickhouse_ddl_ha.sql:ro
       - ./storage/clickhouse_init.sh:/init/clickhouse_init.sh:ro
       - ./ha/clickhouse-cluster.xml:/init/cluster.xml:ro
-      - ./ha/keeper.xml:/init/keeper.xml:ro
     entrypoint: ["/bin/bash", "/init/clickhouse_init.sh"]
 
   # --- Postgres HA: 1 primary + 2 replicas + repmgr + pgBouncer ---
@@ -915,7 +922,7 @@ services:
     ports:
       - "43171:4317"
       - "43181:4318"
-      - "88881:8888"
+      - "18881:8888"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8888/debug/health || exit 1"]
       interval: 30s
@@ -952,7 +959,7 @@ services:
     ports:
       - "43172:4317"
       - "43182:4318"
-      - "88882:8888"
+      - "18882:8888"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8888/debug/health || exit 1"]
       interval: 30s
@@ -989,7 +996,7 @@ services:
     ports:
       - "43173:4317"
       - "43183:4318"
-      - "88883:8888"
+      - "18883:8888"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8888/debug/health || exit 1"]
       interval: 30s

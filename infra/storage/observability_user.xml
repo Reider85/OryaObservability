@@ -15,7 +15,21 @@
       </networks>
       <profile>default</profile>
       <quota>default</quota>
-      <access_management>0</access_management>
+      <!-- PP35: table grants live HERE, not in SQL. The provisioning accounts
+           (image-created `clickhouse`, XML `observability_user` itself) were
+           granted their privileges WITHOUT GRANT OPTION, so
+           `GRANT ... TO observability_user` in clickhouse_ddl_ha.sql fails with
+           ACCESS_DENIED (497) on every fresh cluster. Config-defined grants are
+           applied directly on SYSTEM RELOAD CONFIG — no SQL grant chain needed.
+           observability.* keeps pace with new tables (spans_hot, eval_results,
+           audit_events, tree_summaries, span_embeddings, drift_history,
+           compliance_catalog, eval_golden_results + views).
+           NB: each element is a full GRANT query without grantees, and the
+           <grants> block may not coexist with an explicit <access_management>
+           element (default 0 anyway — access_management is simply omitted). -->
+      <grants>
+        <query>GRANT SELECT, INSERT, ALTER ON observability.*</query>
+      </grants>
     </observability_user>
   </users>
 </clickhouse>

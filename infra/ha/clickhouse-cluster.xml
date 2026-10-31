@@ -6,57 +6,47 @@
                 <replica>
                     <host>clickhouse1</host>
                     <port>9000</port>
+                    <!-- inter-server creds: no default user exists in this image setup, -->
+                    <!-- so replicas must authenticate explicitly (compose defaults) -->
+                    <user>clickhouse</user>
+                    <password>clickhouse</password>
                 </replica>
                 <replica>
                     <host>clickhouse2</host>
                     <port>9000</port>
+                    <!-- inter-server creds: no default user exists in this image setup, -->
+                    <!-- so replicas must authenticate explicitly (compose defaults) -->
+                    <user>clickhouse</user>
+                    <password>clickhouse</password>
                 </replica>
             </shard>
             <shard>
                 <replica>
                     <host>clickhouse3</host>
                     <port>9000</port>
+                    <!-- inter-server creds: no default user exists in this image setup, -->
+                    <!-- so replicas must authenticate explicitly (compose defaults) -->
+                    <user>clickhouse</user>
+                    <password>clickhouse</password>
                 </replica>
                 <replica>
                     <host>clickhouse4</host>
                     <port>9000</port>
+                    <!-- inter-server creds: no default user exists in this image setup, -->
+                    <!-- so replicas must authenticate explicitly (compose defaults) -->
+                    <user>clickhouse</user>
+                    <password>clickhouse</password>
                 </replica>
             </shard>
         </observability_cluster>
     </remote_servers>
 
-    <keeper_server>
-        <tcp_port>9181</tcp_port>
-        <server_id>1</server_id>
-        <log_storage_path>/var/lib/clickhouse/keeper/log</log_storage_path>
-        <snapshot_storage_path>/var/lib/clickhouse/keeper/snapshots</snapshot_storage_path>
-        <coordination_settings>
-            <operation_timeout_ms>10000</operation_timeout_ms>
-            <election_timeout_ms>3000</election_timeout_ms>
-            <log_request_timeout_ms>5000</log_request_timeout_ms>
-            <snapshot_request_timeout_ms>90000</snapshot_request_timeout_ms>
-            <heart_beat_timeout_ms>3000</heart_beat_timeout_ms>
-            <soft_election_timeout_ms>2000</soft_election_timeout_ms>
-        </coordination_settings>
-        <raft_configuration>
-            <server>
-                <id>1</id>
-                <hostname>clickhouse-keeper1</hostname>
-                <port>9181</port>
-            </server>
-            <server>
-                <id>2</id>
-                <hostname>clickhouse-keeper2</hostname>
-                <port>9181</port>
-            </server>
-            <server>
-                <id>3</id>
-                <hostname>clickhouse-keeper3</hostname>
-                <port>9181</port>
-            </server>
-        </raft_configuration>
-    </keeper_server>
-
+    <!-- NOTE (PP35): no <keeper_server> here — this file is mounted into every
+         clickhouse-server (config.d/cluster.xml). An embedded keeper block would
+         start a conflicting Keeper on each CH node with a duplicate raft id.
+         Keeper runs ONLY in the dedicated clickhouse-keeper{1,2,3} services
+         (keeper{1,2,3}.xml, unique server_id per node). The <zookeeper> section
+         below is the CLIENT config pointing at the keeper quorum. -->
     <zookeeper>
         <node>
             <host>clickhouse-keeper1</host>
@@ -72,17 +62,15 @@
         </node>
     </zookeeper>
 
-    <network>
-        <send_timeout>5</send_timeout>
-        <receive_timeout>5</receive_timeout>
-        <send_queue_max_size>10000</send_queue_max_size>
-        <receive_queue_max_size>10000</receive_queue_max_size>
-        <max_connections>100</max_connections>
-        <keep_alive_timeout>3</keep_alive_timeout>
-    </network>
+    <!-- NB (PP35): no <network> section here — clickhouse-server 26.x rejects
+         it as UNKNOWN_ELEMENT_IN_CONFIG (the same pre-PP35 bug class as the
+         logger level). Tune timeouts via <max_...>/server settings instead. -->
 
     <logger>
-        <level>info</level>
+        <!-- "information" is the valid Poco level name; "info" aborts the
+             server start on clickhouse/clickhouse-server 26.x (pre-PP35 bug,
+             same fix as infra/storage/clickhouse_cluster.xml). -->
+        <level>information</level>
         <console>true</console>
         <log>/var/log/clickhouse-server/clickhouse-server.log</log>
     </logger>

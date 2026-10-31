@@ -165,8 +165,10 @@ class TestHotStoreAuditWrite:
         
         hot_store_with_mock.write_audit_event(event)
         
-        # Verify clickhouse_client.execute was called
-        mock_client = hot_store_with_mock._get_client()
+        # Verify clickhouse_client.execute was called.
+        # NB (PP35): _get_client() returns a failover executor proxy — inspect
+        # the injected mock through _client directly.
+        mock_client = hot_store_with_mock._client
         mock_client.execute.assert_called_once()
         
         # Extract the SQL and parameters from the call
@@ -184,8 +186,9 @@ class TestHotStoreAuditWrite:
 
     def test_write_audit_event_failure(self, hot_store_with_mock):
         """Test audit event write failure."""
-        # Make execute raise an exception
-        mock_client = hot_store_with_mock._get_client()
+        # Make execute raise an exception (PP35: set it on the injected mock,
+        # _get_client() returns a proxy, not the mock itself)
+        mock_client = hot_store_with_mock._client
         mock_client.execute.side_effect = Exception("ClickHouse connection failed")
         
         event = RecoveryAuditEvent.for_vault_recovery(

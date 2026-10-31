@@ -1,11 +1,10 @@
-import pytest
+import json
+import os
 import subprocess
 import time
-import json
-import requests
-from typing import Dict, List, Optional
+
 import docker
-from docker.models.containers import Container
+import pytest
 
 
 class TestHAConfig:

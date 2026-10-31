@@ -1,0 +1,4 @@
+# Shell scripts execute inside Linux containers: CRLF breaks the shebang and
+# `set` builtins ($'\r': command not found). Keep them LF in the working copy
+# regardless of core.autocrlf.
+*.sh text eol=lf

@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!-- PP35: shard/replica macros for clickhouse2 (shard 01, replica replica-2).
+     ReplicatedMergeTree DDL uses '/clickhouse/observability/{shard}' and
+     '{replica}' — these macros must be unique per node and consistent within a
+     shard: both replicas of a shard share the same <shard> path, differ in
+     <replica>. The stock image does NOT derive these from CLICKHOUSE_SHARD_NUM
+     / CLICKHOUSE_REPLICA_NUM env vars — they must be provided as config. -->
+<clickhouse>
+    <macros>
+        <shard>01</shard>
+        <replica>replica-2</replica>
+    </macros>
+</clickhouse>
