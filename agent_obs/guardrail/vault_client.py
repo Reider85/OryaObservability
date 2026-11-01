@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import hvac
 import pyotp
@@ -222,6 +222,7 @@ class VaultClient:
         audit_enabled: bool = True,
         jwt: str = "",
         addrs: Optional[list[str] | str] = None,
+        circuit_breaker: Any | None = None,
     ) -> None:
         self._addrs = _resolve_vault_addrs(addr, addrs)
         self.addr = self._addrs[0]
@@ -243,6 +244,15 @@ class VaultClient:
         self._clients: dict[int, hvac.Client] = {}
         self._health_cache: dict = {"available": False, "checked_at": 0}
         self._health_cache_ttl = 30  # Cache health check for 30 seconds
+        # PP38: circuit breaker — after N consecutive all-address failures
+        # (or sealed/uninitialized responses that surface as connection-level
+        # errors through _with_failover), fail fast instead of re-probing every
+        # address on each store()/recover() call.
+        if circuit_breaker is None:
+            from agent_obs.ha.health_checks import circuit_breaker_for
+
+            circuit_breaker = circuit_breaker_for("vault")
+        self._breaker = circuit_breaker
 
     def _hvac_verify(self) -> bool | str:
         """Resolve the ``verify`` argument for hvac/requests."""
@@ -328,7 +338,15 @@ class VaultClient:
         Each address is tried at most once per call. If every address fails,
         the last connection error propagates — callers see the same exception
         type they would have seen pre-PP37 from a single-host client.
+
+        PP38: gated by the ``vault`` circuit breaker — while open, calls
+        raise CircuitOpenError immediately (guardrail treats it like any
+        other vault failure: fail-fast, recovery unavailable).
         """
+        from agent_obs.ha.health_checks import CircuitOpenError
+
+        if not self._breaker.allow_request():
+            raise CircuitOpenError(self._breaker.dependency)
         tried: set[int] = set()
         last_exc: BaseException | None = None
         failover_errors = _vault_failover_errors()
@@ -336,7 +354,7 @@ class VaultClient:
             idx = self._select_addr(exclude=tried)
             tried.add(idx)
             try:
-                return fn(self._client_for(idx))
+                result = fn(self._client_for(idx))
             except failover_errors as exc:
                 last_exc = exc
                 self._mark_dead(idx)
@@ -349,7 +367,11 @@ class VaultClient:
                     exc,
                     f"failing over, {remaining} address(es) left" if remaining else "no addresses left",
                 )
+                continue
+            self._breaker.record_success()
+            return result
         assert last_exc is not None  # loop always runs >= 1 iteration
+        self._breaker.record_failure()
         raise last_exc
     
     def _get_audit_store(self) -> HotStore:

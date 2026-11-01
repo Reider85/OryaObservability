@@ -497,3 +497,28 @@ groups:
             and the audit trail records freeze_deploy. This is a page — wake
             the on-call and stabilise before resuming releases.
             Runbook: docs/error-budget-runbook.md#hard.
+
+  # PP38 (T3.8.4): active health probes (agent_obs.ha.health_checks).
+  # agent_obs_dependency_health is set only for dependencies that are actually
+  # configured — an unconfigured dependency has no series and never alerts.
+  # Graceful degradation keeps the SDK running (ring-buffer export, Redis
+  # embedding fallback, buffered compliance catalog, fail-fast breakers), so
+  # this is a warning, not a page.
+  - name: dependency-health
+    rules:
+      - alert: DependencyUnhealthy
+        expr: agent_obs_dependency_health == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: ha
+        annotations:
+          summary: "Dependency {{ $labels.dependency }} unhealthy for >5m"
+          description: >-
+            Active health probe for {{ $labels.dependency }} has been failing
+            for more than 5 minutes (agent_obs_dependency_health == 0). The
+            SDK is degrading gracefully — circuit breaker
+            (agent_obs_circuit_breaker_state) may be open and calls fail fast
+            — but the dependency needs attention. Probe cadence: 30s
+            (AGENT_OBS_HEALTH_PROBE_INTERVAL). Check the dependency's own
+            health endpoint and the HA stack (infra/docker-compose.ha.yml).

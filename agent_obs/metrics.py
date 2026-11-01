@@ -526,3 +526,31 @@ slo_error_budget_actions_taken_total = Counter(
     "Error-budget policy actions fired (soft/hard on degradation, recover on return to ok)",
     ["name", "action"],
 )
+
+# --- PP38 health probes + circuit breakers (T3.8.4) -------------------------
+# `dependency` is a bounded set (DEPENDENCIES in agent_obs.ha.health_checks):
+# langfuse | ch | pg | vault | redis | minio.
+
+# Updated by HealthChecker.apply_gauges on each probe cycle. 1 = healthy,
+# 0 = unhealthy; dependencies that are not configured are never set (no
+# series, no DependencyUnhealthy alert).
+dependency_health = Gauge(
+    "agent_obs_dependency_health",
+    "Active health-probe result per dependency (1=healthy, 0=unhealthy)",
+    ["dependency"],
+)
+
+# 0 = closed, 1 = half-open, 2 = open (CircuitState.gauge_value).
+circuit_breaker_state = Gauge(
+    "agent_obs_circuit_breaker_state",
+    "Circuit breaker state per dependency (0=closed, 1=half-open, 2=open)",
+    ["dependency"],
+)
+
+# Counted by CircuitBreaker.record_failure on every recorded operation
+# failure — not per scrape, not per rejected request.
+circuit_breaker_failures_total = Counter(
+    "agent_obs_circuit_breaker_failures_total",
+    "Circuit-breaker-recorded operation failures per dependency",
+    ["dependency"],
+)

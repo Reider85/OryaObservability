@@ -27,6 +27,17 @@ route:
       group_interval: 30m
       repeat_interval: 2h
 
+    # PP38: dependency-health warnings go to Slack, grouped per dependency
+    # (same pattern as the drift route). The 5m `for:` in the Prometheus rule
+    # debounces flapping; group_interval dedupes sustained outages.
+    - matchers:
+        - component="ha"
+      receiver: slack
+      group_by: [alertname, dependency]
+      group_wait: 30s
+      group_interval: 15m
+      repeat_interval: 4h
+
     # PC27: critical alerts go to Slack for on-call response.
     - matchers:
         - severity="critical"

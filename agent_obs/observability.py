@@ -427,6 +427,9 @@ class ObservabilitySDK:
         self._metrics_http_server = None
         self._trace_agg: dict[str, dict] = {}
         self._max_trace_agg = 100_000
+        # PP38: active health-probe task (opt-in via AGENT_OBS_HEALTH_PROBES_ENABLED).
+        self._health_task: asyncio.Task | None = None
+        self._health_checker: Any | None = None
 
         # PP09: span aggregation configuration
         self._aggregation_enabled = self._load_aggregation_enabled(config)
@@ -516,6 +519,24 @@ class ObservabilitySDK:
                 pass
             if metrics_port is not None:
                 self._start_metrics_server(metrics_port)
+            # PP38: active health probes (opt-in, default off). Probes only
+            # configured dependencies, run on their own task, and never touch
+            # the export path — the loop contains every exception.
+            if os.environ.get("AGENT_OBS_HEALTH_PROBES_ENABLED", "false").strip().lower() in (
+                "true", "1", "yes", "on",
+            ):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass  # constructed outside async — no probe loop
+                else:
+                    from agent_obs.ha.health_checks import HealthChecker
+
+                    self._health_checker = HealthChecker()
+                    self._health_task = asyncio.create_task(
+                        self._health_checker.run_forever()
+                    )
+                    logger.info("PP38 health probes started (AGENT_OBS_HEALTH_PROBES_ENABLED)")
 
     def _start_metrics_server(self, port: int) -> None:
         """Start a Prometheus HTTP server on the given port to serve /metrics."""
@@ -1469,7 +1490,21 @@ class ObservabilitySDK:
         
         Stores as JSON with key format: embedding:{trace_id}:{span_id}
         Used only as degraded fallback when ClickHouse is unavailable.
+
+        PP38: gated by the ``redis`` circuit breaker — while Redis itself is
+        down (``failure_threshold`` consecutive failed fallbacks), skip the
+        attempt entirely and let the embeddings drop with a log line.
         """
+        from agent_obs.ha.health_checks import circuit_breaker_for
+
+        breaker = circuit_breaker_for("redis")
+        if not breaker.allow_request():
+            logger.warning(
+                "redis circuit breaker open — dropping %d embeddings "
+                "(both ClickHouse and Redis unavailable)",
+                len(batch),
+            )
+            return
         try:
             import json
 
@@ -1483,10 +1518,12 @@ class ObservabilitySDK:
                 pipe.set(key, json.dumps(embedding), ex=3600)  # TTL 1 hour
             await pipe.execute()
             await redis_client.aclose()
+            breaker.record_success()
             logger.info(
                 "Stored %d embeddings in Redis fallback", len(batch)
             )
         except Exception:
+            breaker.record_failure()
             logger.warning(
                 "Redis fallback for %d embeddings also failed; data lost",
                 len(batch),
@@ -1541,6 +1578,22 @@ class ObservabilitySDK:
             except asyncio.CancelledError:
                 pass
             self._cpu_monitor_task = None
+
+        # PP38: stop the health-probe task (fire-and-forget loop; cancel is
+        # enough — run_forever contains every exception).
+        if self._health_task is not None:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
+                pass
+            self._health_task = None
+            if self._health_checker is not None:
+                try:
+                    await self._health_checker.close()
+                except Exception:  # noqa: BLE001, S110 — best-effort teardown
+                    pass
+                self._health_checker = None
 
         # PP11: wait for pending audit tasks to complete
         await self._wait_for_audit_tasks(timeout=5.0)

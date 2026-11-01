@@ -322,6 +322,7 @@ class LangfuseExporter(BaseExporter):
         tls_cert: str | None = None,
         tls_key: str | None = None,
         pending_cap: int = 128,
+        circuit_breaker: Any | None = None,
     ) -> None:
         endpoint = (endpoint or "").strip().rstrip("/")
         if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
@@ -357,6 +358,14 @@ class LangfuseExporter(BaseExporter):
         )
         self._pending: list[list[Span]] = []
         self._pending_cap = max(1, pending_cap)
+        # PP38: circuit breaker on the Langfuse upstream. While open, export()
+        # stashes batches for flush() instead of retrying against a dead
+        # endpoint (which would burn max_retries backoff per batch).
+        if circuit_breaker is None:
+            from agent_obs.ha.health_checks import circuit_breaker_for
+
+            circuit_breaker = circuit_breaker_for("langfuse")
+        self._breaker = circuit_breaker
 
     @classmethod
     def from_env(
@@ -499,16 +508,36 @@ class LangfuseExporter(BaseExporter):
         Does not raise exceptions — all errors are logged and counted.
         If retries are exhausted the batch is stashed for a later
         :meth:`flush` and never blocks the agent.
+
+        PP38: while the ``langfuse`` circuit breaker is open the batch is
+        stashed immediately without any HTTP attempt (fire-and-forget
+        degradation — the ring buffer keeps draining, spans accumulate in
+        ``_pending`` until the dependency recovers or the cap drops them).
         """
         if not batch:
+            return
+
+        if not self._breaker.allow_request():
+            logger.debug(
+                "langfuse circuit breaker open — stashing %d spans", len(batch)
+            )
+            self._stash(batch)
             return
 
         body = json.dumps(_batch_to_otlp(batch), default=str).encode()
         outcome = await self._post_with_retries(body)
 
         if outcome.success or not outcome.retryable:
+            # A non-retryable 4xx still proves the endpoint is reachable —
+            # the breaker tracks availability, not request validity.
+            self._breaker.record_success()
             return
 
+        self._breaker.record_failure()
+        self._stash(batch)
+
+    def _stash(self, batch: list[Span]) -> None:
+        """Append a batch to the pending-delivery queue with overflow drop."""
         self._pending.append(batch)
         if len(self._pending) > self._pending_cap:
             overflowed = self._pending.pop(0)

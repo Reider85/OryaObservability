@@ -210,9 +210,19 @@ class PostgresCatalogWriter:
             updated_at = now()
     """
 
-    def __init__(self, dsn: str | None = None) -> None:
+    def __init__(self, dsn: str | None = None, circuit_breaker: Any | None = None) -> None:
         self._dsn = dsn or os.environ.get(ENV_COMPLIANCE_PG_DSN, DEFAULT_COMPLIANCE_DSN)
         self._pool: Any | None = None
+        # PP38: circuit breaker on the Postgres upstream. While open, upsert()
+        # raises CircuitOpenError before touching asyncpg — ComplianceCatalog
+        # catches it and keeps the buffer (same path as a failed flush), which
+        # is the documented graceful degradation ("Postgres down → catalog
+        # behaves like NullCatalogWriter until it recovers").
+        if circuit_breaker is None:
+            from agent_obs.ha.health_checks import circuit_breaker_for
+
+            circuit_breaker = circuit_breaker_for("pg")
+        self._breaker = circuit_breaker
 
     async def _get_pool(self) -> Any:
         if self._pool is None:
@@ -238,12 +248,23 @@ class PostgresCatalogWriter:
     async def upsert(self, rows: list[ComplianceRow]) -> None:
         if not rows:
             return
-        pool = await self._get_pool()
-        values = [
-            (r.agent_id, r.tool, r.field, r.pii_type, r.frequency) for r in rows
-        ]
-        async with pool.acquire() as conn:
-            await conn.executemany(self._UPSERT_SQL, values)
+        from agent_obs.ha.health_checks import CircuitOpenError
+
+        if not self._breaker.allow_request():
+            raise CircuitOpenError(self._breaker.dependency)
+        try:
+            pool = await self._get_pool()
+            values = [
+                (r.agent_id, r.tool, r.field, r.pii_type, r.frequency) for r in rows
+            ]
+            async with pool.acquire() as conn:
+                await conn.executemany(self._UPSERT_SQL, values)
+        except Exception:
+            # Includes asyncpg import/config errors — Postgres is unusable
+            # either way, so counting it toward the breaker is correct.
+            self._breaker.record_failure()
+            raise
+        self._breaker.record_success()
 
     async def close(self) -> None:
         if self._pool is not None:

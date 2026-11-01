@@ -205,6 +205,7 @@ class HotStore:
         send_receive_timeout: int = 30,
         pool_size: int = 10,
         hosts: list[str] | str | None = None,
+        circuit_breaker: Any | None = None,
     ) -> None:
         if hosts is not None or (host is None and os.environ.get("CLICKHOUSE_HOSTS", "").strip()):
             self._replicas = _resolve_replicas(hosts, port)
@@ -226,6 +227,14 @@ class HotStore:
         self._client_host: tuple[str, int] = self._replicas[0]
         self._dead_until: dict[int, float] = {}
         self._failover_errors = _failover_errors()
+        # PP38: per-dependency circuit breaker. Once every replica has failed
+        # ``failure_threshold`` operations in a row, further calls fail fast
+        # with CircuitOpenError instead of burning connect timeouts.
+        if circuit_breaker is None:
+            from agent_obs.ha.health_checks import circuit_breaker_for
+
+            circuit_breaker = circuit_breaker_for("ch")
+        self._breaker = circuit_breaker
 
     def _connect(self, host: str, port: int) -> Any:
         """Create a raw clickhouse-driver client for one replica."""
@@ -317,14 +326,24 @@ class HotStore:
         Each replica is tried at most once per call. If every replica fails,
         the last connection error propagates — callers see the same exception
         type they would have seen pre-PP35 from a single-host client.
+
+        PP38: the call is gated by the ``ch`` circuit breaker. While the
+        breaker is open (every replica failed ``failure_threshold``
+        operations in a row) the call raises :class:`CircuitOpenError`
+        immediately without touching any replica; the first request after
+        the recovery window is admitted as a half-open probe.
         """
+        from agent_obs.ha.health_checks import CircuitOpenError
+
+        if not self._breaker.allow_request():
+            raise CircuitOpenError(self._breaker.dependency)
         tried: set[int] = set()
         last_exc: BaseException | None = None
         for _ in range(len(self._replicas)):
             idx = self._select_replica(exclude=tried)
             tried.add(idx)
             try:
-                return fn(self._client_for(idx))
+                result = fn(self._client_for(idx))
             except self._failover_errors as exc:
                 last_exc = exc
                 host, port = self._replicas[idx]
@@ -341,7 +360,11 @@ class HotStore:
                     if remaining
                     else "no replicas left",
                 )
+                continue
+            self._breaker.record_success()
+            return result
         assert last_exc is not None  # loop always runs >= 1 iteration
+        self._breaker.record_failure()
         raise last_exc
 
     def is_available(self) -> bool:
