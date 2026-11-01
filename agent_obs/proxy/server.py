@@ -55,6 +55,10 @@ from agent_obs.observability import (
 )
 from agent_obs.proxy import ProxyConfig
 from agent_obs.proxy.obs_pipeline import ObsPipeline, Timing
+from agent_obs.proxy.shared_pipeline import SharedPipeline
+from agent_obs.proxy.security_client import SecurityClient
+from agent_obs.proxy.decision_router import DecisionRouter
+
 from agent_obs.proxy.semantic_cache import get_cache
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -150,7 +154,35 @@ class LLMProxyServer:
         # tracker's background flush cycle starts in start() (needs a loop).
         self.cost_tracker = CostAttributionTracker()
         self.budget = BudgetEnforcer(self.cost_tracker)
-        self.pipeline = ObsPipeline(config, cost_tracker=self.cost_tracker)
+        
+        # PP44: shared proxy mode detection
+        self.shared_enabled = getattr(config, 'shared_proxy_enabled', False)
+        self.shared_security_url = getattr(config, 'shared_proxy_security_url', '')
+        
+        # Initialize pipelines based on mode
+        if self.shared_enabled and self.shared_security_url:
+            # Mode B: shared obs + security proxy
+            self.security_client = SecurityClient(
+                base_url=self.shared_security_url,
+                timeout=getattr(config, 'shared_proxy_security_timeout', 0.05),
+                fail_open=getattr(config, 'shared_proxy_security_fail_open', True),
+            )
+            self.shared_pipeline = SharedPipeline(
+                security_client=self.security_client,
+                obs_pipeline=ObsPipeline(config, cost_tracker=self.cost_tracker),
+                sdk=sdk,
+            )
+            self.decision_router = DecisionRouter(
+                audit_logger=sdk._audit_trail if sdk else None,
+            )
+            self.pipeline = self.shared_pipeline  # Use shared pipeline
+        else:
+            # Mode A: observability-only proxy
+            self.pipeline = ObsPipeline(config, cost_tracker=self.cost_tracker)
+            self.security_client = None
+            self.shared_pipeline = None
+            self.decision_router = None
+        
         self._client: httpx.AsyncClient | None = None
         self._server: Any = None  # uvicorn.Server
         self._server_task: asyncio.Task | None = None
@@ -225,6 +257,14 @@ class LLMProxyServer:
             await self.cost_tracker.stop()
         except Exception:  # pragma: no cover - best-effort teardown
             logger.warning("LLM proxy cost tracker stop failed", exc_info=True)
+        
+        # PP44: close shared proxy resources
+        if self.shared_pipeline is not None:
+            try:
+                await self.shared_pipeline.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                logger.warning("Shared pipeline stop failed", exc_info=True)
+        
         if self._server is not None:
             self._server.should_exit = True
         if self._server_task is not None:
@@ -569,9 +609,14 @@ class LLMProxyServer:
             body = json.dumps(parsed).encode("utf-8")
 
         try:
-            if stream:
-                return await self._handle_streaming(request, span, body, request_id, start_time)
-            return await self._handle_non_streaming(request, span, body, request_id, start_time)
+            # PP44: shared proxy mode
+            if self.shared_enabled and self.shared_pipeline:
+                return await self._handle_shared_proxy(request, span, body, request_id, start_time)
+            else:
+                # Mode A: observability-only proxy
+                if stream:
+                    return await self._handle_streaming(request, span, body, request_id, start_time)
+                return await self._handle_non_streaming(request, span, body, request_id, start_time)
         except self._UpstreamUnavailable as e:
             # PP43: Fallback to cache or 503
             return await self._fallback_to_cache_or_503(e.reason, request_id, span)
@@ -813,3 +858,77 @@ class LLMProxyServer:
         return StreamingResponse(
             sse_aiter(), media_type=media_type, status_code=upstream_resp.status_code
         )
+
+    # PP44: Shared proxy mode handling
+    async def _handle_shared_proxy(
+        self,
+        request: Request,
+        span: Span,
+        body: bytes,
+        request_id: str,
+        start_time: float,
+    ) -> Response:
+        """Handle request through shared obs + security pipeline (PP44)."""
+        try:
+            # Process through shared pipeline
+            result = await self.shared_pipeline.process(
+                request_body=body,
+                headers=dict(request.headers),
+                trace_id=span.trace_id,
+                request_id=request_id,
+            )
+            
+            # Make final decision
+            final_decision = await self.decision_router.decide(
+                security_result=result.security_result,
+                obs_span=result.obs_span,
+                request_id=request_id,
+                trace_id=span.trace_id,
+            )
+            
+            # Update span with decision metadata
+            result.obs_span.attributes.update(final_decision.span_attributes)
+            
+            # Handle different decisions
+            if final_decision.action == "block":
+                # Block response with security details
+                span.attributes["status"] = "blocked"
+                span.attributes["security.block_reason"] = final_decision.reason
+                span.end_time = _now()
+                await self._enqueue_span(span)
+                return JSONResponse(
+                    status_code=final_decision.status_code,
+                    content=final_decision.body,
+                )
+            
+            elif final_decision.action == "flag":
+                # Forward with flag metadata
+                span.attributes["status"] = "forwarded"
+                span.attributes["security.flag"] = True
+                span.end_time = _now()
+                await self._enqueue_span(span)
+                # Forward to upstream with masked body
+                return await self._forward_to_upstream(
+                    request, result.masked_request_body, span, request_id, start_time
+                )
+            
+            else:  # forward
+                # Normal forward
+                span.attributes["status"] = "forwarded"
+                span.end_time = _now()
+                await self._enqueue_span(span)
+                # Forward to upstream with masked body
+                return await self._forward_to_upstream(
+                    request, result.masked_request_body, span, request_id, start_time
+                )
+                
+        except Exception as e:
+            logger.error("Shared proxy processing failed: %s", e)
+            span.attributes["status"] = "error"
+            span.attributes["error.type"] = "shared_proxy_error"
+            span.end_time = _now()
+            await self._enqueue_span(span)
+            return JSONResponse(
+                status_code=500,
+                content={"error": "shared proxy error", "request_id": request_id},
+            )

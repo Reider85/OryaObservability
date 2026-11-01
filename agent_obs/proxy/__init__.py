@@ -132,6 +132,12 @@ class ProxyConfig:
     log_bodies_max_bytes: int = 100_000
     cache_enabled: bool = False
     cache_ttl_seconds: float = 300.0
+    
+    # PP44: Shared proxy mode configuration
+    shared_proxy_enabled: bool = False
+    shared_proxy_security_url: str = ""
+    shared_proxy_security_timeout: float = 0.05
+    shared_proxy_security_fail_open: bool = True
 
     @classmethod
     def from_env(
@@ -275,6 +281,32 @@ class ProxyConfig:
                 ),
                 300.0,
                 name="AGENT_OBS_PROXY_CACHE_TTL_SECONDS",
+            ),
+            # PP44: Shared proxy configuration
+            shared_proxy_enabled=shared_enabled,
+            shared_proxy_security_url=str(
+                pick(
+                    "shared_proxy_security_url",
+                    "SHARED_PROXY_SECURITY_URL",
+                    "",
+                )
+            ),
+            shared_proxy_security_timeout=_parse_float(
+                pick(
+                    "shared_proxy_security_timeout",
+                    "SHARED_PROXY_SECURITY_TIMEOUT",
+                    0.05,
+                ),
+                0.05,
+                name="SHARED_PROXY_SECURITY_TIMEOUT",
+            ),
+            shared_proxy_security_fail_open=_parse_bool(
+                pick(
+                    "shared_proxy_security_fail_open",
+                    "SHARED_PROXY_SECURITY_FAIL_OPEN",
+                    True,
+                ),
+                True,
             ),
         )
 
