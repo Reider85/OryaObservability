@@ -37,6 +37,13 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from agent_obs.cost.attribution import (
+    BUDGET_APPROACHING,
+    BUDGET_EXHAUSTED,
+    BudgetEnforcer,
+    CostAttributionTracker,
+    attribution_from_headers,
+)
 from agent_obs.observability import (
     Span,
     SpanContext,
@@ -136,7 +143,11 @@ class LLMProxyServer:
     def __init__(self, config: ProxyConfig, sdk: ObservabilitySDK | None = None) -> None:
         self.config = config
         self.sdk = sdk
-        self.pipeline = ObsPipeline(config)
+        # PP42: tenant-aware cost attribution + budget enforcement. The
+        # tracker's background flush cycle starts in start() (needs a loop).
+        self.cost_tracker = CostAttributionTracker()
+        self.budget = BudgetEnforcer(self.cost_tracker)
+        self.pipeline = ObsPipeline(config, cost_tracker=self.cost_tracker)
         self._client: httpx.AsyncClient | None = None
         self._server: Any = None  # uvicorn.Server
         self._server_task: asyncio.Task | None = None
@@ -171,6 +182,8 @@ class LLMProxyServer:
         )
         self._server = uvicorn.Server(uv_config)
         self._server_task = asyncio.create_task(self._server.serve())
+        # PP42: begin the cost-attribution flush cycle alongside the server.
+        self.cost_tracker.start()
         while not self._server.started:
             if self._server_task.done():
                 # Propagate the bind/serve error.
@@ -191,6 +204,12 @@ class LLMProxyServer:
 
     async def stop(self) -> None:
         """Gracefully stop the proxy: drain in-flight requests, close the client."""
+        # PP42: stop the cost-attribution worker first so the final flush
+        # lands before the process tears down its stores.
+        try:
+            await self.cost_tracker.stop()
+        except Exception:  # pragma: no cover - best-effort teardown
+            logger.warning("LLM proxy cost tracker stop failed", exc_info=True)
         if self._server is not None:
             self._server.should_exit = True
         if self._server_task is not None:
@@ -345,6 +364,18 @@ class LLMProxyServer:
             stream=stream,
             start_time=start_time,
         )
+
+        # PP42 §3: tenant-level daily budget gate, checked before the upstream
+        # call.  Budget resolution mirrors enrich_span's attribution defaults
+        # (missing tenant header -> "default") so the gate and the rollup
+        # agree on which bucket the request belongs to.
+        attr_tenant, _attr_agent, _attr_user = attribution_from_headers(request.headers)
+        decision = self.budget.check(attr_tenant)
+        if decision != "ok":
+            return await self._reject_over_budget(
+                span, decision, attr_tenant, request_id
+            )
+
         if bool(parsed.get("stream")) and not self.config.streaming_enabled:
             # Client asked for a stream but streaming is disabled: rewrite the
             # body so the upstream answers with plain JSON, and record the
@@ -385,6 +416,60 @@ class LLMProxyServer:
                 status_code=500,
                 content={"error": "proxy internal error", "request_id": request_id},
             )
+
+    async def _reject_over_budget(
+        self,
+        span: Span,
+        decision: str,
+        tenant_id: str,
+        request_id: str,
+    ) -> Response:
+        """Answer 429/403 for a tenant over budget, recording why (PP42 §3).
+
+        The refusal still produces and exports a span (``status=blocked``)
+        so cost-denied traffic is observable, but the upstream is never
+        called.  ``approaching`` (>= 80% of the daily budget) rate-limits
+        with 429 + Retry-After; ``exhausted`` (>= 100%) refuses with 403.
+        """
+        if decision == BUDGET_EXHAUSTED:
+            status_code = 403
+            error = "budget exhausted"
+            error_type = "budget_exhausted"
+            headers = None
+        else:  # BUDGET_APPROACHING — the only other non-ok decision
+            assert decision == BUDGET_APPROACHING
+            status_code = 429
+            error = "budget approaching"
+            error_type = "budget_approaching"
+            headers = {"Retry-After": "60"}
+
+        # The refusal span mirrors enrich_span's attribution so the blocked
+        # request is queryable under the same resolved tenant bucket.
+        span.context.tenant_id = tenant_id
+        span.attributes["cost.attribution.tenant_id"] = tenant_id
+        span.attributes["status"] = "blocked"
+        span.attributes["error.type"] = error_type
+        span.attributes["cost.budget.decision"] = decision
+        span.attributes["cost.budget.tenant_id"] = tenant_id
+        span.attributes["http.response.status_code"] = status_code
+        span.end_time = _now()
+        await self._enqueue_span(span)
+        logger.info(
+            "LLM proxy budget %s for tenant=%s (request_id=%s)",
+            decision,
+            tenant_id,
+            request_id,
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "error": error,
+                "hint": error,
+                "tenant_id": tenant_id,
+                "request_id": request_id,
+            },
+            headers=headers,
+        )
 
     async def _handle_non_streaming(
         self,

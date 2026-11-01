@@ -220,5 +220,33 @@ CREATE TABLE IF NOT EXISTS user_roles (
 
 CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role);
 
+-- PP42 (T3.9.4): tenant_cost_daily — per-(tenant, agent, day) LLM cost rollup.
+-- Written by CostAttributionTracker.flush_once (hybrid: in-memory accumulator
+-- reconciled against a ClickHouse sum(cost_usd) recompute). The proxy budget
+-- checks read the in-memory view; this table is the durable reporting source
+-- for "how much did tenant X spend on agent Y on day Z" queries.
+CREATE TABLE IF NOT EXISTS tenant_cost_daily (
+    tenant_id VARCHAR(255) NOT NULL,
+    agent_id VARCHAR(255) NOT NULL,
+    day DATE NOT NULL,
+    cost_usd_total DECIMAL(15, 6) DEFAULT 0.0,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    PRIMARY KEY (tenant_id, agent_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_cost_daily_day
+    ON tenant_cost_daily(day);
+
+-- PP42 (T3.9.4): tenant_config — per-tenant overrides for the proxy budget
+-- (budget_usd_per_day). Absent row = fall back to env
+-- TENANT_BUDGET_USD_DEFAULT (default 10.0 USD/day; <= 0 disables enforcement
+-- for that tenant). BudgetEnforcer refreshes its cache from this table on
+-- every cost-attribution flush cycle.
+CREATE TABLE IF NOT EXISTS tenant_config (
+    tenant_id VARCHAR(255) PRIMARY KEY,
+    budget_usd_per_day DECIMAL(15, 6),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
 -- Table ownership/grants are handled by postgres_warm_init.sh, which the
 -- postgres entrypoint runs immediately after this file.

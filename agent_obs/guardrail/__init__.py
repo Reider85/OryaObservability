@@ -6,10 +6,11 @@ as well as prompt-injection classification via DeBERTa-v3.
 """
 
 from agent_obs.guardrail.audit import (
-    RecoveryAuditEvent,
     AuditReasonRequiredError,
     AuditWriteError,
     CanaryRollbackAuditEvent,
+    CostAttributionAuditEvent,
+    RecoveryAuditEvent,
     classify_reason_category,
 )
 from agent_obs.guardrail.engine import (
@@ -19,13 +20,12 @@ from agent_obs.guardrail.engine import (
     GuardrailEngine,
     GuardrailVerdict,
 )
-from agent_obs.guardrail.vault_client import MFARequiredError, MFAConfig
 from agent_obs.guardrail.field_masker import FieldMasker
 from agent_obs.guardrail.injection_classifier import InjectionClassifier, InjectionScore
 from agent_obs.guardrail.pii_detector import PIIDetector
-from agent_obs.guardrail.presidio_engine import PresidioPIIEngine, get_presidio_engine
 from agent_obs.guardrail.pii_types import PIIMatch
-from agent_obs.guardrail.vault_client import VaultClient
+from agent_obs.guardrail.presidio_engine import PresidioPIIEngine, get_presidio_engine
+from agent_obs.guardrail.vault_client import MFAConfig, MFARequiredError, VaultClient
 
 __all__ = [
     # PC20 Vault recovery audit
@@ -35,6 +35,8 @@ __all__ = [
     "classify_reason_category",
     # PP29 canary rollback audit
     "CanaryRollbackAuditEvent",
+    # PP42 cost-attribution audit
+    "CostAttributionAuditEvent",
     # Existing exports
     "AuditEvent",
     "GuardrailBlockException",

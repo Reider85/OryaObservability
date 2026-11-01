@@ -1394,6 +1394,30 @@ class HotStore:
         total, good = int(rows[0][0]), int(rows[0][1])
         return (good, total)
 
+    def get_tenant_cost_daily(self, start_ts: float) -> list[tuple[str, str, float]]:
+        """Aggregate per-(tenant, agent) USD cost of spans since *start_ts* (PP42).
+
+        Args:
+            start_ts: Unix timestamp lower bound (inclusive) on ``start_time``,
+                typically the start of the current UTC day.
+
+        Returns:
+            ``(tenant_id, agent_id, total_cost_usd)`` triples. Rows with an
+            empty ``tenant_id`` are excluded (unattributed SDK spans must not
+            pollute the proxy billing buckets).
+        """
+        rows = self._execute_clickhouse(
+            """
+            SELECT tenant_id, agent_id, sum(cost_usd) AS total
+            FROM spans_hot
+            WHERE start_time >= toDateTime64(%(start_ts)s, 3)
+              AND tenant_id != ''
+            GROUP BY tenant_id, agent_id
+            """,
+            {"start_ts": start_ts},
+        )
+        return [(str(r[0]), str(r[1]), float(r[2] or 0.0)) for r in rows]
+
     def create_tenant_user(self, tenant_id: str, password: str) -> None:
         """Create a ClickHouse user and row policy for a specific tenant.
         

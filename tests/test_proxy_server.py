@@ -91,6 +91,9 @@ _PROXY_ENV_VARS = [
     "AGENT_OBS_PROXY_LOG_BODIES_MAX_BYTES",
     "SHARED_PROXY_ENABLED",
     "AGENT_OBS_TENANT_ID",
+    # PP42: keep budget/flush deterministic regardless of the host shell.
+    "TENANT_BUDGET_USD_DEFAULT",
+    "AGENT_OBS_COST_FLUSH_INTERVAL",
 ]
 
 
@@ -502,8 +505,12 @@ class TestHeaderPropagation:
         assert len(span.context.trace_id) == 26
         assert span.context.trace_id != ""  # generated
         assert span.context.user_id == ""
-        assert span.context.tenant_id == ""
+        # PP42: enrichment resolves the attribution default onto the context.
+        assert span.context.tenant_id == "default"
         assert span.context.agent_id == "proxy"  # default agent id
+        assert span.attributes["cost.attribution.tenant_id"] == "default"
+        assert span.attributes["cost.attribution.agent_id"] == "unknown"
+        assert span.attributes["cost.attribution.user_id"] == "anonymous"
 
     async def test_tenant_stamped_from_context(self, proxy, sdk):
         with respx.mock:

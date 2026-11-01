@@ -554,3 +554,13 @@ circuit_breaker_failures_total = Counter(
     "Circuit-breaker-recorded operation failures per dependency",
     ["dependency"],
 )
+
+# --- PP42 tenant-aware cost attribution (T3.9.4) ------------------------------
+# Labels are bounded by deployment shape (tenant count × agent count); updated
+# once per flush cycle by CostAttributionTracker.flush_once, never per request.
+
+cost_per_tenant_usd = Gauge(
+    "cost_per_tenant_usd",
+    "Daily LLM cost per tenant and agent (USD), refreshed once per flush cycle",
+    ["tenant_id", "agent_id"],
+)

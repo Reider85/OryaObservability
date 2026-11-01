@@ -15,8 +15,11 @@ Design notes
   ``stream_options.include_usage=true`` (the proxy injects it — PP40).  The
   server keeps raw usage/finish-reason chunks past the body-size cap so this
   pipeline can always parse them.
-* ``headers`` is accepted (and ignored) for forward-compatibility: PP42 reads
-  tenant/agent attribution from it, PP44 the security verdict.
+* ``headers`` drives tenant/agent/user cost attribution (PP42): missing
+  values fall back to ``default``/``unknown``/``anonymous`` and the resolved
+  triple is stamped on the span context, the ``cost.attribution.*``
+  attributes, and reported to the :class:`CostAttributionTracker` (when
+  wired) so budget enforcement and the daily rollup see the spend.
 * Price book: lazily loaded once from ``AGENT_OBS_PRICE_BOOK_PATH`` (default
   ``price_book.yaml``); a missing/invalid book degrades to "tokens without
   cost" with a warning — matching the MVP ``llm_call`` fail-open semantics.
@@ -30,12 +33,16 @@ import logging
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_obs.content_sampling import attach_llm_content
 from agent_obs.cost import PriceBook, Usage
+from agent_obs.cost.attribution import attribution_from_headers
 from agent_obs.observability import ObservabilitySDK, Span
 from agent_obs.proxy import ProxyConfig
+
+if TYPE_CHECKING:  # pragma: no cover
+    from agent_obs.cost.attribution import CostAttributionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -214,16 +221,20 @@ class ObsPipeline:
     Stateless per request; the only cached piece is the lazily loaded price
     book.  Construct with the proxy :class:`ProxyConfig` and (optionally) an
     explicit ``price_book`` — ``None`` disables cost attribution, omission
-    triggers the lazy env-based load.
+    triggers the lazy env-based load.  An optional ``cost_tracker`` (PP42)
+    receives every attributed ``cost.usd`` so budget enforcement and the
+    daily tenant rollup stay current; without it enrichment is pure.
     """
 
     def __init__(
         self,
         config: ProxyConfig,
         price_book: PriceBook | None | object = _AUTO_PRICE_BOOK,
+        cost_tracker: CostAttributionTracker | None = None,
     ) -> None:
         self.config = config
         self._price_book = price_book
+        self.cost_tracker = cost_tracker
 
     @property
     def price_book(self) -> PriceBook | None:
@@ -240,12 +251,22 @@ class ObsPipeline:
         headers: Mapping[str, str],
         timing: Timing,
     ) -> Span:
-        """Attach request/response-derived attributes to *span* (PP41 §1).
+        """Attach request/response-derived attributes to *span* (PP41 §1, PP42 §1).
 
         Non-streaming calls pass ``response_body`` (``stream_chunks=None``);
         streaming calls pass the retained ``stream_chunks`` (``response_body``
-        is then ignored).  *headers* is reserved for PP42/PP44.
+        is then ignored).  *headers* resolves the tenant/agent/user cost
+        attribution (PP42).
         """
+        tenant_id, agent_id, user_id = attribution_from_headers(headers)
+        # PP42 §1: attribution defaults ride on the span context (SpanContext
+        # has a tenant_id field) and the explicit cost.attribution.* keys so
+        # reports can group by either.
+        span.context.tenant_id = tenant_id
+        span.attributes["cost.attribution.tenant_id"] = tenant_id
+        span.attributes["cost.attribution.agent_id"] = agent_id
+        span.attributes["cost.attribution.user_id"] = user_id
+
         req = _json_dict(request_body)
         messages = req.get("messages")
         message_list = messages if isinstance(messages, list) else []
@@ -295,6 +316,10 @@ class ObsPipeline:
             ObservabilitySDK._attach_cost_attributes(
                 span, model, usage, self.price_book if model else None
             )
+            # PP42 §1: attribute the spend to tenant+agent for budget/rollup.
+            if self.cost_tracker is not None:
+                cost_usd = float(span.attributes.get("cost.usd") or 0.0)
+                self.cost_tracker.record(tenant_id, agent_id, cost_usd)
 
         # --- bodies: log_bodies policy + content sampling (P22) -------------
         self._attach_bodies(span, input_text=input_text, output_text=output_text)

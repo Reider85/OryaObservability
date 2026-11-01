@@ -11,7 +11,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone, UTC
+from datetime import UTC, date, datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -1170,6 +1170,99 @@ class ErrorBudgetActionAuditEvent:
             reason=reason,
             action=action,
             decision=decision,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for JSON consumers (Query API)."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row matching the audit_events_hot DDL."""
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
+class CostAttributionAuditEvent:
+    """Audit event for a cost-attribution flush update (PP42, T3.9.4).
+
+    Emitted by ``CostAttributionTracker.flush_once`` once per *changed*
+    ``(tenant, agent, day)`` row so the audit trail records how the
+    ``tenant_cost_daily`` totals moved.  The row itself is self-contained:
+    tenant/agent/day/total/source ride inside ``resource`` and the 10-column
+    audit_events_hot DDL is unchanged (PC30 rule).
+    """
+
+    audit_id: str
+    timestamp: float  # Unix timestamp
+    actor: dict[str, str]
+    resource: dict[str, Any]
+    reason: str
+    action: str = "cost_attribution"
+    decision: str = "allow"
+    trace_id: str = ""  # not trace-scoped — a daily rollup spans many traces
+    ip_address: str = "127.0.0.1"
+    user_agent: str = "agent-obs/cost-attribution"
+
+    @classmethod
+    def for_cost_update(
+        cls,
+        *,
+        tenant_id: str,
+        agent_id: str,
+        day: date,
+        cost_usd_total: float,
+        source: str = "memory",
+    ) -> CostAttributionAuditEvent:
+        """Create an audit event for one aggregated cost-attribution row.
+
+        Args:
+            tenant_id: Tenant the cost is attributed to.
+            agent_id: Agent within the tenant.
+            day: UTC day of the aggregation bucket.
+            cost_usd_total: Aggregated USD total for (tenant, agent, day).
+            source: Where the total came from — ``"memory"`` (in-process
+                accumulator only) or ``"clickhouse"`` (authoritative
+                recompute won the max()).
+        """
+        reason = (
+            f"cost attribution updated: tenant={tenant_id} agent={agent_id} "
+            f"day={day.isoformat()} total={cost_usd_total:.8f} USD (source={source})"
+        )
+        return cls(
+            audit_id=f"cae-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "system", "id": "cost-attribution"},
+            resource={
+                "type": "cost_attribution",
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "day": day.isoformat(),
+                "cost_usd_total": round(float(cost_usd_total), 8),
+                "source": source,
+            },
+            reason=reason,
         )
 
     def to_dict(self) -> dict[str, Any]:

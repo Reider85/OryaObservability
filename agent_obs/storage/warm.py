@@ -577,6 +577,62 @@ class WarmStore:
             )
             return row is not None
 
+    async def upsert_tenant_cost_daily(self, rows: list[dict[str, Any]]) -> int:
+        """Upsert per-(tenant, agent, day) cost totals (PP42).
+
+        Each row needs ``tenant_id``, ``agent_id``, ``day`` (a ``date``) and
+        ``cost_usd_total``.  ``GREATEST`` keeps the larger total: the hybrid
+        flush may re-send an older snapshot after newer in-memory spend was
+        already written, and a daily rollup must never go backwards.
+        """
+        if not rows:
+            return 0
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO tenant_cost_daily
+                    (tenant_id, agent_id, day, cost_usd_total)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (tenant_id, agent_id, day)
+                DO UPDATE SET
+                    cost_usd_total = GREATEST(
+                        tenant_cost_daily.cost_usd_total,
+                        EXCLUDED.cost_usd_total
+                    ),
+                    updated_at = now()
+                """,
+                [
+                    (
+                        r["tenant_id"],
+                        r["agent_id"],
+                        r["day"],
+                        float(r["cost_usd_total"]),
+                    )
+                    for r in rows
+                ],
+            )
+        logger.debug("tenant_cost_daily upserted: rows=%d", len(rows))
+        return len(rows)
+
+    async def get_tenant_budget_overrides(self) -> dict[str, float]:
+        """Read per-tenant daily budget overrides from ``tenant_config`` (PP42).
+
+        Returns ``{tenant_id: budget_usd_per_day}`` for rows that carry an
+        explicit budget.  A missing table / connection failure propagates to
+        the caller, which falls back to the env default (fail-open config).
+        """
+        pool = await self.connect()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT tenant_id, budget_usd_per_day
+                FROM tenant_config
+                WHERE budget_usd_per_day IS NOT NULL
+                """
+            )
+        return {r["tenant_id"]: float(r["budget_usd_per_day"]) for r in rows}
+
     async def close(self) -> None:
         """Close the connection pool."""
         if self._pool is not None:
