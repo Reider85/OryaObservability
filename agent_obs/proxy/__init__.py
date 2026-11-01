@@ -125,9 +125,13 @@ class ProxyConfig:
     upstream_base_url: str = _DEFAULT_BASE_URL
     upstream_api_key_env: str = "OPENAI_API_KEY"
     request_timeout_seconds: float = 120.0
+    upstream_timeout_seconds: float = 5.0
+    stream_timeout_seconds: float = 10.0
     streaming_enabled: bool = True
     log_bodies: bool = True
     log_bodies_max_bytes: int = 100_000
+    cache_enabled: bool = False
+    cache_ttl_seconds: float = 300.0
 
     @classmethod
     def from_env(
@@ -220,6 +224,24 @@ class ProxyConfig:
                 120.0,
                 name="AGENT_OBS_PROXY_REQUEST_TIMEOUT_SECONDS",
             ),
+            upstream_timeout_seconds=_parse_float(
+                pick(
+                    "upstream_timeout_seconds",
+                    "AGENT_OBS_PROXY_UPSTREAM_TIMEOUT_SECONDS",
+                    5.0,
+                ),
+                5.0,
+                name="AGENT_OBS_PROXY_UPSTREAM_TIMEOUT_SECONDS",
+            ),
+            stream_timeout_seconds=_parse_float(
+                pick(
+                    "stream_timeout_seconds",
+                    "AGENT_OBS_PROXY_STREAM_TIMEOUT_SECONDS",
+                    10.0,
+                ),
+                10.0,
+                name="AGENT_OBS_PROXY_STREAM_TIMEOUT_SECONDS",
+            ),
             streaming_enabled=_parse_bool(
                 pick(
                     "streaming_enabled",
@@ -240,6 +262,19 @@ class ProxyConfig:
                 ),
                 100_000,
                 name="AGENT_OBS_PROXY_LOG_BODIES_MAX_BYTES",
+            ),
+            cache_enabled=_parse_bool(
+                pick("cache_enabled", "AGENT_OBS_PROXY_CACHE_ENABLED", False),
+                False,
+            ),
+            cache_ttl_seconds=_parse_float(
+                pick(
+                    "cache_ttl_seconds",
+                    "AGENT_OBS_PROXY_CACHE_TTL_SECONDS",
+                    300.0,
+                ),
+                300.0,
+                name="AGENT_OBS_PROXY_CACHE_TTL_SECONDS",
             ),
         )
 
