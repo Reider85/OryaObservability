@@ -176,9 +176,13 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_PROXY_UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | PP39: upstream base URL the proxy forwards to. |
 | `AGENT_OBS_PROXY_UPSTREAM_API_KEY_ENV` | `OPENAI_API_KEY` | PP39: name of the env var holding the real upstream key. The proxy injects it; the agent passes `api_key="dummy"`. Missing/empty when the proxy resolves to enabled → `ConfigError`. |
 | `AGENT_OBS_PROXY_REQUEST_TIMEOUT_SECONDS` | `120` | PP39: per-request upstream timeout. |
+| `AGENT_OBS_PROXY_UPSTREAM_TIMEOUT_SECONDS` | `5` | PP43: per-attempt timeout for non-streaming upstream calls (fallback to cache or 503). |
+| `AGENT_OBS_PROXY_STREAM_TIMEOUT_SECONDS` | `10` | PP43: timeout for streaming response headers phase (fallback to cache or 503). |
 | `AGENT_OBS_PROXY_STREAMING_ENABLED` | `true` | PP39: forward SSE streaming responses (PP40 uses it). |
 | `AGENT_OBS_PROXY_LOG_BODIES` | `true` | PP39: capture request/response bodies into the span (subject to content-sampling). |
 | `AGENT_OBS_PROXY_LOG_BODIES_MAX_BYTES` | `100000` | PP39: cap on body bytes stored per span. |
+| `AGENT_OBS_PROXY_CACHE_ENABLED` | `false` | PP43: enable exact-match response cache for upstream failover (preview, PP54 extends to semantic). |
+| `AGENT_OBS_PROXY_CACHE_TTL_SECONDS` | `300` | PP43: TTL for cached responses in seconds. |
 | `AGENT_OBS_PRICE_BOOK_PATH` | `price_book.yaml` | PP41: price book `ObsPipeline` lazily loads for proxy-span cost enrichment. Missing/invalid file → warning + tokens without cost (never blocks). |
 | `TENANT_BUDGET_USD_DEFAULT` | `10.0` | PP42: per-tenant daily LLM budget (USD) enforced by the proxy. ≥80% → 429 "budget approaching", ≥100% → 403 "budget exhausted". Per-tenant override in warm Postgres `tenant_config.budget_usd_per_day`. `<=0` disables enforcement. |
 | `AGENT_OBS_COST_FLUSH_INTERVAL` | `60` | PP42: seconds between cost-attribution flush cycles (ClickHouse recompute → warm `tenant_cost_daily` upsert → `cost_per_tenant_usd` gauge → audit `cost_attribution`). |
@@ -201,9 +205,15 @@ Docker Compose stack in `infra/` provides: Langfuse v3, OTel Collector, Promethe
 
 Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and `LANGFUSE_SALT` in `infra/.env`. Copy from `.env.example` and set real values before first boot.
 
+## Test suites
+
+- `tests/test_proxy_failover.py` — PP43 proxy upstream failover with timeout retry circuit breaker and cache fallback. Tests resilient forward, circuit breaker state transitions, retry policy for 429/5xx, semantic cache fallback, and audit events.
+
 ## Gotchas
 
 - **PP39/PP40: the LLM proxy.** `ObservabilitySDK.__init__` does `from agent_obs.proxy.server import LLMProxyServer` inside a `try/except ImportError` — fastapi/uvicorn live in the optional `api` extra, so a missing extra degrades to `sdk._proxy is None` (warning, never a crash). The constructor does **not** bind the port; only `await sdk.start()` / `async with sdk:` starts uvicorn (`observability.py:start`). `shutdown()` stops the proxy first. The stub contract in `tests/test_proxy_config.py` (`LLMProxyServer(config, sdk=None)` with `start()`/`stop()`) is superseded by the real module — inject a stub via `sys.modules` only if you need to avoid binding a port.
+- **PP43: proxy timeout behavior changed.** Upstream timeout now returns 503 (was 504 before PP43) with `{"error":"upstream_timeout","retry_after":30}` and `Retry-After: 30` header. The `_forward_with_retry` wrapper handles timeout logic internally; the outer `httpx.TimeoutException` catch remains as a safety net. Circuit breaker `allow_request()` both transitions AND admits — call it once per request attempt, not before. `_sleep` is injectable for tests to avoid real delays.
+- **PP43: proxy failover with cache.** When upstream is unavailable, the proxy falls back to cache (if enabled) or returns 503. The cache uses exact-match on input text with TTL. Circuit breaker opens after 5 consecutive failures and recovers after 60s. 429 errors are not retried in current implementation; 5xx errors are retried once.
 - **PP41: streaming usage lives in the final SSE chunk.** OpenAI reports `usage` only when `stream_options.include_usage=true` (PP40 injects it). The streaming handler keeps raw usage/finish-reason chunks past `log_bodies_max_bytes` (`_MAX_USAGE_CHUNK_BYTES` in `server.py`) so `ObsPipeline` can always parse them — do not "simplify" that retention away. Enrichment goes through `LLMProxyServer._enrich_span`, which swallows every exception: an enrichment bug must never turn a successful proxied call into a 500.
 - **PP42: cost attribution is hybrid — memory decides budgets, ClickHouse wins rollups.** `CostAttributionTracker.record()` (sync, from `ObsPipeline.enrich_span`) feeds the in-memory spend that `BudgetEnforcer.check()` reads synchronously at request time; the flush cycle re-asks ClickHouse for `sum(cost_usd)` and takes `max(memory, ch)` per `(tenant, agent, day)` before upserting warm `tenant_cost_daily`. `flush_once` writes audit only on *changed* rows (not every tick). Budget gate defaults are `default`/`unknown`/`anonymous` (from `attribution_from_headers`) — `extract_headers` in `server.py` still returns `""` for the raw span context, so `test_defaults_when_headers_missing` sees `context.tenant_id == "default"` only after enrichment. `TENANT_BUDGET_USD_DEFAULT<=0` disables enforcement per tenant.
 - `_atexit_handler` is defined twice in `agent_obs/observability.py` (lines 1635 and 1649) — the second silently overwrites the first.
