@@ -59,6 +59,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_circuit_breaker.py`: PP38 `CircuitBreaker` state machine — closed→open at threshold, recovery-window gate, half-open single-flight probe, env thresholds (`AGENT_OBS_CB_*`), gauge 0/1/2 encoding, registry singleton/reset, thread-safety smoke
 - `tests/test_health_checks.py`: PP38 `HealthChecker` — all 6 probes with mocked httpx/HotStore/asyncpg/redis/boto3 (vault 200/429 healthy, 501/503 not), unconfigured deps skipped by `targets()`, `dependency_health` gauges after `check_all`, one `run_forever` cycle
 - `tests/test_pp38_degradation.py`: PP38 graceful degradation per dependency — open breaker skips driver/HTTP entirely (HotStore/Vault/Langfuse/PG writer/Redis fallback), guardrail masking survives a vault outage, compliance buffer preserved on PG outage, `DependencyUnhealthy` alert + Alertmanager `component=ha` route shape
+- `tests/test_proxy_config.py`: PP39 proxy mode config — `ProxyConfig` env load for on/off/auto, §0.4 compat table (Mode A/B, `off`+shared=on raises `ConfigError`), default auto failover probe off PP38 breaker registry, SDK wiring (`_proxy` only constructed when enabled, `start()`/`shutdown()` propagate, ImportError from missing PP40 `server.py` degrades to warning)
 - `tests/conftest.py`: autouse fixture resetting the process-wide circuit-breaker registry around every test (prevents shared-breaker failure counts leaking across tests)
 
 ## Lint / typecheck
@@ -164,6 +165,17 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_HEALTH_PROBE_TIMEOUT` | `5` | PP38: per-probe timeout in seconds. |
 | `AGENT_OBS_CB_FAILURE_THRESHOLD` | `5` | PP38: consecutive operation failures before a dependency's circuit breaker opens (all 6 breakers share the setting). |
 | `AGENT_OBS_CB_RECOVERY_SECONDS` | `60` | PP38: seconds an open breaker waits before admitting a single half-open probe request. |
+| `AGENT_OBS_PROXY_MODE` | `off` | PP39: `off` (in-process SDK) / `on` (Mode A: proxy LLM traffic) / `auto` (proxy only when an SDK dependency's circuit breaker is open — failover). Invalid with `SHARED_PROXY_ENABLED=on` when `off` → `ConfigError` at SDK construction. |
+| `AGENT_OBS_PROXY_HOST` | `127.0.0.1` | PP39: proxy listen host. |
+| `AGENT_OBS_PROXY_PORT` | `8765` | PP39: proxy listen port. |
+| `AGENT_OBS_PROXY_UPSTREAM_PROVIDER` | `openai` | PP39: upstream provider — `openai` / `anthropic` / `azure_openai` / `custom`. Anything else fails fast. |
+| `AGENT_OBS_PROXY_UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | PP39: upstream base URL the proxy forwards to. |
+| `AGENT_OBS_PROXY_UPSTREAM_API_KEY_ENV` | `OPENAI_API_KEY` | PP39: name of the env var holding the real upstream key. The proxy injects it; the agent passes `api_key="dummy"`. Missing/empty when the proxy resolves to enabled → `ConfigError`. |
+| `AGENT_OBS_PROXY_REQUEST_TIMEOUT_SECONDS` | `120` | PP39: per-request upstream timeout. |
+| `AGENT_OBS_PROXY_STREAMING_ENABLED` | `true` | PP39: forward SSE streaming responses (PP40 uses it). |
+| `AGENT_OBS_PROXY_LOG_BODIES` | `true` | PP39: capture request/response bodies into the span (subject to content-sampling). |
+| `AGENT_OBS_PROXY_LOG_BODIES_MAX_BYTES` | `100000` | PP39: cap on body bytes stored per span. |
+| `SHARED_PROXY_ENABLED` | `false` | PP39/PP44: Mode B — shared obs+security proxy. Requires `AGENT_OBS_PROXY_MODE=on`; with `off` it is an invalid combination and fails fast. |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
 `AGENT_OBS_CRON_*` family (~30 vars: retention days, specs, batch sizes,
@@ -184,6 +196,7 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 
 ## Gotchas
 
+- **PP39: the LLM proxy server does not exist yet.** `ObservabilitySDK.__init__` does `from agent_obs.proxy.server import LLMProxyServer` inside a `try/except ImportError` — that module is PP40. Until it lands, `AGENT_OBS_PROXY_MODE=on` (with a valid key) resolves to `enabled=True` but logs a warning and leaves `sdk._proxy is None`. Don't assert `sdk._proxy` is non-None unless you inject a stub into `sys.modules["agent_obs.proxy.server"]` (see `tests/test_proxy_config.py::TestSDKWiring`).
 - `_atexit_handler` is defined twice in `agent_obs/observability.py` (lines 1635 and 1649) — the second silently overwrites the first.
 - `SamplerRateChangeAuditEvent.to_clickhouse_row` had a pre-existing bug (fixed in PP27): it built a merged `resource` dict with the rate numbers but serialized the unmerged `self.resource`, so the numbers never reached ClickHouse. If you see rate-related audit rows without `prev_rate`/`new_rate`, you are on a pre-PP27 ClickHouse snapshot.
 - `PilotAgent` in `pilot_agent/agent.py` (line 82) calls `compute_cost(usage, model=config.model, book=self.price_book)` with keyword `book=`, while `llm_call()` in `agent_obs/observability.py` (line 1769) uses positional `price_book=`. These are different call sites — be careful when changing the `compute_cost` signature.

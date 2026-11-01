@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, NamedTuple, Opti
 
 from agent_obs.cost.compute_cost import Usage, compute_cost
 from agent_obs.cost.price_book import PriceBook, PriceNotFoundError
+from agent_obs.proxy import load_proxy_config
 
 if TYPE_CHECKING:
     from agent_obs.guardrail.engine import GuardrailEngine, GuardrailVerdict
@@ -496,6 +497,31 @@ class ObservabilitySDK:
             rule_based_evaluator, config
         )
         self._llm_judge = self._setup_llm_judge(llm_judge, config)
+        # PP39: proxy mode (Mode A/B, §0.4).  load_proxy_config raises
+        # ConfigError on invalid combinations — fail-fast at construction.
+        # LLMProxyServer itself lands in PP40 (agent_obs/proxy/server.py);
+        # until then a missing server module degrades to a warning so the
+        # SDK stays usable in-process.
+        self._proxy_config = load_proxy_config(config)
+        self._proxy: Any | None = None
+        if self._proxy_config.enabled:
+            try:
+                from agent_obs.proxy.server import LLMProxyServer
+            except ImportError:
+                logger.warning(
+                    "AGENT_OBS_PROXY_MODE=%s resolved to enabled but "
+                    "agent_obs.proxy.server is not available yet (PP40); "
+                    "running without the proxy",
+                    self._proxy_config.mode,
+                )
+            else:
+                self._proxy = LLMProxyServer(self._proxy_config, sdk=self)
+                logger.info(
+                    "LLM proxy configured (%s:%s -> %s)",
+                    self._proxy_config.listen_host,
+                    self._proxy_config.listen_port,
+                    self._proxy_config.upstream_base_url,
+                )
         if self.enabled:
             if self._exporters:
                 self._worker_task = asyncio.create_task(self._export_worker())
@@ -1530,6 +1556,17 @@ class ObservabilitySDK:
                 exc_info=True,
             )
 
+    async def start(self) -> None:
+        """Start optional in-process components (PP39).
+
+        Currently the LLM proxy server (Mode A/B).  The export / aggregation
+        workers are started from the constructor when a running event loop
+        exists; this method only covers components that need an explicit
+        async start.
+        """
+        if self._proxy is not None:
+            await self._proxy.start()
+
     async def shutdown(self) -> None:
         """Gracefully shut down: drain buffer, flush exporters, cancel worker.
 
@@ -1537,6 +1574,14 @@ class ObservabilitySDK:
         is exceeded the worker is cancelled and a warning is logged with the
         count of undelivered spans.
         """
+        # PP39: stop the LLM proxy first so no new requests arrive while the
+        # queues drain (best-effort — teardown must not mask other errors).
+        if self._proxy is not None:
+            try:
+                await self._proxy.stop()
+            except Exception:
+                logger.warning("LLM proxy stop failed", exc_info=True)
+
         # PP09: flush any remaining buffered micro-spans before shutdown
         await self._flush_aggregation()
 
@@ -1627,6 +1672,7 @@ class ObservabilitySDK:
                 logger.warning("Exporter %s flush failed or timed out", type(exporter).__name__)
 
     async def __aenter__(self) -> "ObservabilitySDK":
+        await self.start()
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
