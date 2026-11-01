@@ -5,7 +5,6 @@ import time
 import pytest
 
 from agent_obs.observability import (
-    Event,
     InvalidSpanTypeError,
     Span,
     SpanContext,
@@ -13,7 +12,6 @@ from agent_obs.observability import (
     _now,
     _to_iso8601,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,12 +41,13 @@ class TestSpanType:
     def test_allowed_values(self):
         assert SpanType.AGENT_LOOP.value == "agent.loop"
         assert SpanType.LLM_CALL.value == "llm.call"
+        assert SpanType.LLM_PROXY_CALL.value == "llm.proxy.call"
         assert SpanType.TOOL_CALL.value == "tool.call"
         assert SpanType.AGENT_REASONING.value == "agent.reasoning"
         assert SpanType.AGENT_REASONING_COMPRESSED.value == "agent.reasoning.compressed"
 
-    def test_all_five_types_present(self):
-        assert len(SpanType) == 5
+    def test_all_six_types_present(self):
+        assert len(SpanType) == 6
 
 
 # ---------------------------------------------------------------------------

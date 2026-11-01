@@ -257,12 +257,13 @@ class TestSDKWiring:
         assert sdk._proxy.sdk is sdk
         assert sdk._proxy.config.mode == "on"
 
-    def test_degrades_when_server_module_missing(self, monkeypatch):
+    def test_degrades_when_server_module_unimportable(self, monkeypatch):
         monkeypatch.setenv("AGENT_OBS_PROXY_MODE", "on")
         _set_key(monkeypatch)
-        monkeypatch.delitem(sys.modules, "agent_obs.proxy.server", raising=False)
-        # PP40 has not landed yet: server.py does not exist -> ImportError
-        # path must degrade to _proxy=None instead of raising.
+        # A None entry in sys.modules makes `import` raise ImportError —
+        # simulates fastapi/uvicorn missing (server.py exists since PP40 but
+        # its import must still degrade to _proxy=None instead of raising).
+        monkeypatch.setitem(sys.modules, "agent_obs.proxy.server", None)
         sdk = ObservabilitySDK([])
         assert sdk._proxy is None
 

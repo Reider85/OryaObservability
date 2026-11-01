@@ -213,6 +213,7 @@ class SpanType(Enum):
 
     AGENT_LOOP = "agent.loop"
     LLM_CALL = "llm.call"
+    LLM_PROXY_CALL = "llm.proxy.call"
     TOOL_CALL = "tool.call"
     AGENT_REASONING = "agent.reasoning"
     AGENT_REASONING_COMPRESSED = "agent.reasoning.compressed"
@@ -499,8 +500,8 @@ class ObservabilitySDK:
         self._llm_judge = self._setup_llm_judge(llm_judge, config)
         # PP39: proxy mode (Mode A/B, §0.4).  load_proxy_config raises
         # ConfigError on invalid combinations — fail-fast at construction.
-        # LLMProxyServer itself lands in PP40 (agent_obs/proxy/server.py);
-        # until then a missing server module degrades to a warning so the
+        # LLMProxyServer (PP40, agent_obs/proxy/server.py) needs fastapi/uvicorn;
+        # if the api extra is missing the import degrades to a warning so the
         # SDK stays usable in-process.
         self._proxy_config = load_proxy_config(config)
         self._proxy: Any | None = None
@@ -510,7 +511,8 @@ class ObservabilitySDK:
             except ImportError:
                 logger.warning(
                     "AGENT_OBS_PROXY_MODE=%s resolved to enabled but "
-                    "agent_obs.proxy.server is not available yet (PP40); "
+                    "agent_obs.proxy.server could not be imported "
+                    "(install the api extra: pip install 'agent-obs[api]'); "
                     "running without the proxy",
                     self._proxy_config.mode,
                 )
@@ -868,7 +870,10 @@ class ObservabilitySDK:
             is_error = span.attributes.get("status") == "error"
             self._update_error_rate(span.context.agent_id, is_error)
 
-            if span.span_type == SpanType.LLM_CALL and "cost.usd" in span.attributes:
+            if (
+                span.span_type in (SpanType.LLM_CALL, SpanType.LLM_PROXY_CALL)
+                and "cost.usd" in span.attributes
+            ):
                 agent_id = span.context.agent_id
                 model = span.attributes.get("llm.model", "unknown")
                 cost_usd = span.attributes["cost.usd"]

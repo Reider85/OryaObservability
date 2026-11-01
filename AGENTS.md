@@ -55,6 +55,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_rbac_roles.py`: PP30 role model tests — 6 canonical roles in `agent_obs/rbac/roles.py`, no-overlap (identical permission sets), `RBAC.check()` fail-closed behaviour, `AGENT_OBS_RBAC_ROLES` env parsing, `PostgresRoleStore` with mocked asyncpg
 - `tests/test_policy_engine.py`: PP31 OPA policy engine — cross-tenant deny, MFA gating for `pii:recover`, Redis 60s decision cache (sha256 key), fail-closed OPA errors; includes `TestRegoPolicy` which runs `opa eval` against `infra/rbac/policies/observability.rego` and skips when the opa binary is not installed
 - `tests/test_hot_store_failover.py`: PP35 SDK failover unit tests — `CLICKHOUSE_HOSTS` parsing, failover on NetworkError with sticky active replica + 30s cooldown, all-replicas-down raise, ServerException never fails over, injected-client compatibility
+- `tests/test_proxy_server.py`: PP40 LLMProxyServer — non-streaming/streaming (SSE) proxying, `llm.proxy.call` span per request, X-OryaObs-* header propagation, 504/502/500 error mapping, log_bodies policy, real-socket uvicorn lifecycle (`_UpstreamStub` stdlib server; respx-passthrough is broken — do not use `respx.mock(assert_all_mocked=False)` for inbound socket traffic)
 - `tests/ha/test_pp35_clickhouse_replication.py`: PP35 integration — Keeper quorum survives one node loss, ReplicatedMergeTree DDL on all 4 nodes, SDK writes continue after `stop clickhouse1` (<10s) and resync after restart; requires the HA stack (Docker), auto-skips without it
 - `tests/test_circuit_breaker.py`: PP38 `CircuitBreaker` state machine — closed→open at threshold, recovery-window gate, half-open single-flight probe, env thresholds (`AGENT_OBS_CB_*`), gauge 0/1/2 encoding, registry singleton/reset, thread-safety smoke
 - `tests/test_health_checks.py`: PP38 `HealthChecker` — all 6 probes with mocked httpx/HotStore/asyncpg/redis/boto3 (vault 200/429 healthy, 501/503 not), unconfigured deps skipped by `targets()`, `dependency_health` gauges after `check_all`, one `run_forever` cycle
@@ -83,12 +84,13 @@ not mass-refactor. There is no ruff/mypy config; both run with defaults.
 - **`agent.reasoning` spans are aggregated in-process (PP09).** `_enqueue` routes them through `SpanAggregator` (buffer 50 spans / 1s window) instead of the ring buffer; flushed aggregates re-enter normal export. Aggregation is enabled by default (`AGENT_OBS_AGGREGATION_ENABLED=true`).
 - **Compliance catalog is a free side-product of masking (PC33).** `GuardrailEngine.check_input()` calls `ComplianceCatalog.record()` (sync dict increment, no I/O) for every `redacted_fields` entry. Persistence is a background `asyncio` task batching UPSERTs to Postgres `compliance_catalog` once per minute (`flush_interval`). On flush failure the buffer is kept and retried; `asyncpg` stays optional via `AGENT_OBS_COMPLIANCE_PG` (NullCatalogWriter fallback). `tool_name` for catalog rows comes from `SpanContext.tool_name`, set only in `tool_call`.
 
-## Span types (5 in MVP after PP17)
+## Span types (6 in MVP after PP40)
 
 | Type | Value |
 |---|---|
 | Root loop | `agent.loop` |
 | LLM call | `llm.call` |
+| LLM proxy call | `llm.proxy.call` (PP40: emitted by `LLMProxyServer` for every proxied request) |
 | Tool call | `tool.call` |
 | Reasoning micro-span | `agent.reasoning` (PP09: routed through SpanAggregator when aggregation is enabled) |
 | Compressed reasoning | `agent.reasoning.compressed` (PP17: tree compression summary nodes, tree-only, never exported) |
@@ -196,7 +198,7 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 
 ## Gotchas
 
-- **PP39: the LLM proxy server does not exist yet.** `ObservabilitySDK.__init__` does `from agent_obs.proxy.server import LLMProxyServer` inside a `try/except ImportError` — that module is PP40. Until it lands, `AGENT_OBS_PROXY_MODE=on` (with a valid key) resolves to `enabled=True` but logs a warning and leaves `sdk._proxy is None`. Don't assert `sdk._proxy` is non-None unless you inject a stub into `sys.modules["agent_obs.proxy.server"]` (see `tests/test_proxy_config.py::TestSDKWiring`).
+- **PP39/PP40: the LLM proxy.** `ObservabilitySDK.__init__` does `from agent_obs.proxy.server import LLMProxyServer` inside a `try/except ImportError` — fastapi/uvicorn live in the optional `api` extra, so a missing extra degrades to `sdk._proxy is None` (warning, never a crash). The constructor does **not** bind the port; only `await sdk.start()` / `async with sdk:` starts uvicorn (`observability.py:start`). `shutdown()` stops the proxy first. The stub contract in `tests/test_proxy_config.py` (`LLMProxyServer(config, sdk=None)` with `start()`/`stop()`) is superseded by the real module — inject a stub via `sys.modules` only if you need to avoid binding a port.
 - `_atexit_handler` is defined twice in `agent_obs/observability.py` (lines 1635 and 1649) — the second silently overwrites the first.
 - `SamplerRateChangeAuditEvent.to_clickhouse_row` had a pre-existing bug (fixed in PP27): it built a merged `resource` dict with the rate numbers but serialized the unmerged `self.resource`, so the numbers never reached ClickHouse. If you see rate-related audit rows without `prev_rate`/`new_rate`, you are on a pre-PP27 ClickHouse snapshot.
 - `PilotAgent` in `pilot_agent/agent.py` (line 82) calls `compute_cost(usage, model=config.model, book=self.price_book)` with keyword `book=`, while `llm_call()` in `agent_obs/observability.py` (line 1769) uses positional `price_book=`. These are different call sites — be careful when changing the `compute_cost` signature.
