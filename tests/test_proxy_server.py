@@ -86,14 +86,15 @@ _PROXY_ENV_VARS = [
     "AGENT_OBS_PROXY_UPSTREAM_BASE_URL",
     "AGENT_OBS_PROXY_UPSTREAM_API_KEY_ENV",
     "AGENT_OBS_PROXY_REQUEST_TIMEOUT_SECONDS",
+    "AGENT_OBS_PROXY_UPSTREAM_TIMEOUT_SECONDS",
+    "AGENT_OBS_PROXY_STREAM_TIMEOUT_SECONDS",
     "AGENT_OBS_PROXY_STREAMING_ENABLED",
     "AGENT_OBS_PROXY_LOG_BODIES",
     "AGENT_OBS_PROXY_LOG_BODIES_MAX_BYTES",
+    "AGENT_OBS_PROXY_CACHE_ENABLED",
+    "AGENT_OBS_PROXY_CACHE_TTL_SECONDS",
     "SHARED_PROXY_ENABLED",
-    "AGENT_OBS_TENANT_ID",
-    # PP42: keep budget/flush deterministic regardless of the host shell.
-    "TENANT_BUDGET_USD_DEFAULT",
-    "AGENT_OBS_COST_FLUSH_INTERVAL",
+    "OPENAI_API_KEY",
 ]
 
 
@@ -385,16 +386,16 @@ class TestStreaming:
 
 
 class TestErrors:
-    async def test_upstream_timeout_returns_504(self, proxy, sdk):
+    async def test_upstream_timeout_returns_503(self, proxy, sdk):
         with respx.mock:
             respx.post(UPSTREAM).mock(side_effect=httpx.TimeoutException("boom"))
             async with client_for(proxy) as client:
                 resp = await client.post(
                     "/llm/v1/chat/completions", json=chat_body()
                 )
-        assert resp.status_code == 504
+        assert resp.status_code == 503
         body = resp.json()
-        assert body["error"] == "upstream timeout"
+        assert body["error"] == "upstream_timeout"
         assert body["request_id"]
 
         span = proxy_spans(sdk)[0]
@@ -410,7 +411,7 @@ class TestErrors:
                 resp = await client.post(
                     "/llm/v1/chat/completions", json=chat_body()
                 )
-        assert resp.status_code == 502
+        assert resp.status_code == 503
 
         span = proxy_spans(sdk)[0]
         assert span.attributes["status"] == "error"
@@ -420,7 +421,7 @@ class TestErrors:
         async def boom(*args, **kwargs):
             raise RuntimeError("kaboom")
 
-        monkeypatch.setattr(proxy, "forward_to_upstream", boom)
+        monkeypatch.setattr(proxy, "_forward_with_retry", boom)
         async with client_for(proxy) as client:
             resp = await client.post(
                 "/llm/v1/chat/completions", json=chat_body()

@@ -555,6 +555,14 @@ circuit_breaker_failures_total = Counter(
     ["dependency"],
 )
 
+# --- PP43 proxy upstream failover (T3.9.5) ------------------------------------
+# Bounded label set: timeout|429|5xx|circuit_open
+proxy_upstream_failures_total = Counter(
+    "proxy_upstream_failures_total",
+    "Upstream operation failures in proxy mode by reason",
+    ["reason"],
+)
+
 # --- PP42 tenant-aware cost attribution (T3.9.4) ------------------------------
 # Labels are bounded by deployment shape (tenant count × agent count); updated
 # once per flush cycle by CostAttributionTracker.flush_once, never per request.

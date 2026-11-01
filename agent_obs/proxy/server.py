@@ -44,6 +44,8 @@ from agent_obs.cost.attribution import (
     CostAttributionTracker,
     attribution_from_headers,
 )
+from agent_obs.guardrail.audit import ProxyFallbackAuditEvent
+from agent_obs.ha.health_checks import CircuitBreaker
 from agent_obs.observability import (
     Span,
     SpanContext,
@@ -53,6 +55,7 @@ from agent_obs.observability import (
 )
 from agent_obs.proxy import ProxyConfig
 from agent_obs.proxy.obs_pipeline import ObsPipeline, Timing
+from agent_obs.proxy.semantic_cache import get_cache
 
 if TYPE_CHECKING:  # pragma: no cover
     from agent_obs.observability import ObservabilitySDK
@@ -152,12 +155,24 @@ class LLMProxyServer:
         self._server: Any = None  # uvicorn.Server
         self._server_task: asyncio.Task | None = None
 
+        # PP43: upstream failover
+        self.upstream_breaker = CircuitBreaker("llm_upstream")
+        self.cache = get_cache(config)
+        # For testability: allow sleep injection to avoid real delays
+        self._sleep = asyncio.sleep
+
         self.app = FastAPI(title="OryaObservability LLM Proxy")
         self.app.add_api_route(
             "/llm/v1/chat/completions",
             self.chat_completions,
             methods=["POST"],
         )
+
+    # Sentinel for upstream unavailable
+    class _UpstreamUnavailable(Exception):
+        def __init__(self, reason: str):
+            self.reason = reason
+            super().__init__(f"Upstream unavailable: {reason}")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -343,6 +358,175 @@ class LLMProxyServer:
             logger.warning("Failed to enqueue proxy span", exc_info=True)
 
     # ------------------------------------------------------------------
+    # PP43: Failover and retry helpers
+    # ------------------------------------------------------------------
+
+    def _record_failure(self, reason: str, request_id: str, upstream_url: str) -> None:
+        """Record a failure to the circuit breaker and emit audit/metric."""
+        self.upstream_breaker.record_failure()
+        from agent_obs.metrics import proxy_upstream_failures_total
+        proxy_upstream_failures_total.labels(reason=reason).inc()
+        
+        # Emit audit event
+        try:
+            event = ProxyFallbackAuditEvent.for_fallback(
+                request_id=request_id,
+                upstream_url=upstream_url,
+                reason=reason,
+                fallback_type=reason,
+            )
+            if self.sdk is not None:
+                hot = self.sdk._resolve_hot_store()
+                if hot is not None:
+                    hot.write_audit_event(event)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to write proxy fallback audit event", exc_info=True)
+
+    async def _forward_with_retry(
+        self,
+        body: bytes,
+        headers: Mapping[str, str],
+        request_id: str,
+        *,
+        stream: bool = False,
+    ) -> tuple[httpx.Response, list[bytes]]:
+        """Forward to upstream with PP43 retry/circuit breaker logic.
+        
+        Returns: (upstream_response, stream_chunks) or raises _UpstreamUnavailable.
+        """
+        upstream_url = f"{self.config.upstream_base_url.rstrip('/')}/chat/completions"
+        timeout = self.config.stream_timeout_seconds if stream else self.config.upstream_timeout_seconds
+        
+        # Check circuit breaker before first attempt
+        if not self.upstream_breaker.allow_request():
+            self._record_failure("circuit_open", request_id, upstream_url)
+            raise self._UpstreamUnavailable("circuit_open")
+        
+        # Retry loop for 429 and 5xx
+        attempt = 0
+        max_attempts = 4  # 1 initial + 3 retries for 429
+        while attempt < max_attempts:
+            try:
+                # Apply timeout per attempt
+                client = self._get_client()
+                fwd = forward_headers(headers)
+                fwd.update(self._upstream_auth_headers())
+                fwd["X-Request-Id"] = request_id
+                
+                if stream:
+                    # For streaming, timeout applies to getting response headers
+                    upstream_req = client.build_request(
+                        "POST", "/chat/completions", headers=fwd, content=body
+                    )
+                    # Note: httpx.AsyncClient.send() doesn't support timeout parameter
+                    upstream_resp = await client.send(upstream_req, stream=True)
+                    # For streaming, return the response and empty chunks (streaming handles it)
+                    return upstream_resp, []
+                else:
+                    # For non-streaming, apply timeout to the full request
+                    upstream_resp = await client.post(
+                        "/chat/completions", headers=fwd, content=body, timeout=timeout
+                    )
+                    return upstream_resp, []
+                    
+            except httpx.TimeoutException:
+                reason = "timeout"
+                self._record_failure(reason, request_id, upstream_url)
+                if attempt == max_attempts - 1:
+                    raise self._UpstreamUnavailable(reason)
+                # No retry on timeout - go to fallback immediately
+                raise self._UpstreamUnavailable(reason)
+                
+            except httpx.TransportError:
+                reason = "connection"
+                self._record_failure(reason, request_id, upstream_url)
+                if attempt == max_attempts - 1:
+                    raise self._UpstreamUnavailable(reason)
+                # No retry on connection error - go to fallback immediately
+                raise self._UpstreamUnavailable(reason)
+            
+            # Handle upstream responses
+            if upstream_resp.status_code == 429:
+                reason = "429"
+                self._record_failure(reason, request_id, upstream_url)
+                if attempt < max_attempts - 1:  # Retry 429
+                    delay = 1.0 * (2 ** attempt)  # 1s, 2s, 4s
+                    await self._sleep(delay)
+                    attempt += 1
+                    continue
+                # Last attempt: return the 429 as-is
+                return upstream_resp, []
+                
+            elif 500 <= upstream_resp.status_code < 600:
+                reason = "5xx"
+                self._record_failure(reason, request_id, upstream_url)
+                if attempt == 0:  # Retry 5xx once
+                    attempt += 1
+                    continue
+                # Second 5xx: return as-is
+                return upstream_resp, []
+                
+            else:
+                # Success or other 4xx: return immediately
+                if upstream_resp.status_code < 400:
+                    self.upstream_breaker.record_success()
+                return upstream_resp, []
+
+    async def _fallback_to_cache_or_503(self, reason: str, request_id: str, span: Span) -> Response:
+        """Handle fallback: cache lookup or 503 response."""
+        upstream_url = f"{self.config.upstream_base_url.rstrip('/')}/chat/completions"
+        
+        # Try cache first if enabled
+        if self.cache is not None:
+            cached = self.cache.get(span.attributes.get("llm.input_text", "").encode("utf-8"))
+            if cached is not None:
+                # Cache hit: return cached response
+                span.attributes["cache.hit"] = True
+                span.attributes["status"] = "ok"
+                span.end_time = _now()
+                await self._enqueue_span(span)
+                
+                from fastapi.responses import Response
+                return Response(
+                    content=cached.payload,
+                    media_type=cached.media_type,
+                    headers={"X-OryaObs-Cache-Hit": "true"}
+                )
+        
+        # Cache miss or no cache: return 503
+        span.attributes["status"] = "error"
+        span.attributes["error.type"] = _UPSTREAM_CONNECTION if reason == "connection" else f"upstream_{reason}"
+        span.attributes["http.response.status_code"] = 503
+        span.end_time = _now()
+        await self._enqueue_span(span)
+        
+        # Emit audit event
+        try:
+            event = ProxyFallbackAuditEvent.for_fallback(
+                request_id=request_id,
+                upstream_url=upstream_url,
+                reason=reason,
+                fallback_type=reason,
+                status_code=503,
+            )
+            if self.sdk is not None:
+                hot = self.sdk._resolve_hot_store()
+                if hot is not None:
+                    hot.write_audit_event(event)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to write proxy fallback audit event", exc_info=True)
+        
+        from fastapi.responses import JSONResponse
+        retry_after = 30
+        return JSONResponse(
+            {"error": "upstream_timeout" if reason == "timeout" else "upstream_unavailable",
+             "retry_after": retry_after,
+             "request_id": request_id},
+            status_code=503,
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    # ------------------------------------------------------------------
     # Endpoint
     # ------------------------------------------------------------------
 
@@ -388,23 +572,28 @@ class LLMProxyServer:
             if stream:
                 return await self._handle_streaming(request, span, body, request_id, start_time)
             return await self._handle_non_streaming(request, span, body, request_id, start_time)
+        except self._UpstreamUnavailable as e:
+            # PP43: Fallback to cache or 503
+            return await self._fallback_to_cache_or_503(e.reason, request_id, span)
         except httpx.TimeoutException:
+            # PP43: Timeout now handled in _forward_with_retry, this is safety net
             span.attributes["status"] = "error"
             span.attributes["error.type"] = _UPSTREAM_TIMEOUT
             span.end_time = _now()
             await self._enqueue_span(span)
             return JSONResponse(
-                status_code=504,
-                content={"error": "upstream timeout", "request_id": request_id},
+                status_code=503,
+                content={"error": "upstream_timeout", "request_id": request_id},
             )
         except httpx.TransportError:
+            # PP43: Connection errors now handled in _forward_with_retry, this is safety net
             span.attributes["status"] = "error"
             span.attributes["error.type"] = _UPSTREAM_CONNECTION
             span.end_time = _now()
             await self._enqueue_span(span)
             return JSONResponse(
-                status_code=502,
-                content={"error": "upstream connection error", "request_id": request_id},
+                status_code=503,
+                content={"error": "upstream_connection_error", "request_id": request_id},
             )
         except Exception:
             logger.exception("LLM proxy internal error (request_id=%s)", request_id)
@@ -479,8 +668,13 @@ class LLMProxyServer:
         request_id: str,
         start_time: float,
     ) -> Response:
-        t_upstream_started = _now()
-        upstream = await self.forward_to_upstream(body, request.headers, request_id)
+        # PP43: Use resilient forward with retry/circuit breaker logic
+        try:
+            upstream, _ = await self._forward_with_retry(body, request.headers, request_id, stream=False)
+        except self._UpstreamUnavailable as e:
+            # Fallback to cache or 503 - need to await the async method
+            fallback_response = await self._fallback_to_cache_or_503(e.reason, request_id, span)
+            return fallback_response
         t_upstream_completed = _now()
 
         span.attributes["http.response.status_code"] = upstream.status_code
@@ -497,7 +691,7 @@ class LLMProxyServer:
             headers=request.headers,
             timing=Timing(
                 t_request_received=start_time,
-                t_upstream_started=t_upstream_started,
+                t_upstream_started=start_time,  # Approximate since we don't track start of forward
                 t_upstream_completed=t_upstream_completed,
             ),
         )
@@ -543,14 +737,14 @@ class LLMProxyServer:
         usage_bytes = 0
         t_first_token: float | None = None
 
-        upstream_req = client.build_request(
-            "POST", "/chat/completions", headers=fwd, content=body
-        )
-        # Open the upstream stream eagerly so the response status/content-type
-        # are known before the client response is constructed; body chunks are
-        # still relayed lazily by sse_aiter.
-        t_upstream_started = _now()
-        upstream_resp = await client.send(upstream_req, stream=True)
+        # PP43: Use resilient forward with retry/circuit breaker logic for headers phase
+        try:
+            upstream_resp, _ = await self._forward_with_retry(body, request.headers, request_id, stream=True)
+            t_upstream_started = _now()
+        except self._UpstreamUnavailable as e:
+            # Fallback to cache or 503 - need to await the async method
+            fallback_response = await self._fallback_to_cache_or_503(e.reason, request_id, span)
+            return fallback_response
         span.attributes["http.response.status_code"] = upstream_resp.status_code
         if upstream_resp.status_code >= 400:
             span.attributes["status"] = "error"

@@ -1297,6 +1297,81 @@ class CostAttributionAuditEvent:
 
 
 @dataclass
+class ProxyFallbackAuditEvent:
+    """Audit event for proxy upstream failover (PP43, T3.9.5).
+
+    Recorded when proxy mode fails over to cache or 503 due to upstream
+    timeout, rate limiting, circuit breaker, or connection issues.
+    """
+
+    audit_id: str
+    timestamp: float
+    actor: dict[str, str]
+    resource: dict[str, Any]
+    reason: str
+    action: str = "proxy_fallback"
+    decision: str = "degraded"
+    trace_id: str = ""
+    ip_address: str = "127.0.0.1"
+    user_agent: str = "agent-obs/proxy"
+
+    @classmethod
+    def for_fallback(
+        cls,
+        *,
+        request_id: str,
+        upstream_url: str,
+        reason: str,
+        fallback_type: str = "timeout",
+        status_code: int = 503,
+    ) -> ProxyFallbackAuditEvent:
+        """Create an audit event for a proxy failover."""
+        return cls(
+            audit_id=f"pfa-{uuid.uuid4().hex[:12]}",
+            timestamp=time.time(),
+            actor={"type": "proxy", "id": "llm-proxy"},
+            resource={
+                "type": "proxy_fallback",
+                "request_id": request_id,
+                "upstream_url": upstream_url,
+                "fallback_type": fallback_type,
+                "status_code": status_code,
+            },
+            reason=f"proxy fallback: {reason}",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for JSON consumers (Query API)."""
+        return {
+            "audit_id": self.audit_id,
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "action": self.action,
+            "resource": self.resource,
+            "reason": self.reason,
+            "decision": self.decision,
+            "ip_address": self.ip_address,
+            "user_agent": self.user_agent,
+        }
+
+    def to_clickhouse_row(self) -> tuple:
+        """Convert to ClickHouse INSERT row matching the audit_events_hot DDL."""
+        return (
+            self.audit_id,
+            datetime.fromtimestamp(self.timestamp, tz=UTC),
+            self.trace_id,
+            json.dumps(self.actor),
+            self.action,
+            self.decision,
+            json.dumps(self.resource),
+            self.reason,
+            self.ip_address,
+            self.user_agent,
+        )
+
+
+@dataclass
 class CanaryRollbackAuditEvent:
     """Audit event for an SLO-gated canary rollback (PP29, T3.6.5).
 
