@@ -61,6 +61,7 @@ installed** — `--timeout=N` fails with "unrecognized arguments".
 - `tests/test_health_checks.py`: PP38 `HealthChecker` — all 6 probes with mocked httpx/HotStore/asyncpg/redis/boto3 (vault 200/429 healthy, 501/503 not), unconfigured deps skipped by `targets()`, `dependency_health` gauges after `check_all`, one `run_forever` cycle
 - `tests/test_pp38_degradation.py`: PP38 graceful degradation per dependency — open breaker skips driver/HTTP entirely (HotStore/Vault/Langfuse/PG writer/Redis fallback), guardrail masking survives a vault outage, compliance buffer preserved on PG outage, `DependencyUnhealthy` alert + Alertmanager `component=ha` route shape
 - `tests/test_proxy_config.py`: PP39 proxy mode config — `ProxyConfig` env load for on/off/auto, §0.4 compat table (Mode A/B, `off`+shared=on raises `ConfigError`), default auto failover probe off PP38 breaker registry, SDK wiring (`_proxy` only constructed when enabled, `start()`/`shutdown()` propagate, ImportError from missing PP40 `server.py` degrades to warning)
+- `tests/test_obs_pipeline.py`: PP41 `ObsPipeline` span enrichment — `Timing` (ttft/latency, non-streaming `ttft_ms=0`), SSE parsing (`parse_sse_chunk`/`iter_sse_json`, events split across chunks), request/response attribute extraction (model/temperature/messages/finish_reason), streaming usage aggregation from the final chunk, cost via `compute_cost` with injected price book (unknown model / `price_book=None` → tokens without cost), content-sampling (rate 0/100, `log_bodies=false`, truncation)
 - `tests/conftest.py`: autouse fixture resetting the process-wide circuit-breaker registry around every test (prevents shared-breaker failure counts leaking across tests)
 
 ## Lint / typecheck
@@ -177,6 +178,7 @@ Level-2 types (`tool.input`, `llm.output`, etc.) are placeholders — do not use
 | `AGENT_OBS_PROXY_STREAMING_ENABLED` | `true` | PP39: forward SSE streaming responses (PP40 uses it). |
 | `AGENT_OBS_PROXY_LOG_BODIES` | `true` | PP39: capture request/response bodies into the span (subject to content-sampling). |
 | `AGENT_OBS_PROXY_LOG_BODIES_MAX_BYTES` | `100000` | PP39: cap on body bytes stored per span. |
+| `AGENT_OBS_PRICE_BOOK_PATH` | `price_book.yaml` | PP41: price book `ObsPipeline` lazily loads for proxy-span cost enrichment. Missing/invalid file → warning + tokens without cost (never blocks). |
 | `SHARED_PROXY_ENABLED` | `false` | PP39/PP44: Mode B — shared obs+security proxy. Requires `AGENT_OBS_PROXY_MODE=on`; with `off` it is an invalid combination and fails fast. |
 
 Full list: grep `AGENT_OBS_` under `agent_obs/` and `scripts/`. The
@@ -199,6 +201,7 @@ Langfuse v3 requires `CLICKHOUSE_URL`, `ENCRYPTION_KEY`, `NEXTAUTH_SECRET`, and 
 ## Gotchas
 
 - **PP39/PP40: the LLM proxy.** `ObservabilitySDK.__init__` does `from agent_obs.proxy.server import LLMProxyServer` inside a `try/except ImportError` — fastapi/uvicorn live in the optional `api` extra, so a missing extra degrades to `sdk._proxy is None` (warning, never a crash). The constructor does **not** bind the port; only `await sdk.start()` / `async with sdk:` starts uvicorn (`observability.py:start`). `shutdown()` stops the proxy first. The stub contract in `tests/test_proxy_config.py` (`LLMProxyServer(config, sdk=None)` with `start()`/`stop()`) is superseded by the real module — inject a stub via `sys.modules` only if you need to avoid binding a port.
+- **PP41: streaming usage lives in the final SSE chunk.** OpenAI reports `usage` only when `stream_options.include_usage=true` (PP40 injects it). The streaming handler keeps raw usage/finish-reason chunks past `log_bodies_max_bytes` (`_MAX_USAGE_CHUNK_BYTES` in `server.py`) so `ObsPipeline` can always parse them — do not "simplify" that retention away. Enrichment goes through `LLMProxyServer._enrich_span`, which swallows every exception: an enrichment bug must never turn a successful proxied call into a 500.
 - `_atexit_handler` is defined twice in `agent_obs/observability.py` (lines 1635 and 1649) — the second silently overwrites the first.
 - `SamplerRateChangeAuditEvent.to_clickhouse_row` had a pre-existing bug (fixed in PP27): it built a merged `resource` dict with the rate numbers but serialized the unmerged `self.resource`, so the numbers never reached ClickHouse. If you see rate-related audit rows without `prev_rate`/`new_rate`, you are on a pre-PP27 ClickHouse snapshot.
 - `PilotAgent` in `pilot_agent/agent.py` (line 82) calls `compute_cost(usage, model=config.model, book=self.price_book)` with keyword `book=`, while `llm_call()` in `agent_obs/observability.py` (line 1769) uses positional `price_book=`. These are different call sites — be careful when changing the `compute_cost` signature.

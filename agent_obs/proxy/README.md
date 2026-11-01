@@ -1,10 +1,11 @@
-# agent_obs.proxy — LLM-proxy observability mode (PP39 + PP40)
+# agent_obs.proxy — LLM-proxy observability mode (PP39 + PP40 + PP41)
 
 Level-3 mode (PRODUCTION-PROMPTS §0.4): the SDK runs an in-process HTTP proxy
 in front of the LLM provider, so agents you do not instrument directly still
 produce `llm.proxy.call` spans and cost attributes. PP39 ships the
 configuration layer (`ProxyConfig`); PP40 ships the FastAPI server
-(`agent_obs/proxy/server.py`).
+(`agent_obs/proxy/server.py`); PP41 ships the span enrichment pipeline
+(`agent_obs/proxy/obs_pipeline.py`).
 
 ## Modes
 
@@ -79,6 +80,30 @@ The client may pass observability context as headers; they land on the
 
 `Authorization` is **never** forwarded — the proxy replaces it with the
 upstream key. Hop-by-hop headers are stripped.
+
+## Span enrichment (PP41)
+
+Every proxied request goes through `ObsPipeline.enrich_span`
+(`agent_obs/proxy/obs_pipeline.py`), which extracts:
+
+| Attribute | Source |
+|---|---|
+| `llm.model`, `llm.temperature`, `llm.input_messages_count` | request JSON |
+| `tokens.input/output/cached`, `cost.usd`, `cost.price_book_version` | response `usage` + price book (`compute_cost`) |
+| `llm.finish_reason`, `llm.output_messages_count` | response `choices[0]` / final SSE chunk |
+| `llm.ttft_ms` | streaming: first chunk minus upstream start (`0.0` when non-streaming) |
+| `llm.latency_ms` | upstream completion minus request receipt |
+| `llm.input_text` / `llm.output_text` (or sha256 + chars) | bodies per `log_bodies` + content sampling |
+
+Cost needs a price book: lazily loaded once from `AGENT_OBS_PRICE_BOOK_PATH`
+(default `price_book.yaml`). A missing/invalid book degrades to tokens without
+cost attributes (warning, never a failure) — matching `sdk.llm_call` semantics.
+
+Streaming: OpenAI reports `usage` only in the final SSE chunk when
+`stream_options.include_usage=true` (the proxy injects this). Usage/finish
+chunks are retained separately from the body-size cap so enrichment can always
+parse them. Enrichment failures are swallowed — they never fail a proxied
+request.
 
 ## Error handling
 

@@ -11,13 +11,15 @@ Design notes
 * FastAPI / uvicorn are an *optional* dependency (``pip install "agent-obs[api]"``).
   The SDK imports this module lazily inside a ``try/except ImportError``
   (``ObservabilitySDK.__init__``), so a missing extra degrades to a warning.
-* Bodies are stored on the span under ``llm.input_text`` / ``llm.output_text``
-  so the in-process guardrail masks PII before anything leaves the process
-  (architectural anti-pattern §8.3), and content sampling
-  (``attach_llm_content``) applies the ``AGENT_OBS_CONTENT_RATE`` policy.
+* Bodies, tokens, cost and streaming timing are extracted by ``ObsPipeline``
+  (PP41, ``agent_obs/proxy/obs_pipeline.py``): bodies are stored on the span
+  under ``llm.input_text`` / ``llm.output_text`` so the in-process guardrail
+  masks PII before anything leaves the process (architectural anti-pattern
+  §8.3), and content sampling (``attach_llm_content``) applies the
+  ``AGENT_OBS_CONTENT_RATE`` policy.  Enrichment failures are swallowed by
+  ``_enrich_span`` — they can never fail a proxied request.
 * ``forward_to_upstream`` / ``build_proxy_span`` are separate functions so
-  PP41 (ObsPipeline enrichment) and PP43 (failover/retries) can slot in
-  without rewriting ``chat_completions``.
+  PP43 (failover/retries) can slot in without rewriting ``chat_completions``.
 * mTLS (``AGENT_OBS_PROXY_TLS``) is not yet in ``ProxyConfig`` — out of scope
   for PP40.
 """
@@ -25,7 +27,6 @@ Design notes
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -36,7 +37,6 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from agent_obs.content_sampling import attach_llm_content
 from agent_obs.observability import (
     Span,
     SpanContext,
@@ -45,6 +45,7 @@ from agent_obs.observability import (
     _now,
 )
 from agent_obs.proxy import ProxyConfig
+from agent_obs.proxy.obs_pipeline import ObsPipeline, Timing
 
 if TYPE_CHECKING:  # pragma: no cover
     from agent_obs.observability import ObservabilitySDK
@@ -74,9 +75,19 @@ _HOP_BY_HOP = frozenset(
 # span memory (events beyond the cap are still counted in llm.stream_chunks).
 _MAX_STREAM_EVENTS = 1000
 
+# Raw SSE chunks carrying usage / finish_reason are retained separately from
+# the body-cap buffer so PP41 enrichment can always parse them — the final
+# usage chunk may arrive after ``log_bodies_max_bytes`` was already reached.
+_MAX_USAGE_CHUNK_BYTES = 64 * 1024
+
 _UPSTREAM_TIMEOUT = "upstream_timeout"
 _UPSTREAM_CONNECTION = "upstream_connection_error"
 _PROXY_INTERNAL = "proxy_internal_error"
+
+
+def _is_usage_chunk(chunk: bytes) -> bool:
+    """True if an SSE chunk carries the fields PP41 must parse."""
+    return b'"usage"' in chunk or b'"finish_reason"' in chunk
 
 
 def extract_headers(headers: Mapping[str, str]) -> tuple[str, str, str, str]:
@@ -104,10 +115,6 @@ def forward_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _parse_body(raw: bytes) -> dict[str, Any]:
     """Best-effort JSON parse of the request body (invalid JSON → {})."""
     try:
@@ -129,6 +136,7 @@ class LLMProxyServer:
     def __init__(self, config: ProxyConfig, sdk: ObservabilitySDK | None = None) -> None:
         self.config = config
         self.sdk = sdk
+        self.pipeline = ObsPipeline(config)
         self._client: httpx.AsyncClient | None = None
         self._server: Any = None  # uvicorn.Server
         self._server_task: asyncio.Task | None = None
@@ -244,42 +252,32 @@ class LLMProxyServer:
     # Span building
     # ------------------------------------------------------------------
 
-    def _body_attrs(self, span: Span, *, input_text: str | None, output_text: str | None) -> None:
-        """Attach request/response bodies to the span per the log_bodies policy.
-
-        ``log_bodies=False`` → sha256 + char count only (never plaintext).
-        Bodies above ``log_bodies_max_bytes`` are truncated before storage.
-        Full-text storage goes through ``attach_llm_content`` so the
-        ``AGENT_OBS_CONTENT_RATE`` sampling policy applies.
-        """
-        cfg = self.config
-
-        def cap(text: str) -> tuple[str, bool]:
-            raw = text.encode("utf-8", errors="replace")
-            if len(raw) <= cfg.log_bodies_max_bytes:
-                return text, False
-            return raw[: cfg.log_bodies_max_bytes].decode("utf-8", errors="replace"), True
-
-        if not cfg.log_bodies:
-            if input_text is not None:
-                span.attributes["llm.input_sha256"] = _sha256(input_text)
-                span.attributes["llm.input_chars"] = len(input_text)
-            if output_text is not None:
-                span.attributes["llm.output_sha256"] = _sha256(output_text)
-                span.attributes["llm.output_chars"] = len(output_text)
-            return
-
-        in_text: str | None = None
-        out_text: str | None = None
-        if input_text is not None:
-            in_text, in_trunc = cap(input_text)
-            if in_trunc:
-                span.attributes["llm.input_truncated"] = True
-        if output_text is not None:
-            out_text, out_trunc = cap(output_text)
-            if out_trunc:
-                span.attributes["llm.output_truncated"] = True
-        attach_llm_content(span, input_text=in_text, output_text=out_text)
+    async def _enrich_span(
+        self,
+        span: Span,
+        *,
+        request_body: bytes,
+        response_body: bytes | None,
+        stream_chunks: list[bytes] | None,
+        headers: Mapping[str, str],
+        timing: Timing,
+    ) -> None:
+        """Run ObsPipeline enrichment, never letting it fail the request (PP41)."""
+        try:
+            await self.pipeline.enrich_span(
+                span,
+                request_body=request_body,
+                response_body=response_body,
+                stream_chunks=stream_chunks,
+                headers=headers,
+                timing=timing,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "Proxy span enrichment failed (span=%s)",
+                span.context.span_id,
+                exc_info=True,
+            )
 
     def build_proxy_span(
         self,
@@ -358,7 +356,7 @@ class LLMProxyServer:
         try:
             if stream:
                 return await self._handle_streaming(request, span, body, request_id, start_time)
-            return await self._handle_non_streaming(request, span, body, request_id)
+            return await self._handle_non_streaming(request, span, body, request_id, start_time)
         except httpx.TimeoutException:
             span.attributes["status"] = "error"
             span.attributes["error.type"] = _UPSTREAM_TIMEOUT
@@ -394,21 +392,30 @@ class LLMProxyServer:
         span: Span,
         body: bytes,
         request_id: str,
+        start_time: float,
     ) -> Response:
+        t_upstream_started = _now()
         upstream = await self.forward_to_upstream(body, request.headers, request_id)
+        t_upstream_completed = _now()
 
-        output_text = upstream.content.decode("utf-8", errors="replace")
-        self._body_attrs(
-            span,
-            input_text=body.decode("utf-8", errors="replace"),
-            output_text=output_text,
-        )
         span.attributes["http.response.status_code"] = upstream.status_code
         if upstream.status_code >= 400:
             span.attributes["status"] = "error"
             span.attributes["error.type"] = f"upstream_http_{upstream.status_code}"
         else:
             span.attributes["status"] = "ok"
+        await self._enrich_span(
+            span,
+            request_body=body,
+            response_body=upstream.content,
+            stream_chunks=None,
+            headers=request.headers,
+            timing=Timing(
+                t_request_received=start_time,
+                t_upstream_started=t_upstream_started,
+                t_upstream_completed=t_upstream_completed,
+            ),
+        )
         span.end_time = _now()
         await self._enqueue_span(span)
 
@@ -443,10 +450,13 @@ class LLMProxyServer:
             parsed["stream_options"] = {"include_usage": True}
             body = json.dumps(parsed).encode("utf-8")
 
-        input_text = body.decode("utf-8", errors="replace")
         output_parts: list[bytes] = []
         output_bytes = 0
         chunk_count = 0
+        # Retained past the body cap so PP41 can always parse usage/finish.
+        usage_parts: list[bytes] = []
+        usage_bytes = 0
+        t_first_token: float | None = None
 
         upstream_req = client.build_request(
             "POST", "/chat/completions", headers=fwd, content=body
@@ -454,6 +464,7 @@ class LLMProxyServer:
         # Open the upstream stream eagerly so the response status/content-type
         # are known before the client response is constructed; body chunks are
         # still relayed lazily by sse_aiter.
+        t_upstream_started = _now()
         upstream_resp = await client.send(upstream_req, stream=True)
         span.attributes["http.response.status_code"] = upstream_resp.status_code
         if upstream_resp.status_code >= 400:
@@ -462,9 +473,11 @@ class LLMProxyServer:
         media_type = upstream_resp.headers.get("content-type", "text/event-stream")
 
         async def sse_aiter() -> AsyncIterator[bytes]:
-            nonlocal output_bytes, chunk_count
+            nonlocal output_bytes, chunk_count, usage_bytes, t_first_token
             try:
                 async for chunk in upstream_resp.aiter_bytes():
+                    if t_first_token is None:
+                        t_first_token = _now()
                     chunk_count += 1
                     if chunk_count <= _MAX_STREAM_EVENTS:
                         span.add_event(
@@ -474,6 +487,9 @@ class LLMProxyServer:
                     if output_bytes < self.config.log_bodies_max_bytes:
                         output_parts.append(chunk)
                         output_bytes += len(chunk)
+                    elif _is_usage_chunk(chunk) and usage_bytes < _MAX_USAGE_CHUNK_BYTES:
+                        usage_parts.append(chunk)
+                        usage_bytes += len(chunk)
                     yield chunk
                 if "status" not in span.attributes:
                     span.attributes["status"] = "ok"
@@ -499,8 +515,19 @@ class LLMProxyServer:
                 except Exception:  # pragma: no cover - best-effort teardown
                     logger.debug("Upstream stream close failed", exc_info=True)
                 span.attributes["llm.stream_chunks"] = chunk_count
-                output_text = b"".join(output_parts).decode("utf-8", errors="replace")
-                self._body_attrs(span, input_text=input_text, output_text=output_text)
+                await self._enrich_span(
+                    span,
+                    request_body=body,
+                    response_body=None,
+                    stream_chunks=output_parts + usage_parts,
+                    headers=request.headers,
+                    timing=Timing(
+                        t_request_received=start_time,
+                        t_upstream_started=t_upstream_started,
+                        t_first_token=t_first_token,
+                        t_upstream_completed=_now(),
+                    ),
+                )
                 span.end_time = _now()
                 await self._enqueue_span(span)
 

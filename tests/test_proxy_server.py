@@ -36,6 +36,16 @@ _SSE_CHUNKS = [
     b"data: [DONE]\n\n",
 ]
 
+# PP41: realistic stream with finish_reason + usage in the trailing chunks
+# (OpenAI reports usage only in the final chunk, with include_usage=true).
+_SSE_CHUNKS_WITH_USAGE = [
+    b'data: {"choices":[{"delta":{"content":"He"}}]}\n\n',
+    b'data: {"choices":[{"delta":{"content":"llo"}}]}\n\n',
+    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    b'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n',
+    b"data: [DONE]\n\n",
+]
+
 
 class SSEStream(httpx.AsyncByteStream):
     """AsyncByteStream yielding SSE chunks separately (realistic streaming)."""
@@ -49,6 +59,19 @@ class SSEStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:  # pragma: no cover - nothing to close
         pass
+
+
+class SlowSSEStream(SSEStream):
+    """SSE stream with a per-chunk delay — guarantees a measurable ttft."""
+
+    def __init__(self, chunks: list[bytes], delay: float = 0.02) -> None:
+        super().__init__(chunks)
+        self._delay = delay
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            await asyncio.sleep(self._delay)
+            yield chunk
 
 
 # ---------------------------------------------------------------------------
@@ -716,3 +739,149 @@ class TestSDKIntegration:
                 span = proxy_spans(sdk)[0]
                 assert span.context.trace_id == "E2E-TRACE"
                 assert span.attributes["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# PP41: ObsPipeline enrichment through the endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestSpanEnrichment:
+    async def test_non_streaming_tokens_cost_and_timing(self, proxy, sdk):
+        upstream_resp = {
+            "choices": [
+                {"message": {"content": "hi"}, "finish_reason": "stop"}
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            },
+        }
+        with respx.mock:
+            respx.post(UPSTREAM).mock(
+                return_value=httpx.Response(200, json=upstream_resp)
+            )
+            async with client_for(proxy) as client:
+                resp = await client.post(
+                    "/llm/v1/chat/completions",
+                    json=chat_body(temperature=0.3),
+                )
+        assert resp.status_code == 200
+
+        span = proxy_spans(sdk)[0]
+        assert span.attributes["tokens.input"] == 10
+        assert span.attributes["tokens.output"] == 5
+        assert span.attributes["tokens.cached"] == 2
+        assert span.attributes["cost.usd"] > 0
+        assert span.attributes["cost.price_book_version"]
+        assert span.attributes["llm.finish_reason"] == "stop"
+        assert span.attributes["llm.temperature"] == 0.3
+        assert span.attributes["llm.input_messages_count"] == 1
+        assert span.attributes["llm.output_messages_count"] == 1
+        assert span.attributes["llm.input_chars"] == len(
+            json.dumps([{"role": "user", "content": "hello"}])
+        )
+        assert span.attributes["llm.output_chars"] == len("hi")
+        assert span.attributes["llm.ttft_ms"] == 0.0  # N/A for non-streaming
+        assert span.attributes["llm.latency_ms"] >= 0
+        assert span.attributes["llm.stream"] is False
+        assert "hello" in span.attributes["llm.input_text"]
+        assert span.attributes["llm.output_text"] == "hi"
+
+    async def test_streaming_ttft_usage_and_content(self, proxy, sdk):
+        with respx.mock:
+            respx.post(UPSTREAM).mock(
+                return_value=httpx.Response(
+                    200,
+                    stream=SlowSSEStream(_SSE_CHUNKS_WITH_USAGE),
+                    headers={"content-type": "text/event-stream"},
+                )
+            )
+            async with client_for(proxy) as client, client.stream(
+                "POST",
+                "/llm/v1/chat/completions",
+                json=chat_body(stream=True),
+            ) as resp:
+                assert resp.status_code == 200
+                async for _ in resp.aiter_bytes():
+                    pass
+
+        span = proxy_spans(sdk)[0]
+        assert span.attributes["llm.stream"] is True
+        assert span.attributes["llm.ttft_ms"] > 0
+        assert span.attributes["llm.latency_ms"] >= span.attributes["llm.ttft_ms"]
+        assert span.attributes["tokens.input"] == 7
+        assert span.attributes["tokens.output"] == 3
+        assert span.attributes["llm.finish_reason"] == "stop"
+        assert span.attributes["llm.output_text"] == "Hello"
+        assert span.attributes["llm.stream_chunks"] == len(_SSE_CHUNKS_WITH_USAGE)
+        assert span.attributes["cost.usd"] > 0
+
+    async def test_usage_chunk_survives_body_cap(self, sdk, monkeypatch):
+        """The trailing usage chunk must be parseable even after the body cap."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-upstream-secret")
+        cfg = ProxyConfig(
+            mode="on",
+            enabled=True,
+            upstream_api_key_env="OPENAI_API_KEY",
+            log_bodies_max_bytes=64,
+        )
+        proxy = LLMProxyServer(cfg, sdk=sdk)
+        chunks = [
+            b'data: {"choices":[{"delta":{"content":"' + b"x" * 300 + b'"}}]}\n\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            (
+                b'data: {"choices":[],"usage":{"prompt_tokens":11,'
+                b'"completion_tokens":6}}\n\n'
+            ),
+            b"data: [DONE]\n\n",
+        ]
+        with respx.mock:
+            respx.post(UPSTREAM).mock(
+                return_value=httpx.Response(
+                    200,
+                    stream=SSEStream(chunks),
+                    headers={"content-type": "text/event-stream"},
+                )
+            )
+            async with client_for(proxy) as client, client.stream(
+                "POST",
+                "/llm/v1/chat/completions",
+                json=chat_body(stream=True),
+            ) as resp:
+                async for _ in resp.aiter_bytes():
+                    pass
+
+        span = proxy_spans(sdk)[0]
+        assert span.attributes["tokens.input"] == 11
+        assert span.attributes["tokens.output"] == 6
+        assert span.attributes["llm.finish_reason"] == "stop"
+        assert span.attributes["llm.output_truncated"] is True
+
+    async def test_content_sampling_zero_keeps_hashes_only(
+        self, proxy, sdk, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_OBS_CONTENT_RATE", "0")
+        with respx.mock:
+            respx.post(UPSTREAM).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": "hi"}}]},
+                )
+            )
+            async with client_for(proxy) as client:
+                await client.post("/llm/v1/chat/completions", json=chat_body())
+
+        span = proxy_spans(sdk)[0]
+        assert "llm.input_text" not in span.attributes
+        assert "llm.output_text" not in span.attributes
+        assert len(span.attributes["llm.input_sha256"]) == 64
+        assert len(span.attributes["llm.output_sha256"]) == 64
+        assert span.attributes["trace.content_sampled"] is False
+        assert span.attributes["llm.input_chars"] == len(
+            json.dumps([{"role": "user", "content": "hello"}])
+        )
+        # Structured attributes are independent of sampling.
+        assert span.attributes["llm.input_messages_count"] == 1
+        assert span.attributes["llm.output_messages_count"] == 1
