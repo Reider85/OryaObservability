@@ -26,6 +26,10 @@ from prometheus_client import Counter, Histogram
 
 logger = logging.getLogger(__name__)
 
+# Module-level metrics to avoid duplicate registration
+_audit_total = Counter("shared_proxy_audit_total", "Audit events")
+_audit_latency_seconds = Histogram("shared_proxy_audit_latency_seconds", "Audit latency")
+
 
 @dataclass
 class SharedAuditEvent:
@@ -77,10 +81,6 @@ class SharedAuditTrail:
             metrics: Optional metrics client for monitoring
             circuit_breaker: Optional circuit breaker for failover
         """
-        self.metrics = metrics or {
-            "counter": Counter("shared_proxy_audit_total", "Audit events"),
-            "histogram": Histogram("shared_proxy_audit_latency_seconds", "Audit latency"),
-        }
         # Use unique metric names to avoid conflicts
         if not hasattr(self, '_metrics_initialized'):
             self._metrics_initialized = True
@@ -127,7 +127,7 @@ class SharedAuditTrail:
             # Check circuit breaker
             if not self.circuit_breaker.allow_request():
                 logger.warning("Audit trail circuit breaker open, skipping write")
-                self.metrics["counter"].inc()
+                _audit_total.inc()
                 return f"skipped_{int(time.time())}"
             
             # Generate audit ID
@@ -155,8 +155,8 @@ class SharedAuditTrail:
             
             # Record metrics
             latency = time.time() - start_time
-            self.metrics["histogram"].observe(latency)
-            self.metrics["counter"].inc()
+            _audit_latency_seconds.observe(latency)
+            _audit_total.inc()
             
             # Update circuit breaker on success
             self.circuit_breaker.record_success()
@@ -171,9 +171,8 @@ class SharedAuditTrail:
         except Exception as e:
             # Record failure
             latency = time.time() - start_time
-            self.metrics["histogram"].observe(latency)
-            self.metrics["counter"].inc()
-            self.metrics.increment("shared_proxy_audit_failures_total")
+            _audit_latency_seconds.observe(latency)
+            _audit_total.inc()
             
             # Update circuit breaker on failure
             self.circuit_breaker.record_failure()
@@ -214,7 +213,7 @@ class SharedAuditTrail:
             
             # Record metrics
             latency = time.time() - start_time
-            self.metrics["histogram"].observe(latency)
+            _audit_latency_seconds.observe(latency)
             
             logger.debug(
                 "Audit query completed: trace_id=%s, events=%d, latency=%.3fs",

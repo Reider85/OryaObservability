@@ -28,9 +28,13 @@ from typing import Any
 import httpx
 
 from agent_obs.ha.health_checks import CircuitBreaker, circuit_breaker_for
-from prometheus_client import Counter, Histogram, Histogram
+from prometheus_client import Counter, Histogram
 
 logger = logging.getLogger(__name__)
+
+# Module-level metrics to avoid duplicate registration
+_security_scans_total = Counter("shared_proxy_security_scans_total", "Security scans")
+_security_latency_seconds = Histogram("shared_proxy_security_latency_seconds", "Security scan latency")
 
 
 @dataclass
@@ -44,6 +48,7 @@ class SecurityScanResult:
         masked_request_body: bytes - request body with PII redacted
         audit_event_id: str - unique ID for audit trail correlation
         security_metadata: dict - detailed analysis results per detector
+        fail_reason: str | None - reason for fail-open (if any)
     """
     verdict: str  # "clean" | "flag" | "block"
     score: float  # 0.0..1.0
@@ -51,6 +56,7 @@ class SecurityScanResult:
     masked_request_body: bytes
     audit_event_id: str
     security_metadata: dict[str, Any]
+    fail_reason: str | None = None
 
     @classmethod
     def fail_open(cls, reason: str = "security_timeout") -> SecurityScanResult:
@@ -62,6 +68,7 @@ class SecurityScanResult:
             masked_request_body=b"",
             audit_event_id=f"fail_open_{int(time.time())}",
             security_metadata={"fail_reason": reason, "timestamp": time.time()},
+            fail_reason=reason,
         )
 
 
@@ -91,13 +98,6 @@ class SecurityClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.fail_open = fail_open
-        self.metrics = metrics or {
-            "counter": Counter("shared_proxy_security_scans_total", "Security scans"),
-            "histogram": Histogram("shared_proxy_security_latency_seconds", "Security scan latency"),
-        }
-        # Use unique metric names to avoid conflicts
-        if not hasattr(self, '_metrics_initialized'):
-            self._metrics_initialized = True
         # Use unique metric names to avoid conflicts
         if not hasattr(self, '_metrics_initialized'):
             self._metrics_initialized = True
@@ -139,7 +139,7 @@ class SecurityClient:
             # Check circuit breaker before making request
             if not self.circuit_breaker.allow_request():
                 logger.warning("Security service circuit breaker open, fail-open")
-                self.metrics["counter"].inc()
+                _security_scans_total.inc()
                 return SecurityScanResult.fail_open("circuit_breaker")
 
             # Prepare scan request
@@ -178,8 +178,8 @@ class SecurityClient:
             
             # Record metrics
             latency = time.time() - start_time
-            self.metrics["histogram"].observe(latency)
-            self.metrics["counter"].inc()
+            _security_latency_seconds.observe(latency)
+            _security_scans_total.inc()
             
             # Update circuit breaker on success
             self.circuit_breaker.record_success()
@@ -194,8 +194,8 @@ class SecurityClient:
         except Exception as e:
             # Record failure
             latency = time.time() - start_time
-            self.metrics["histogram"].observe(latency)
-            self.metrics["counter"].inc()
+            _security_latency_seconds.observe(latency)
+            _security_scans_total.inc()
             
             # Update circuit breaker on failure
             self.circuit_breaker.record_failure()
@@ -207,8 +207,8 @@ class SecurityClient:
             
             # Fail-open if enabled
             if self.fail_open:
-                self.metrics["counter"].inc()
-                return SecurityScanResult.fail_open(str(e))
+                _security_scans_total.inc()
+                return SecurityScanResult.fail_open("security_timeout")
             
             # Re-raise if fail-open disabled
             raise

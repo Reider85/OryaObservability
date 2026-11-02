@@ -173,7 +173,7 @@ class LLMProxyServer:
                 sdk=sdk,
             )
             self.decision_router = DecisionRouter(
-                audit_logger=sdk._audit_trail if sdk else None,
+                audit_logger=getattr(sdk, "_audit_trail", None) if sdk else None,
             )
             self.pipeline = self.shared_pipeline  # Use shared pipeline
         else:
@@ -886,12 +886,15 @@ class LLMProxyServer:
                 trace_id=span.trace_id,
             )
             
-            # Update span with decision metadata
-            result.obs_span.attributes.update(final_decision.span_attributes)
+            # Update span with decision metadata (record-then-block)
+            span.attributes.update(final_decision.span_attributes)
             
-            # Handle different decisions
-            if final_decision.action == "block":
-                # Block response with security details
+            # Handle different decisions (accept both old and new action names for compatibility)
+            is_block = final_decision.action in ("block", "block_response")
+            is_flag = final_decision.action in ("flag", "forward_with_flag")
+            
+            if is_block:
+                # Block response with security details (record-then-block)
                 span.attributes["status"] = "blocked"
                 span.attributes["security.block_reason"] = final_decision.reason
                 span.end_time = _now()
@@ -901,7 +904,7 @@ class LLMProxyServer:
                     content=final_decision.body,
                 )
             
-            elif final_decision.action == "flag":
+            elif is_flag:
                 # Forward with flag metadata
                 span.attributes["status"] = "forwarded"
                 span.attributes["security.flag"] = True

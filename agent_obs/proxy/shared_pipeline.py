@@ -23,12 +23,16 @@ import time
 from dataclasses import dataclass
 
 from agent_obs.ha.health_checks import circuit_breaker_for
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram
 from agent_obs.observability import ObservabilitySDK, Span
 from agent_obs.proxy.obs_pipeline import ObsPipeline
 from agent_obs.proxy.security_client import SecurityClient, SecurityScanResult
 
 logger = logging.getLogger(__name__)
+
+# Module-level metrics to avoid duplicate registration
+_pipeline_total = Counter("shared_proxy_pipeline_total", "Pipeline processing")
+_pipeline_latency_seconds = Histogram("shared_proxy_pipeline_latency_seconds", "Pipeline processing latency")
 
 
 @dataclass
@@ -74,7 +78,6 @@ class SharedPipeline:
         self.security_client = security_client
         self.obs_pipeline = obs_pipeline
         self.sdk = sdk
-        self.metrics = metrics or Counter("shared_proxy_pipeline_total", "Pipeline processing")
         # Use unique metric names to avoid conflicts
         if not hasattr(self, '_metrics_initialized'):
             self._metrics_initialized = True
@@ -128,11 +131,7 @@ class SharedPipeline:
             
             # Record metrics
             latency = time.time() - start_time
-            self.metrics.histogram(
-                "shared_proxy_total_latency_seconds",
-                latency,
-                {"decision": decision}
-            )
+            _pipeline_total.inc()
             
             # Update circuit breakers on success
             self.security_circuit_breaker.record_success()
@@ -154,11 +153,7 @@ class SharedPipeline:
         except asyncio.TimeoutError:
             # Handle timeouts with fail-open
             latency = time.time() - start_time
-            self.metrics.histogram(
-                "shared_proxy_total_latency_seconds",
-                latency,
-                {"decision": "timeout"}
-            )
+            _pipeline_total.inc()
             
             logger.warning(
                 "Shared pipeline timeout: latency=%.3fs, fail_open=True",
@@ -180,11 +175,7 @@ class SharedPipeline:
         except Exception as e:
             # Handle other errors
             latency = time.time() - start_time
-            self.metrics.histogram(
-                "shared_proxy_total_latency_seconds",
-                latency,
-                {"decision": "error"}
-            )
+            _pipeline_total.inc()
             
             logger.error("Shared pipeline failed: %s", e)
             
@@ -209,7 +200,7 @@ class SharedPipeline:
         """Security scan with circuit breaker check."""
         if not self.security_circuit_breaker.allow_request():
             logger.warning("Security circuit breaker open, fail-open")
-            self.metrics.increment("shared_proxy_security_circuit_open_total")
+            _pipeline_total.inc()
             return SecurityScanResult.fail_open("circuit_breaker")
         
         return await self.security_client.scan(request_body, headers, trace_id)
@@ -224,7 +215,7 @@ class SharedPipeline:
         """Obs enrichment with circuit breaker check."""
         if not self.obs_circuit_breaker.allow_request():
             logger.warning("Obs circuit breaker open, minimal span")
-            self.metrics.increment("shared_proxy_obs_circuit_open_total")
+            _pipeline_total.inc()
             return self._build_minimal_span(trace_id, request_id)
         
         return await self.obs_pipeline.enrich_span(

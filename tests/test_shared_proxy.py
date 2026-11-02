@@ -31,6 +31,8 @@ class TestSecurityClient:
                 timeout=0.05,
                 fail_open=True,
             )
+            # Add timeout attribute for testing
+            client.timeout = 0.05
             return client
 
     @pytest.fixture
@@ -131,13 +133,15 @@ class TestSharedPipeline:
     def shared_pipeline(self, mock_sdk, mock_obs_pipeline):
         """Create SharedPipeline for testing."""
         security_client = MagicMock(spec=SecurityClient)
+        security_client.timeout = 0.05
         security_client.scan = AsyncMock(return_value=SecurityScanResult(
             verdict="clean",
             score=0.1,
             redacted_fields=[],
             masked_request_body=b'{"messages": []}',
             audit_event_id="audit-123",
-            security_metadata={}
+            security_metadata={},
+            fail_reason=None
         ))
 
         return SharedPipeline(
