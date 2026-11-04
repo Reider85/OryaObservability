@@ -484,6 +484,15 @@ class ObservabilitySDK:
         self._error_rate_windows: dict[
             str, collections.deque[tuple[float, bool]]
         ] = {}  # agent_id -> deque of (timestamp, is_error)
+        # PP50 (C1): running error count + entry count per window so the hot
+        # path stays O(1) — a full ``sum()`` over a 5-minute window costs
+        # milliseconds per span under load (quadratic overall) and blew the
+        # <2% CPU acceptance budget.
+        self._error_rate_errors: dict[str, int] = {}
+        self._error_rate_tracked: dict[str, int] = {}
+        # Cached labelled gauge children: prometheus ``labels()`` lookup is
+        # ~10 µs and runs on every enqueue otherwise.
+        self._error_rate_gauges: dict[str, Any] = {}
         if guardrail is not None and self._load_guardrail_enabled(config):
             self._guardrail = guardrail
             logger.info(
@@ -1422,22 +1431,50 @@ class ObservabilitySDK:
         Called from ``_enqueue`` for every span.  Old entries (>5 min) are
         evicted before recomputation so the gauge always reflects a sliding
         window.  Each agent_id has its own independent window.
+
+        Hot path is O(1) (PP50/C1): the error count is maintained
+        incrementally alongside the deque instead of re-summing the whole
+        window on every span.  A full recount runs only when entries appear
+        in the deque that this method did not add (test/debug injection) —
+        detected via the tracked-entry count.
         """
         now = _now()
         window = self._error_rate_windows.setdefault(agent_id, collections.deque())
         window.append((now, is_error))
 
+        tracked = self._error_rate_tracked.get(agent_id, 0) + 1
+        errors = self._error_rate_errors.get(agent_id, 0) + (1 if is_error else 0)
+
         cutoff = now - 300.0  # 5 minutes
         while window and window[0][0] < cutoff:
-            window.popleft()
+            _, err = window.popleft()
+            tracked -= 1
+            if err:
+                errors -= 1
 
         total = len(window)
         if total == 0:
+            self._error_rate_errors.pop(agent_id, None)
+            self._error_rate_tracked.pop(agent_id, None)
             return
-        errors = sum(1 for _, err in window if err)
-        from agent_obs.metrics import agent_error_rate_5m
 
-        agent_error_rate_5m.labels(agent_id=agent_id).set(errors / total)
+        if tracked != total:
+            # Externally injected entries (tests append straight to the
+            # deque): fall back to an exact recount — never on the hot path.
+            errors = sum(1 for _, err in window if err)
+            tracked = total
+        errors = max(0, min(errors, total))
+
+        self._error_rate_errors[agent_id] = errors
+        self._error_rate_tracked[agent_id] = tracked
+
+        gauge = self._error_rate_gauges.get(agent_id)
+        if gauge is None:
+            from agent_obs.metrics import agent_error_rate_5m
+
+            gauge = agent_error_rate_5m.labels(agent_id=agent_id)
+            self._error_rate_gauges[agent_id] = gauge
+        gauge.set(errors / total)
 
     async def _flush_embedding_batch(
         self, batch: list[tuple[str, str, str, str, list[float]]]
