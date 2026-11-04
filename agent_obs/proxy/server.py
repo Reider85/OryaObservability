@@ -194,11 +194,18 @@ class LLMProxyServer:
         self._sleep = asyncio.sleep
 
         self.app = FastAPI(title="OryaObservability LLM Proxy")
+        
+        # Add main proxy route
         self.app.add_api_route(
             "/llm/v1/chat/completions",
             self.chat_completions,
             methods=["POST"],
         )
+        
+        # PP48: Add audit trail UI routes (only in shared proxy mode)
+        if self.shared_enabled and self.shared_security_url:
+            from agent_obs.audit_trail.ui import router as audit_trail_router
+            self.app.include_router(audit_trail_router, prefix="/admin")
 
     # Sentinel for upstream unavailable
     class _UpstreamUnavailable(Exception):

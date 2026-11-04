@@ -648,30 +648,44 @@ groups:
              Total shared proxy pipeline latency (p99) has exceeded the 100ms SLA for more than 5 minutes.
              This violates PP47 performance isolation requirements. Check both security and obs pipelines.
 
-       # Alert if security timeout rate exceeds 10%
-       - alert: SharedProxySecurityTimeoutRateHigh
-         expr: rate(shared_proxy_security_timeouts_total[5m]) / (rate(shared_proxy_security_timeouts_total[5m]) + rate(shared_proxy_pipeline_total[5m])) > 0.1
-         for: 5m
-         labels:
-           severity: warning
-           component: proxy
-         annotations:
-           summary: "Shared proxy security timeout rate >10% for >5m"
-           description: >-
-             Security pipeline timeout rate has exceeded 10% for more than 5 minutes.
-             This may indicate that OryaSecurity is overwhelmed or network issues.
-             Consider increasing timeout or scaling the security service.
+        # PP48: Alert if block rate exceeds 5%
+        - alert: SharedProxyBlockRateHigh
+          expr: rate(shared_proxy_audit_total{decision="block"}[5m]) / rate(shared_proxy_audit_total[5m]) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            component: proxy
+          annotations:
+            summary: "Shared proxy block rate >5% for >5m"
+            description: >-
+              Block rate has exceeded 5% for more than 5 minutes. This may indicate
+              an ongoing attack or overly aggressive security policies. Investigate
+              recent security events and consider policy tuning.
 
-       # Alert if security circuit breaker opens frequently
-       - alert: SharedProxySecurityCircuitOpenFrequent
-         expr: rate(shared_proxy_security_circuit_open_total[5m]) > 0.1
-         for: 5m
-         labels:
-           severity: warning
-           component: proxy
-         annotations:
-           summary: "Shared proxy security circuit opens >0.1/min for >5m"
-           description: >-
-             Security circuit breaker has been opening more than once every 10 minutes.
-             This indicates persistent issues with the security service. Check the service
-             health and consider adjusting circuit breaker thresholds.
+        # PP48: Alert if security timeout rate exceeds 10%
+        - alert: SharedProxySecurityTimeoutsHigh
+          expr: rate(shared_proxy_security_timeouts_total[5m]) / (rate(shared_proxy_security_timeouts_total[5m]) + rate(shared_proxy_pipeline_total[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Shared proxy security timeout rate >10% for >5m"
+            description: >-
+              Security pipeline timeout rate has exceeded 10% for more than 5 minutes.
+              This may indicate that OryaSecurity is overwhelmed or network issues.
+              Consider increasing timeout or scaling the security service.
+
+        # Alert if security circuit breaker opens frequently
+        - alert: SharedProxySecurityCircuitOpenFrequent
+          expr: rate(shared_proxy_security_circuit_open_total[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Shared proxy security circuit opens >0.1/min for >5m"
+            description: >-
+              Security circuit breaker has been opening more than once every 10 minutes.
+              This indicates persistent issues with the security service. Check the service
+              health and consider adjusting circuit breaker thresholds.
