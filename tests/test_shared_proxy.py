@@ -690,3 +690,156 @@ class TestIntegrationScenarios:
             assert decision.action == "block_response"
             assert decision.status_code == 403
             assert "blocked_by_security" in decision.body["error"]
+
+
+class TestPP47PerformanceIsolationIntegration:
+    """PP47 Integration tests for shared proxy performance isolation."""
+
+    @pytest.mark.asyncio
+    async def test_pp47_shared_proxy_with_circuit_breakers(self):
+        """PP47: Test shared proxy with independent circuit breakers."""
+        with patch('agent_obs.proxy.security_client.httpx.AsyncClient'):
+            # Create components
+            security_client = SecurityClient("http://orya-security:8000", timeout=0.05)
+            mock_sdk = MagicMock()
+            mock_obs_pipeline = MagicMock()
+            mock_obs_pipeline.enrich_span = AsyncMock(
+                return_value=MagicMock(spec=Span)
+            )
+            
+            # Mock security circuit breaker open
+            security_client.circuit_breaker.allow_request = MagicMock(return_value=False)
+            
+            # Create shared pipeline
+            shared_pipeline = SharedPipeline(
+                security_client=security_client,
+                obs_pipeline=mock_obs_pipeline,
+                sdk=mock_sdk,
+            )
+            
+            # Mock obs completion
+            mock_obs_pipeline.enrich_span = AsyncMock(
+                return_value=MagicMock(spec=Span)
+            )
+            
+            # Process request
+            result = await shared_pipeline.process(
+                request_body=b'{"messages": []}',
+                headers={"Content-Type": "application/json"},
+                trace_id="test-trace-123",
+                request_id="test-request-123",
+            )
+            
+            # PP47: Verify fail-open behavior with circuit breaker
+            assert result.decision == "forward"  # PP47: Fail-open allows forwarding
+            assert result.security_result.verdict == "clean"  # PP47: Fail-open verdict
+            assert result.security_result.fail_reason == "circuit_breaker"  # PP47: Circuit breaker reason
+            assert result.obs_span is not None  # PP47: Obs pipeline completed
+
+    @pytest.mark.asyncio
+    async def test_pp47_shared_proxy_timeout_isolation(self):
+        """PP47: Test timeout isolation between security and obs pipelines."""
+        with patch('agent_obs.proxy.security_client.httpx.AsyncClient'):
+            # Create components
+            security_client = SecurityClient("http://orya-security:8000", timeout=0.05)
+            mock_sdk = MagicMock()
+            mock_obs_pipeline = MagicMock()
+            
+            # Mock slow security scan (should timeout)
+            async def slow_security_scan(*args, **kwargs):
+                await asyncio.sleep(0.06)  # 60ms > 50ms timeout
+                return SecurityScanResult(
+                    verdict="clean",
+                    score=0.1,
+                    redacted_fields=[],
+                    masked_request_body=b'{"messages": []}',
+                    audit_event_id="audit-123",
+                    security_metadata={},
+                    fail_reason=None
+                )
+            
+            security_client.scan = slow_security_scan
+            
+            # Mock fast obs completion
+            mock_obs_pipeline.enrich_span = AsyncMock(
+                return_value=MagicMock(spec=Span)
+            )
+            
+            # Create shared pipeline
+            shared_pipeline = SharedPipeline(
+                security_client=security_client,
+                obs_pipeline=mock_obs_pipeline,
+                sdk=mock_sdk,
+            )
+            
+            # Process request
+            result = await shared_pipeline.process(
+                request_body=b'{"messages": []}',
+                headers={"Content-Type": "application/json"},
+                trace_id="test-trace-123",
+                request_id="test-request-123",
+            )
+            
+            # PP47: Verify timeout isolation
+            assert result.decision == "forward"  # PP47: Fail-open allows forwarding
+            assert result.security_result.verdict == "clean"  # PP47: Fail-open verdict
+            assert "timeout" in result.security_result.fail_reason  # PP47: Timeout reason
+            assert result.obs_span is not None  # PP47: Obs pipeline completed
+
+    @pytest.mark.asyncio
+    async def test_pp47_shared_proxy_concurrent_execution(self):
+        """PP47: Test concurrent execution of security and obs pipelines."""
+        with patch('agent_obs.proxy.security_client.httpx.AsyncClient'):
+            # Create components
+            security_client = SecurityClient("http://orya-security:8000", timeout=0.05)
+            mock_sdk = MagicMock()
+            mock_obs_pipeline = MagicMock()
+            
+            # Track execution order
+            execution_order = []
+            
+            async def tracked_security_scan(*args, **kwargs):
+                execution_order.append("security_start")
+                await asyncio.sleep(0.03)  # 30ms
+                execution_order.append("security_end")
+                return SecurityScanResult(
+                    verdict="clean",
+                    score=0.1,
+                    redacted_fields=[],
+                    masked_request_body=b'{"messages": []}',
+                    audit_event_id="audit-123",
+                    security_metadata={},
+                    fail_reason=None
+                )
+            
+            async def tracked_obs_enrichment(*args, **kwargs):
+                execution_order.append("obs_start")
+                await asyncio.sleep(0.04)  # 40ms
+                execution_order.append("obs_end")
+                return MagicMock(spec=Span)
+            
+            security_client.scan = tracked_security_scan
+            mock_obs_pipeline.enrich_span = tracked_obs_enrichment
+            
+            # Create shared pipeline
+            shared_pipeline = SharedPipeline(
+                security_client=security_client,
+                obs_pipeline=mock_obs_pipeline,
+                sdk=mock_sdk,
+            )
+            
+            # Process request
+            start_time = asyncio.get_event_loop().time()
+            result = await shared_pipeline.process(
+                request_body=b'{"messages": []}',
+                headers={"Content-Type": "application/json"},
+                trace_id="test-trace-123",
+                request_id="test-request-123",
+            )
+            end_time = asyncio.get_event_loop().time()
+            
+            # PP47: Verify concurrent execution
+            assert execution_order == ["security_start", "obs_start", "security_end", "obs_end"]
+            assert result.decision == "forward"
+            # Concurrent should be faster than sequential (30+40=70ms)
+            assert (end_time - start_time) < 0.08  # Allow some margin for overhead

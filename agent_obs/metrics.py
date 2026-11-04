@@ -48,7 +48,49 @@ guardrail_check_in_enqueue_total = Counter(
 eval_llm_judge_pending_total = Counter(
     "agent_obs_eval_llm_judge_pending_total",
     "LLM judge evaluation jobs enqueued for async processing",
-    ["agent_id", "eval_type"],
+)
+
+# PP47: Performance isolation metrics for shared proxy
+shared_proxy_security_latency_seconds = Histogram(
+    "shared_proxy_security_latency_seconds",
+    "Security pipeline latency with PP47 performance isolation",
+    ["agent_id", "tenant_id"],
+)
+
+shared_proxy_obs_latency_seconds = Histogram(
+    "shared_proxy_obs_latency_seconds", 
+    "Observability pipeline latency with PP47 performance isolation",
+    ["agent_id", "tenant_id"],
+)
+
+shared_proxy_total_latency_seconds = Histogram(
+    "shared_proxy_total_latency_seconds",
+    "Total pipeline latency with PP47 performance isolation",
+    ["agent_id", "tenant_id"],
+)
+
+shared_proxy_security_timeouts_total = Counter(
+    "shared_proxy_security_timeouts_total",
+    "Security pipeline timeouts with PP47 fail-open behavior",
+    ["agent_id", "tenant_id"],
+)
+
+shared_proxy_security_circuit_open_total = Counter(
+    "shared_proxy_security_circuit_open_total",
+    "Security circuit breaker opens with PP47 performance isolation",
+    ["agent_id", "tenant_id"],
+)
+
+shared_proxy_obs_circuit_open_total = Counter(
+    "shared_proxy_obs_circuit_open_total",
+    "Observability circuit breaker opens with PP47 performance isolation",
+    ["agent_id", "tenant_id"],
+)
+
+shared_proxy_performance_isolation_effective = Gauge(
+    "shared_proxy_performance_isolation_effective",
+    "PP47 performance isolation effectiveness (1=effective, 0=ineffective)",
+    ["agent_id", "tenant_id"],
 )
 
 # PP47: Shared proxy performance isolation metrics

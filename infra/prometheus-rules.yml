@@ -48,6 +48,86 @@ groups:
         for: 5m
         labels:
           severity: warning
+
+  # PP47: Performance isolation alerting for shared proxy
+  - name: pp47_performance_isolation
+    rules:
+      # Security pipeline latency should stay below 50ms p99
+      - alert: PP47SecurityLatencyTooHigh
+        expr: |
+          histogram_quantile(0.99, sum(rate(shared_proxy_security_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PP47 security pipeline latency too high"
+          description: "Security pipeline p99 latency exceeds 50ms threshold for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
+
+      # Observability pipeline latency should stay below 100ms p99  
+      - alert: PP47ObservabilityLatencyTooHigh
+        expr: |
+          histogram_quantile(0.99, sum(rate(shared_proxy_obs_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PP47 observability pipeline latency too high"
+          description: "Observability pipeline p99 latency exceeds 100ms threshold for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
+
+      # Total pipeline latency should stay below 100ms p99 (SLA)
+      - alert: PP47TotalLatencyTooHigh
+        expr: |
+          histogram_quantile(0.99, sum(rate(shared_proxy_total_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PP47 total pipeline latency SLA violation"
+          description: "Total pipeline p99 latency exceeds 100ms SLA for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
+
+      # Security circuit breaker opening indicates performance isolation issues
+      - alert: PP47SecurityCircuitBreakerOpen
+        expr: |
+          rate(shared_proxy_security_circuit_open_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PP47 security circuit breaker open"
+          description: "Security circuit breaker opened for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
+
+      # Observability circuit breaker opening indicates performance isolation issues
+      - alert: PP47ObservabilityCircuitBreakerOpen
+        expr: |
+          rate(shared_proxy_obs_circuit_open_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PP47 observability circuit breaker open"
+          description: "Observability circuit breaker opened for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
+
+      # High security timeout rate indicates performance isolation issues
+      - alert: PP47SecurityTimeoutRateTooHigh
+        expr: |
+          rate(shared_proxy_security_timeouts_total[5m]) / rate(shared_proxy_pipeline_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PP47 security timeout rate too high"
+          description: "Security timeout rate exceeds 10% for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
+
+      # Performance isolation effectiveness monitoring
+      - alert: PP47PerformanceIsolationIneffective
+        expr: |
+          shared_proxy_performance_isolation_effective{agent_id="$agent_id", tenant_id="$tenant_id"} < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PP47 performance isolation ineffective"
+          description: "Performance isolation effectiveness below 80% for agent {{ $labels.agent_id }} tenant {{ $labels.tenant_id }}"
         annotations:
           summary: "cleanup_vault has not succeeded for more than 2 hourly cycles"
           description: >-

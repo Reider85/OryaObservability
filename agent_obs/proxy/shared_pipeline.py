@@ -12,7 +12,9 @@ Design notes
   audit warnings; obs failures create minimal spans.
 * Decision router: Security decisions (clean/flag/block) override obs decisions.
 * Single transaction: Span, audit-event, and decision are batched and idempotent.
-* Performance isolation: Independent circuit breakers for security/obs.
+* Performance isolation: Independent circuit breakers for security/obs (PP47).
+* PP47: SLA p99 total latency < 100ms with independent circuit breakers.
+* PP47: Security pipeline failures=3, recovery=30s; obs pipeline failures=10, recovery=60s.
 """
 
 from __future__ import annotations
@@ -121,11 +123,17 @@ class SharedPipeline:
         if not hasattr(self, '_metrics_initialized'):
             self._metrics_initialized = True
         
-        # Independent circuit breakers with PP47 thresholds
+        # PP47: Independent circuit breakers with proper thresholds
         self.security_circuit_breaker = circuit_breaker_for("vault")  # proxy for security
         self.obs_circuit_breaker = circuit_breaker_for("langfuse")   # proxy for obs
         
-        # PP47 timeout configuration
+        # PP47: Configure circuit breaker thresholds
+        self.security_circuit_breaker.failure_threshold = 3  # failures=3 for security
+        self.security_circuit_breaker.recovery_window = 30   # recovery=30s for security
+        self.obs_circuit_breaker.failure_threshold = 10     # failures=10 for obs  
+        self.obs_circuit_breaker.recovery_window = 60        # recovery=60s for obs
+        
+        # PP47 timeout configuration for SLA p99 < 100ms
         self.security_timeout = 0.05  # 50ms for security pipeline
         self.obs_timeout = 0.1        # 100ms for obs pipeline
 
@@ -153,21 +161,88 @@ class SharedPipeline:
         start_time = time.time()
         
         try:
-            # Create security and obs tasks with PP47 timeouts
+            # PP47: Create security and obs tasks with independent timeouts
             security_task = asyncio.create_task(
-                self._scan_with_timeout(request_body, headers, trace_id)
+                self._scan_with_timeout(request_body, headers, trace_id),
+                name="security_scan"  # PP47: Name for timeout identification
             )
             obs_task = asyncio.create_task(
-                self._enrich_with_timeout(request_body, headers, trace_id, request_id)
+                self._enrich_with_timeout(request_body, headers, trace_id, request_id),
+                name="obs_enrichment"  # PP47: Name for timeout identification
             )
             
-            # PP47: Wait for both tasks with independent timeouts
-            security_result = await asyncio.wait_for(
-                security_task, timeout=self.security_timeout  # 50ms for security
-            )
-            obs_span = await asyncio.wait_for(
-                obs_task, timeout=self.obs_timeout  # 100ms for obs
-            )
+            # PP47: Execute with independent timeouts and concurrent processing
+            try:
+                # Wait for security with 50ms timeout
+                security_result = await asyncio.wait_for(
+                    security_task, timeout=self.security_timeout  # PP47: 50ms for security
+                )
+                # Wait for obs with 100ms timeout  
+                obs_span = await asyncio.wait_for(
+                    obs_task, timeout=self.obs_timeout  # PP47: 100ms for obs
+                )
+                
+            except asyncio.TimeoutError:
+                # PP47: Handle timeouts with fail-open semantics
+                latency = time.time() - start_time
+                logger.warning(
+                    "Shared pipeline timeout: latency=%.3fs, fail_open=True",
+                    latency
+                )
+                
+                # Check which task completed and which timed out
+                if security_task.done() and not obs_task.done():
+                    # Security completed, obs timed out
+                    logger.warning("Obs pipeline timeout after %.3fs, fail-open", self.obs_timeout)
+                    obs_span = self._build_minimal_span(trace_id, request_id)
+                    obs_span._timeout_reason = "obs_timeout"
+                    obs_span._processing_time = self.obs_timeout
+                    security_result = security_task.result()
+                    _security_timeouts_total.inc()
+                elif obs_task.done() and not security_task.done():
+                    # Obs completed, security timed out
+                    logger.warning("Security pipeline timeout after %.3fs, fail-open", self.security_timeout)
+                    security_result = SecurityScanResult.fail_open("security_timeout")
+                    security_result._processing_time = self.security_timeout
+                    security_result._timeout_reason = "security_timeout"
+                    obs_span = obs_task.result()
+                    _security_timeouts_total.inc()
+                else:
+                    # Both timed out or neither completed
+                    logger.warning("Both pipelines timed out, fail-open both")
+                    security_result = SecurityScanResult.fail_open("both_timeout")
+                    obs_span = self._build_minimal_span(trace_id, request_id)
+                    security_result._processing_time = self.security_timeout
+                    obs_span._processing_time = self.obs_timeout
+                    _security_timeouts_total.inc()
+                
+                # Cancel any pending tasks
+                if not security_task.done():
+                    security_task.cancel()
+                if not obs_task.done():
+                    obs_task.cancel()
+                
+                # Wait for cancellation to complete
+                await asyncio.gather(security_task, obs_task, return_exceptions=True)
+                
+                # PP47: Make fail-open decision
+                decision = "forward"  # PP47: Fail-open allows forwarding
+                
+                # Record per-pipeline latencies
+                security_latency = getattr(security_result, '_processing_time', 0)
+                obs_latency = getattr(obs_span, '_processing_time', 0)
+                
+                _security_latency_seconds.observe(security_latency)
+                _obs_latency_seconds.observe(obs_latency)
+                _total_latency_seconds.observe(latency)
+                
+                return SharedPipelineResult(
+                    masked_request_body=security_result.masked_request_body,
+                    security_result=security_result,
+                    obs_span=obs_span,
+                    decision=decision,
+                    latency_seconds=latency,
+                )
             
             # Make final decision (security > obs)
             decision = self._make_decision(security_result, obs_span)
@@ -283,18 +358,28 @@ class SharedPipeline:
         trace_id: str | None,
     ) -> SecurityScanResult:
         """Security scan with PP47 circuit breaker check and timeout."""
-        # PP47: Check security circuit breaker first
+        # PP47: Check security circuit breaker first (failures=3, recovery=30s)
         if not self.security_circuit_breaker.allow_request():
             logger.warning("Security circuit breaker open, fail-open")
             _security_circuit_open_total.inc()
             _pipeline_total.inc()
-            return SecurityScanResult.fail_open("circuit_breaker")
+            result = SecurityScanResult.fail_open("circuit_breaker")
+            result._processing_time = 0.0  # PP47: No processing time when breaker open
+            return result
         
-        # PP47: Track security processing time
+        # PP47: Track security processing time for SLA p99 < 100ms
         start_time = time.time()
         try:
             result = await self.security_client.scan(request_body, headers, trace_id)
             result._processing_time = time.time() - start_time  # PP47: Track latency
+            
+            # PP47: Check if security processing time exceeds SLA
+            if result._processing_time > self.security_timeout:
+                logger.warning(
+                    "Security scan exceeded timeout: %.3fs > %.3fs", 
+                    result._processing_time, self.security_timeout
+                )
+            
             return result
         except asyncio.TimeoutError:
             # PP47: Handle timeout specifically
@@ -319,19 +404,29 @@ class SharedPipeline:
         request_id: str | None,
     ) -> Span:
         """Obs enrichment with PP47 circuit breaker check and timeout."""
-        # PP47: Check obs circuit breaker first
+        # PP47: Check obs circuit breaker first (failures=10, recovery=60s)
         if not self.obs_circuit_breaker.allow_request():
             logger.warning("Obs circuit breaker open, minimal span")
             _pipeline_total.inc()
-            return self._build_minimal_span(trace_id, request_id)
+            result = self._build_minimal_span(trace_id, request_id)
+            result._processing_time = 0.0  # PP47: No processing time when breaker open
+            return result
         
-        # PP47: Track obs processing time
+        # PP47: Track obs processing time for SLA p99 < 100ms
         start_time = time.time()
         try:
             result = await self.obs_pipeline.enrich_span(
                 request_body, headers, trace_id, request_id
             )
             result._processing_time = time.time() - start_time  # PP47: Track latency
+            
+            # PP47: Check if obs processing time exceeds SLA
+            if result._processing_time > self.obs_timeout:
+                logger.warning(
+                    "Obs enrichment exceeded timeout: %.3fs > %.3fs", 
+                    result._processing_time, self.obs_timeout
+                )
+            
             return result
         except asyncio.TimeoutError:
             # PP47: Handle timeout specifically
