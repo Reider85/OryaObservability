@@ -95,7 +95,7 @@ class MockHotStore(HotStore):
     def is_available(self):
         return True
 
-    def get_spans(self, trace_id):
+    def get_spans(self, trace_id, tenant_id=None):
         self.read_count += 1
         if trace_id not in self.spans:
             raise Exception("not found")
@@ -106,7 +106,7 @@ class MockWarmStore(WarmStore):
     def __init__(self):
         self.traces = {}
 
-    async def get_trace(self, trace_id):
+    async def get_trace(self, trace_id, tenant_id=None):
         return self.traces.get(trace_id)
 
     async def connect(self):
@@ -470,6 +470,17 @@ class TestVaultRecoveryInvalidation:
         client._audit_enabled = False
         client._audit_store = None
         client._client = fake_client
+        # PP38: recover() gates on the circuit breaker; a permissive mock
+        # keeps this test focused on the invalidation side effect.
+        client._breaker = MagicMock()
+        client._breaker.allow_request.return_value = True
+        # PP37 failover wiring: a single fake address with the failover
+        # helpers stubbed out on the instance (shadow the class methods).
+        client._addrs = ["https://vault.test:8200"]
+        client._select_addr = lambda exclude=None: 0
+        client._client_for = lambda idx: fake_client
+        client._mark_dead = lambda idx: None
+        client._drop_client = lambda idx: None
 
         def _fake_from_url(url):
             m = MagicMock()

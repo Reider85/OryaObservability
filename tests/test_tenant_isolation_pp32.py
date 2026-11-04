@@ -151,18 +151,24 @@ class TestWarmStoreTenant:
     @patch("agent_obs.storage.warm.setup_connection")
     async def test_get_trace_with_tenant(self, mock_setup):
         """get_trace sets GUC and includes tenant filter."""
-        mock_pool = AsyncMock()
+        mock_pool = MagicMock()
         mock_conn = AsyncMock()
         # Make pool.acquire() return an async context manager
         mock_acquire = AsyncMock()
         mock_acquire.__aenter__.return_value = mock_conn
         mock_acquire.__aexit__.return_value = None
         mock_pool.acquire.return_value = mock_acquire
+        # get_trace wraps the tenant-scoped fetch in conn.transaction()
+        mock_tx = MagicMock()
+        mock_tx.__aenter__ = AsyncMock(return_value=None)
+        mock_tx.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.transaction = MagicMock(return_value=mock_tx)
+        mock_conn.fetchrow.return_value = {"trace_id": "trace-1"}
         
         # Mock the lazy import of asyncpg
         with patch.dict('sys.modules', {'asyncpg': MagicMock()}):
             # Make create_pool return our mock_pool directly
-            with patch('asyncpg.create_pool', return_value=mock_pool):
+            with patch('asyncpg.create_pool', new_callable=AsyncMock, return_value=mock_pool):
                 store = WarmStore()
                 await store.get_trace("trace-1", tenant_id="tenant-a")
                 
@@ -174,30 +180,32 @@ class TestWarmStoreTenant:
     @patch("agent_obs.storage.warm.setup_connection")
     async def test_get_trace_without_tenant(self, mock_setup):
         """get_trace without tenant doesn't set GUC or add filter."""
-        mock_pool = AsyncMock()
+        mock_pool = MagicMock()
         mock_conn = AsyncMock()
         # Make pool.acquire() return an async context manager
         mock_acquire = AsyncMock()
         mock_acquire.__aenter__.return_value = mock_conn
         mock_acquire.__aexit__.return_value = None
         mock_pool.acquire.return_value = mock_acquire
+        mock_conn.fetchrow.return_value = {"trace_id": "trace-1"}
         
         # Mock the lazy import of asyncpg
         with patch.dict('sys.modules', {'asyncpg': MagicMock()}):
             # Make create_pool return our mock_pool directly
-            with patch('asyncpg.create_pool', return_value=mock_pool):
+            with patch('asyncpg.create_pool', new_callable=AsyncMock, return_value=mock_pool):
                 store = WarmStore()
                 await store.get_trace("trace-1")
                 
                 mock_setup.assert_not_called()
                 mock_conn.fetchrow.assert_called_once()
                 query = mock_conn.fetchrow.call_args[0][0]
-                assert "tenant_id" not in query
+                # No tenant FILTER — `tenant_id` may still appear as a SELECT column
+                assert "AND tenant_id" not in query
 
     @patch("agent_obs.storage.warm.setup_connection")
     async def test_trace_exists(self, mock_setup):
         """trace_exists checks trace existence with unscoped GUC."""
-        mock_pool = AsyncMock()
+        mock_pool = MagicMock()
         mock_conn = AsyncMock()
         # Make pool.acquire() return an async context manager
         mock_acquire = AsyncMock()
@@ -208,7 +216,7 @@ class TestWarmStoreTenant:
         # Mock the lazy import of asyncpg
         with patch.dict('sys.modules', {'asyncpg': MagicMock()}):
             # Make create_pool return our mock_pool directly
-            with patch('asyncpg.create_pool', return_value=mock_pool):
+            with patch('asyncpg.create_pool', new_callable=AsyncMock, return_value=mock_pool):
                 store = WarmStore()
                 result = await store.trace_exists("trace-1")
                 

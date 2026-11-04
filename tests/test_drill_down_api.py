@@ -18,7 +18,7 @@ from agent_obs.storage.drill_down import DrillDownRequest, DrillDownResult, Dril
 from agent_obs.storage.hot import HotStore
 from agent_obs.storage.warm import WarmStore
 from agent_obs.storage.cold import ColdStore
-from agent_obs.trace_viewer.ui import app, get_drill_down_service
+from agent_obs.trace_viewer.ui import app, get_drill_down_service, get_hot_store
 
 
 class MockHotStore(HotStore):
@@ -30,7 +30,7 @@ class MockHotStore(HotStore):
     def is_available(self):
         return True
     
-    def get_spans(self, trace_id):
+    def get_spans(self, trace_id, tenant_id=None):
         if trace_id not in self.spans:
             raise Exception("not found")
         return self.spans[trace_id]
@@ -42,7 +42,7 @@ class MockWarmStore(WarmStore):
     def __init__(self):
         self.traces = {}
     
-    async def get_trace(self, trace_id):
+    async def get_trace(self, trace_id, tenant_id=None):
         return self.traces.get(trace_id)
     
     async def connect(self):
@@ -370,12 +370,19 @@ class TestDrillDownAPI:
         self.mock_service = MagicMock()
         self.mock_service.drill_down = AsyncMock()
         
-        with patch('agent_obs.trace_viewer.ui.get_drill_down_service') as mock_get:
-            mock_get.return_value = self.mock_service
-            self.client = TestClient(app)
+        # FastAPI binds Depends(...) at route-definition time, so patching the
+        # module attribute has no effect on the request path — use the
+        # dependency_overrides registry instead (and stub the hot store the
+        # handler uses for audit writes so no ClickHouse connection is made).
+        self.mock_hot_store = MagicMock()
+        app.dependency_overrides[get_drill_down_service] = lambda: self.mock_service
+        app.dependency_overrides[get_hot_store] = lambda: self.mock_hot_store
+        self.client = TestClient(app)
     
     def teardown_method(self):
         """Clean up test environment."""
+        app.dependency_overrides.pop(get_drill_down_service, None)
+        app.dependency_overrides.pop(get_hot_store, None)
         # Clean up environment variables
         if "AGENT_OBS_RBAC_ROLES" in os.environ:
             del os.environ["AGENT_OBS_RBAC_ROLES"]
@@ -414,7 +421,7 @@ class TestDrillDownAPI:
     
     def test_drill_down_missing_trace_read_permission(self):
         """Test missing trace:read permission."""
-        os.environ["AGENT_OBS_RBAC_ROLES"] = "testuser:auditor"  # auditor doesn't have trace:read
+        os.environ["AGENT_OBS_RBAC_ROLES"] = "testuser:agent"  # agent role has no trace:read
         
         response = self.client.get(
             "/api/v1/traces/test-trace-123/drill-down",
@@ -443,6 +450,8 @@ class TestDrillDownAPI:
     
     def test_drill_down_pii_with_invalid_mfa(self):
         """Test PII fields with invalid MFA token."""
+        # PII recovery requires the pii:recover permission (admin holds it)
+        os.environ["AGENT_OBS_RBAC_ROLES"] = "testuser:admin"
         response = self.client.get(
             "/api/v1/traces/test-trace-123/drill-down?fields=llm.input_text",
             headers={
@@ -456,6 +465,7 @@ class TestDrillDownAPI:
     
     def test_drill_down_pii_with_valid_mfa(self):
         """Test PII fields with valid MFA token."""
+        os.environ["AGENT_OBS_RBAC_ROLES"] = "testuser:admin"
         self.mock_service.drill_down.return_value = DrillDownResult(
             fields={"llm.input_text": "Hello world"},
             storage_tier="hot",
@@ -477,6 +487,8 @@ class TestDrillDownAPI:
     
     def test_drill_down_fields_parameter(self):
         """Test comma-separated fields parameter."""
+        # llm.* fields are PII: needs pii:recover (admin) + an MFA token
+        os.environ["AGENT_OBS_RBAC_ROLES"] = "testuser:admin"
         self.mock_service.drill_down.return_value = DrillDownResult(
             fields={"llm.input_text": "Hello", "llm.output_text": "World"},
             storage_tier="hot",
@@ -486,7 +498,10 @@ class TestDrillDownAPI:
         
         response = self.client.get(
             "/api/v1/traces/test-trace-123/drill-down?fields=llm.input_text,llm.output_text",
-            headers={"X-OryaObs-User": "testuser"}
+            headers={
+                "X-OryaObs-User": "testuser",
+                "X-OryaObs-MFA": "valid_token",
+            }
         )
         
         assert response.status_code == 200
