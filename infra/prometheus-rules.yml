@@ -506,19 +506,92 @@ groups:
   # this is a warning, not a page.
   - name: dependency-health
     rules:
-      - alert: DependencyUnhealthy
-        expr: agent_obs_dependency_health == 0
-        for: 5m
-        labels:
-          severity: warning
-          component: ha
-        annotations:
-          summary: "Dependency {{ $labels.dependency }} unhealthy for >5m"
-          description: >-
-            Active health probe for {{ $labels.dependency }} has been failing
-            for more than 5 minutes (agent_obs_dependency_health == 0). The
-            SDK is degrading gracefully — circuit breaker
-            (agent_obs_circuit_breaker_state) may be open and calls fail fast
-            — but the dependency needs attention. Probe cadence: 30s
-            (AGENT_OBS_HEALTH_PROBE_INTERVAL). Check the dependency's own
-            health endpoint and the HA stack (infra/docker-compose.ha.yml).
+       - alert: DependencyUnhealthy
+         expr: agent_obs_dependency_health == 0
+         for: 5m
+         labels:
+           severity: warning
+           component: ha
+         annotations:
+           summary: "Dependency {{ $labels.dependency }} unhealthy for >5m"
+           description: >-
+             Active health probe for {{ $labels.dependency }} has been failing
+             for more than 5 minutes (agent_obs_dependency_health == 0). The
+             SDK is degrading gracefully — circuit breaker
+             (agent_obs_circuit_breaker_state) may be open and calls fail fast
+             — but the dependency needs attention. Probe cadence: 30s
+             (AGENT_OBS_HEALTH_PROBE_INTERVAL). Check the dependency's own
+             health endpoint and the HA stack (infra/docker-compose.ha.yml).
+
+   # PP47 (T3.10.4): Performance isolation for shared proxy.
+   # These rules monitor the performance isolation between security and obs pipelines.
+   - name: shared-proxy-performance
+     rules:
+       # Alert if security pipeline latency exceeds 50ms (PP47 timeout)
+       - alert: SharedProxySecurityLatencyHigh
+         expr: histogram_quantile(0.99, sum(rate(shared_proxy_security_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.05
+         for: 5m
+         labels:
+           severity: warning
+           component: proxy
+         annotations:
+           summary: "Shared proxy security pipeline latency >50ms for >5m"
+           description: >-
+             Security pipeline latency (p99) has been above 50ms for more than 5 minutes.
+             This indicates performance issues in the security scanning pipeline.
+             Check OryaSecurity service health and network latency.
+
+       # Alert if obs pipeline latency exceeds 100ms (PP47 timeout)
+       - alert: SharedProxyObsLatencyHigh
+         expr: histogram_quantile(0.99, sum(rate(shared_proxy_obs_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
+         for: 5m
+         labels:
+           severity: warning
+           component: proxy
+         annotations:
+           summary: "Shared proxy obs pipeline latency >100ms for >5m"
+           description: >-
+             Observability pipeline latency (p99) has been above 100ms for more than 5 minutes.
+             This indicates performance issues in the observability enrichment pipeline.
+             Check obs pipeline resources and upstream dependencies.
+
+       # Alert if total pipeline latency exceeds 100ms (PP47 SLA)
+       - alert: SharedProxyTotalLatencyHigh
+         expr: histogram_quantile(0.99, sum(rate(shared_proxy_total_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
+         for: 5m
+         labels:
+           severity: critical
+           component: proxy
+         annotations:
+           summary: "Shared proxy total latency >100ms (SLA violation) for >5m"
+           description: >-
+             Total shared proxy pipeline latency (p99) has exceeded the 100ms SLA for more than 5 minutes.
+             This violates PP47 performance isolation requirements. Check both security and obs pipelines.
+
+       # Alert if security timeout rate exceeds 10%
+       - alert: SharedProxySecurityTimeoutRateHigh
+         expr: rate(shared_proxy_security_timeouts_total[5m]) / (rate(shared_proxy_security_timeouts_total[5m]) + rate(shared_proxy_pipeline_total[5m])) > 0.1
+         for: 5m
+         labels:
+           severity: warning
+           component: proxy
+         annotations:
+           summary: "Shared proxy security timeout rate >10% for >5m"
+           description: >-
+             Security pipeline timeout rate has exceeded 10% for more than 5 minutes.
+             This may indicate that OryaSecurity is overwhelmed or network issues.
+             Consider increasing timeout or scaling the security service.
+
+       # Alert if security circuit breaker opens frequently
+       - alert: SharedProxySecurityCircuitOpenFrequent
+         expr: rate(shared_proxy_security_circuit_open_total[5m]) > 0.1
+         for: 5m
+         labels:
+           severity: warning
+           component: proxy
+         annotations:
+           summary: "Shared proxy security circuit opens >0.1/min for >5m"
+           description: >-
+             Security circuit breaker has been opening more than once every 10 minutes.
+             This indicates persistent issues with the security service. Check the service
+             health and consider adjusting circuit breaker thresholds.

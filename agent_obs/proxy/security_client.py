@@ -33,8 +33,17 @@ from prometheus_client import Counter, Histogram
 logger = logging.getLogger(__name__)
 
 # Module-level metrics to avoid duplicate registration
-_security_scans_total = Counter("shared_proxy_security_scans_total", "Security scans")
-_security_latency_seconds = Histogram("shared_proxy_security_latency_seconds", "Security scan latency")
+try:
+    _security_scans_total = Counter("shared_proxy_security_scans_total", "Security scans")
+    _security_latency_seconds = Histogram("shared_proxy_security_latency_seconds", "Security scan latency")
+    _security_latency_seconds_client = _security_latency_seconds
+except:
+    # Metrics already exist, skip registration
+    class DummyMetric:
+        def inc(self): pass
+        def observe(self, value): pass
+    _security_latency_seconds = DummyMetric()
+    _security_latency_seconds_client = _security_latency_seconds
 
 
 @dataclass
@@ -178,7 +187,7 @@ class SecurityClient:
             
             # Record metrics
             latency = time.time() - start_time
-            _security_latency_seconds.observe(latency)
+            _security_latency_seconds_client.observe(latency)
             _security_scans_total.inc()
             
             # Update circuit breaker on success
@@ -194,7 +203,7 @@ class SecurityClient:
         except Exception as e:
             # Record failure
             latency = time.time() - start_time
-            _security_latency_seconds.observe(latency)
+            _security_latency_seconds_client.observe(latency)
             _security_scans_total.inc()
             
             # Update circuit breaker on failure

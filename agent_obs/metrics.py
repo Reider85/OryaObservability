@@ -48,8 +48,49 @@ guardrail_check_in_enqueue_total = Counter(
 eval_llm_judge_pending_total = Counter(
     "agent_obs_eval_llm_judge_pending_total",
     "LLM judge evaluation jobs enqueued for async processing",
-    ["eval_name"],
+    ["agent_id", "eval_type"],
 )
+
+# PP47: Shared proxy performance isolation metrics
+try:
+    shared_proxy_security_latency_seconds = Histogram(
+        "shared_proxy_security_latency_seconds",
+        "Security pipeline processing latency",
+        ["agent_id", "tenant_id"],
+    )
+
+    shared_proxy_obs_latency_seconds = Histogram(
+        "shared_proxy_obs_latency_seconds", 
+        "Observability pipeline processing latency",
+        ["agent_id", "tenant_id"],
+    )
+
+    shared_proxy_total_latency_seconds = Histogram(
+        "shared_proxy_total_latency_seconds",
+        "Total shared pipeline processing latency",
+        ["agent_id", "tenant_id"],
+    )
+
+    shared_proxy_security_timeouts_total = Counter(
+        "shared_proxy_security_timeouts_total",
+        "Security pipeline timeouts",
+        ["agent_id", "tenant_id"],
+    )
+
+    shared_proxy_security_circuit_open_total = Counter(
+        "shared_proxy_security_circuit_open_total",
+        "Security circuit breaker opens",
+        ["agent_id", "tenant_id"],
+    )
+
+    shared_proxy_obs_circuit_open_total = Counter(
+        "shared_proxy_obs_circuit_open_total",
+        "Observability circuit breaker opens", 
+        ["agent_id", "tenant_id"],
+    )
+except:
+    # Metrics already exist, skip registration
+    pass
 
 eval_llm_judge_sampling_skipped_total = Counter(
     "agent_obs_eval_llm_judge_sampling_skipped_total",
