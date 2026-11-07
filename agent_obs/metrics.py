@@ -655,3 +655,124 @@ cost_per_tenant_usd = Gauge(
     "Daily LLM cost per tenant and agent (USD), refreshed once per flush cycle",
     ["tenant_id", "agent_id"],
 )
+
+# --- PP51 Observability-of-observability metrics (T3.13) ----------------------
+# Meta-metrics for monitoring the health of the observability system itself
+
+# Ring buffer health metrics
+ring_buffer_depth = Gauge(
+    "agent_obs_ring_buffer_depth",
+    "Current ring buffer depth (number of spans waiting to be processed)",
+    ["agent_id"],
+)
+
+ring_buffer_pressure_ratio = Gauge(
+    "agent_obs_ring_buffer_pressure_ratio",
+    "Ring buffer pressure ratio (current depth / maxsize), 0..1. Alert if > 0.8",
+    ["agent_id"],
+)
+
+ring_buffer_enqueue_rate = Counter(
+    "agent_obs_ring_buffer_enqueue_rate",
+    "Spans enqueued per second",
+    ["agent_id"],
+)
+
+ring_buffer_dequeue_rate = Counter(
+    "agent_obs_ring_buffer_dequeue_rate",
+    "Spans dequeued per second",
+    ["agent_id"],
+)
+
+ring_buffer_backlog_growth = Gauge(
+    "agent_obs_ring_buffer_backlog_growth",
+    "Backlog growth trend (positive values indicate growing backlog)",
+    ["agent_id"],
+)
+
+# Worker task health metrics
+worker_task_healthy = Gauge(
+    "agent_obs_worker_task_healthy",
+    "Worker task health (1=healthy, 0=unhealthy)",
+    ["agent_id"],
+)
+
+worker_processing_latency_seconds = Histogram(
+    "agent_obs_worker_processing_latency_seconds",
+    "Worker processing latency for span export",
+    ["agent_id"],
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+)
+
+worker_task_restart_total = Counter(
+    "agent_obs_worker_task_restart_total",
+    "Worker task restarts",
+    ["agent_id"],
+)
+
+# Exporter health metrics
+exporter_latency_seconds = Histogram(
+    "agent_obs_exporter_latency_seconds",
+    "Exporter processing latency",
+    ["exporter"],
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+)
+
+exporter_success_rate = Gauge(
+    "agent_obs_exporter_success_rate",
+    "Exporter success rate (0..1)",
+    ["exporter"],
+)
+
+exporter_data_loss_total = Counter(
+    "agent_obs_exporter_data_loss_total",
+    "Data loss events by exporter",
+    ["exporter", "reason"],
+)
+
+# System resource metrics
+observability_cpu_usage = Gauge(
+    "agent_obs_system_cpu_usage",
+    "Observability system CPU usage percentage",
+    ["agent_id"],
+)
+
+observability_memory_usage_bytes = Gauge(
+    "agent_obs_system_memory_usage_bytes",
+    "Observability system memory usage in bytes",
+    ["agent_id"],
+)
+
+observability_disk_usage_bytes = Gauge(
+    "agent_obs_system_disk_usage_bytes",
+    "Observability system disk usage in bytes",
+    ["agent_id"],
+)
+
+# Component dependency metrics
+component_dependency_health = Gauge(
+    "agent_obs_component_dependency_health",
+    "Component dependency health (1=healthy, 0=unhealthy)",
+    ["component"],
+)
+
+component_dependency_latency_seconds = Histogram(
+    "agent_obs_component_dependency_latency_seconds",
+    "Component dependency latency",
+    ["component"],
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+)
+
+# Export latency for observability spans (meta-observation)
+obs_export_latency_seconds = Histogram(
+    "agent_obs_export_latency_seconds",
+    "Time from span enqueue to export completion (meta-observation)",
+    ["agent_id"],
+)
+
+# Obs stack health overall gauge
+obs_stack_health = Gauge(
+    "agent_obs_stack_health",
+    "Overall observability stack health (1=healthy, 0=unhealthy)",
+    ["agent_id"],
+)

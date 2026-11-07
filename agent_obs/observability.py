@@ -44,6 +44,17 @@ from agent_obs.metrics import (
     spans_micro_input_total,
     bytes_saved_total,
     aggregation_ratio,
+    # PP51 observability-of-observability metrics
+    ring_buffer_depth,
+    ring_buffer_pressure_ratio,
+    ring_buffer_enqueue_rate,
+    ring_buffer_dequeue_rate,
+    ring_buffer_backlog_growth,
+    worker_task_healthy,
+    worker_processing_latency_seconds,
+    worker_task_restart_total,
+    obs_export_latency_seconds,
+    obs_stack_health,
 )
 
 # Global references to PP11 metrics for use in _record_aggregation_metrics
@@ -426,6 +437,14 @@ class ObservabilitySDK:
         self._shutdown: asyncio.Event = asyncio.Event()
         self._last_drop_warning: float = 0.0
         self._worker_task: asyncio.Task | None = None
+        
+        # PP51: Ring buffer monitoring variables
+        self._last_enqueue_time: float = 0.0
+        self._last_dequeue_time: float = 0.0
+        self._enqueue_count: int = 0
+        self._dequeue_count: int = 0
+        self._last_backlog_size: int = 0
+        self._worker_healthy: bool = True
         self._metrics_http_server = None
         self._trace_agg: dict[str, dict] = {}
         self._max_trace_agg = 100_000
@@ -536,6 +555,14 @@ class ObservabilitySDK:
         if self.enabled:
             if self._exporters:
                 self._worker_task = asyncio.create_task(self._export_worker())
+                # PP51: Track worker task creation (restart tracking)
+                if hasattr(self, '_worker_restart_count'):
+                    self._worker_restart_count += 1
+                else:
+                    self._worker_restart_count = 1
+                if hasattr(self, 'last_spans') and self.last_spans:
+                    agent_id = self.last_spans[-1].context.agent_id
+                    worker_task_restart_total.labels(agent_id=agent_id).inc()
                 atexit.register(self._atexit_handler)
             # PC24: start the embedding storage worker alongside the main
             # export worker.  It drains the embedding queue every 5 seconds
@@ -874,6 +901,12 @@ class ObservabilitySDK:
             self.last_spans.append(span)
             self._accumulate_trace_aggregates(span)
             
+            # PP51: Ring buffer monitoring
+            current_time = _now()
+            self._last_enqueue_time = current_time
+            self._enqueue_count += 1
+            self._update_ring_buffer_metrics(span.context.agent_id)
+            
             spans_total.labels(agent_id=span.context.agent_id).inc()
 
             is_error = span.attributes.get("status") == "error"
@@ -902,6 +935,96 @@ class ObservabilitySDK:
                     span.context.span_id,
                     span.context.trace_id,
                 )
+
+    def _update_ring_buffer_metrics(self, agent_id: str) -> None:
+        """PP51: Update ring buffer health metrics."""
+        current_depth = self._ring_buffer.qsize()
+        maxsize = self._ring_buffer.maxsize
+        
+        # Update depth and pressure ratio
+        ring_buffer_depth.labels(agent_id=agent_id).set(current_depth)
+        pressure_ratio = current_depth / maxsize
+        ring_buffer_pressure_ratio.labels(agent_id=agent_id).set(pressure_ratio)
+        
+        # Calculate enqueue rate (spans per second)
+        current_time = _now()
+        if self._last_enqueue_time > 0:
+            time_diff = current_time - self._last_enqueue_time
+            if time_diff > 0:
+                enqueue_rate = 1.0 / time_diff
+                ring_buffer_enqueue_rate.labels(agent_id=agent_id).inc(enqueue_rate)
+        
+        # Calculate backlog growth trend
+        if current_depth > self._last_backlog_size:
+            growth = current_depth - self._last_backlog_size
+            ring_buffer_backlog_growth.labels(agent_id=agent_id).set(growth)
+        else:
+            ring_buffer_backlog_growth.labels(agent_id=agent_id).set(0)
+        
+        self._last_backlog_size = current_depth
+
+    def _update_worker_metrics(self, agent_id: str) -> None:
+        """PP51: Update worker health metrics."""
+        # Calculate dequeue rate (spans per second)
+        current_time = _now()
+        if self._last_dequeue_time > 0:
+            time_diff = current_time - self._last_dequeue_time
+            if time_diff > 0:
+                dequeue_rate = 1.0 / time_diff
+                ring_buffer_dequeue_rate.labels(agent_id=agent_id).inc(dequeue_rate)
+        
+        # Mark worker as healthy
+        self._worker_healthy = True
+        worker_task_healthy.labels(agent_id=agent_id).set(1)
+
+    def _check_worker_health(self) -> None:
+        """PP51: Check worker health and update overall stack health."""
+        # Check if worker is healthy (not stuck)
+        current_time = _now()
+        if current_time - self._last_dequeue_time > 5.0:  # No dequeue for 5 seconds
+            self._worker_healthy = False
+            if hasattr(self, 'last_spans') and self.last_spans:
+                agent_id = self.last_spans[-1].context.agent_id
+                worker_task_healthy.labels(agent_id=agent_id).set(0)
+        
+        # Update overall stack health based on worker health and ring buffer pressure
+        if hasattr(self, 'last_spans') and self.last_spans:
+            agent_id = self.last_spans[-1].context.agent_id
+            current_pressure = ring_buffer_pressure_ratio.labels(agent_id=agent_id)._value.get()
+            
+            # Stack is unhealthy if worker is unhealthy or ring buffer is over pressure
+            stack_healthy = 1 if (self._worker_healthy and current_pressure < 0.8) else 0
+            obs_stack_health.labels(agent_id=agent_id).set(stack_healthy)
+
+    def _update_system_resources(self) -> None:
+        """PP51: Update system resource metrics for observability stack."""
+        try:
+            import psutil
+            process = psutil.Process()
+            
+            # CPU usage
+            cpu_percent = process.cpu_percent(interval=0.1)
+            if hasattr(self, 'last_spans') and self.last_spans:
+                agent_id = self.last_spans[-1].context.agent_id
+                observability_cpu_usage.labels(agent_id=agent_id).set(cpu_percent)
+            
+            # Memory usage
+            memory_info = process.memory_info()
+            memory_bytes = memory_info.rss
+            if hasattr(self, 'last_spans') and self.last_spans:
+                agent_id = self.last_spans[-1].context.agent_id
+                observability_memory_usage_bytes.labels(agent_id=agent_id).set(memory_bytes)
+            
+            # Disk usage
+            disk_usage = psutil.disk_usage('.')
+            if hasattr(self, 'last_spans') and self.last_spans:
+                agent_id = self.last_spans[-1].context.agent_id
+                observability_disk_usage_bytes.labels(agent_id=agent_id).set(disk_usage.used)
+                
+        except ImportError:
+            logger.warning("psutil not installed; system resource metrics will not be updated")
+        except Exception as e:
+            logger.warning(f"Failed to update system resource metrics: {e}")
 
     def _aggregate_to_span(self, aggregate: SpanAggregate) -> Span:
         """Convert SpanAggregate to Span (PP09 wiring)."""
@@ -1317,13 +1440,24 @@ class ObservabilitySDK:
         then continues draining any remaining spans until the queue is empty
         before exiting.
         """
+        worker_start_time = _now()
+        
         while True:
             batch: list[Span] = []
+            batch_start_time = _now()
+            
             try:
                 first = await asyncio.wait_for(
                     self._ring_buffer.get(), timeout=0.5
                 )
                 batch.append(first)
+                
+                # PP51: Update dequeue metrics
+                current_time = _now()
+                self._last_dequeue_time = current_time
+                self._dequeue_count += 1
+                self._update_worker_metrics(first.context.agent_id)
+                
             except asyncio.TimeoutError:
                 if self._shutdown.is_set() and self._ring_buffer.empty():
                     break
@@ -1332,17 +1466,57 @@ class ObservabilitySDK:
             deadline = _now() + 0.05  # 50ms drain window
             while _now() < deadline and len(batch) < 512:
                 try:
-                    batch.append(self._ring_buffer.get_nowait())
+                    span = self._ring_buffer.get_nowait()
+                    batch.append(span)
+                    
+                    # PP51: Update dequeue metrics
+                    current_time = _now()
+                    self._last_dequeue_time = current_time
+                    self._dequeue_count += 1
+                    self._update_worker_metrics(span.context.agent_id)
+                    
                 except asyncio.QueueEmpty:
                     break
 
-            try:
-                await asyncio.gather(
-                    *[exp.export(batch) for exp in self._exporters],
-                    return_exceptions=True,
-                )
-            except Exception:
-                logger.exception("Export worker encountered an unexpected error")
+# PP51: Track export latency and exporter health
+                export_start_time = _now()
+                successful_exports = 0
+                failed_exports = 0
+                
+                for exp in self._exporters:
+                    exporter_name = exp.__class__.__name__.lower().replace('exporter', '')
+                    try:
+                        await exp.export(batch)
+                        successful_exports += 1
+                        
+                        # PP51: Track successful export latency
+                        export_latency = _now() - export_start_time
+                        obs_export_latency_seconds.labels(agent_id=span.context.agent_id if batch else "unknown", exporter=exporter_name).observe(export_latency)
+                        
+                    except Exception as e:
+                        failed_exports += 1
+                        logger.exception(f"Exporter {exporter_name} failed for batch: {e}")
+                        
+                        # PP51: Track export failure
+                        export_latency = _now() - export_start_time
+                        obs_export_latency_seconds.labels(agent_id=span.context.agent_id if batch else "unknown", exporter=exporter_name).observe(export_latency)
+                        
+                        # PP51: Track data loss
+                        exporter_data_loss_total.labels(exporter=exporter_name, reason="export_failure").inc(len(batch))
+                
+                # PP51: Update exporter success rate
+                total_exports = len(self._exporters)
+                if total_exports > 0:
+                    success_rate = successful_exports / total_exports
+                    if batch:
+                        agent_id = batch[0].context.agent_id
+                        for exp in self._exporters:
+                            exporter_name = exp.__class__.__name__.lower().replace('exporter', '')
+                            exporter_success_rate.labels(exporter=exporter_name).set(success_rate)
+
+            # PP51: Check worker health and update system resources
+            self._check_worker_health()
+            self._update_system_resources()
 
             if self._shutdown.is_set() and self._ring_buffer.empty():
                 break

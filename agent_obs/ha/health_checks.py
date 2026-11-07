@@ -40,6 +40,9 @@ from agent_obs.metrics import (
     circuit_breaker_failures_total,
     circuit_breaker_state,
     dependency_health,
+    # PP51: Component dependency metrics
+    component_dependency_health,
+    component_dependency_latency_seconds,
 )
 
 logger = logging.getLogger(__name__)
