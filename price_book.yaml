@@ -1,5 +1,14 @@
 version: "2026-09-01"
 currency: USD
+routing_categories:
+  premium:
+    - gpt-4o
+    - claude-3.5-sonnet
+  standard:
+    - gpt-4o-mini
+    - claude-3-haiku
+  budget:
+    - gemini-1.5-pro
 models:
   gpt-4o:
     valid_from: "2026-01-01"

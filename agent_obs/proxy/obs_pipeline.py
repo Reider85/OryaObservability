@@ -295,6 +295,9 @@ class ObsPipeline:
                 )
             except Exception as e:
                 logger.warning("Failed to enrich span with prompt template: %s", e)
+        
+        # PP55: Track cost-aware routing metadata in span attributes
+        self._attach_routing_metadata(span, headers=headers)
 
         req = _json_dict(request_body)
         messages = req.get("messages")
@@ -398,6 +401,37 @@ class ObsPipeline:
             span.attributes["llm.input_chars"] = len(input_text)
         if output_text is not None:
             span.attributes["llm.output_chars"] = len(output_text)
+
+    def _attach_routing_metadata(self, span: Span, headers: Mapping[str, str]) -> None:
+        """Attach cost-aware routing metadata to span attributes (PP55).
+        
+        Tracks routing decisions, cost savings, and business rule applications
+        to support observability and debugging of model routing decisions.
+        """
+        # Extract routing-related attributes from span
+        routing_attrs = {}
+        
+        # Track original vs routed model
+        if "llm.original_model" in span.attributes:
+            routing_attrs["llm.original_model"] = span.attributes["llm.original_model"]
+        if "llm.routed_model" in span.attributes:
+            routing_attrs["llm.routed_model"] = span.attributes["llm.routed_model"]
+            
+        # Track routing decision and cost savings
+        if "llm.routing_reason" in span.attributes:
+            routing_attrs["llm.routing_reason"] = span.attributes["llm.routing_reason"]
+        if "llm.cost_savings_usd" in span.attributes:
+            routing_attrs["llm.cost_savings_usd"] = span.attributes["llm.cost_savings_usd"]
+            
+        # Add routing metadata to span attributes
+        span.attributes.update(routing_attrs)
+        
+        # Add routing-specific event for traceability
+        if routing_attrs:
+            span.add_event(
+                "cost_aware_routing_decision",
+                routing_attrs
+            )
 
 
 __all__ = [

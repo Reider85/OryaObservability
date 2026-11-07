@@ -58,6 +58,7 @@ from agent_obs.proxy.obs_pipeline import ObsPipeline, Timing
 from agent_obs.proxy.shared_pipeline import SharedPipeline
 from agent_obs.proxy.security_client import SecurityClient
 from agent_obs.proxy.decision_router import DecisionRouter
+from agent_obs.proxy.router import CostAwareRouter
 
 from agent_obs.proxy.semantic_cache import get_semantic_cache
 
@@ -195,6 +196,16 @@ class LLMProxyServer:
             asyncio.create_task(self.cache.initialize())
         # For testability: allow sleep injection to avoid real delays
         self._sleep = asyncio.sleep
+        
+        # PP55: Cost-aware model routing
+        self.cost_router = None
+        if getattr(config, 'cost_aware_routing_enabled', False):
+            try:
+                from agent_obs.cost.price_book import PriceBook
+                price_book = PriceBook.load()
+                self.cost_router = CostAwareRouter(config, price_book)
+            except Exception as e:
+                logger.warning("Failed to initialize cost-aware router: %s", e)
 
         self.app = FastAPI(title="OryaObservability LLM Proxy")
         
@@ -662,6 +673,29 @@ class LLMProxyServer:
             if cached_response is not None:
                 return cached_response
 
+        # PP55: Cost-aware model routing for simple requests
+        if (self.cost_router is not None and 
+            self.config.cost_aware_routing_enabled and 
+            not stream):
+            
+            routing_decision = await self.cost_router.select_model(
+                request_body=body,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                current_model=parsed.get("model")
+            )
+            
+            # Attach routing metadata to span
+            self.pipeline._attach_routing_metadata(span, routing_decision)
+            
+            # If downgrade is recommended and allowed, update the request
+            if routing_decision.should_downgrade:
+                parsed["model"] = routing_decision.new_model
+                body = json.dumps(parsed).encode("utf-8")
+                span.attributes["llm.model"] = routing_decision.new_model
+                span.attributes["llm.cost_savings_usd"] = routing_decision.cost_savings_usd
+
         # PP42 §3: tenant-level daily budget gate, checked before the upstream
         # call.  Budget resolution mirrors enrich_span's attribution defaults
         # (missing tenant header -> "default") so the gate and the rollup
@@ -672,6 +706,38 @@ class LLMProxyServer:
             return await self._reject_over_budget(
                 span, decision, attr_tenant, request_id
             )
+
+        # PP55: Cost-aware model routing
+        if self.cost_router and getattr(self.config, 'cost_aware_routing_enabled', False):
+            try:
+                routing_decision = await self.cost_router.select_model(
+                    request_body=body,
+                    tenant_id=attr_tenant,
+                    agent_id=_attr_agent,
+                    user_id=_attr_user,
+                    current_model=parsed.get("model", "gpt-4o")
+                )
+                
+                if routing_decision.should_downgrade:
+                    # Update the request body with the selected model
+                    parsed["model"] = routing_decision.new_model
+                    body = json.dumps(parsed).encode("utf-8")
+                    
+                    # Track routing decision in span attributes
+                    span.attributes["llm.original_model"] = routing_decision.original_model
+                    span.attributes["llm.routed_model"] = routing_decision.new_model
+                    span.attributes["llm.routing_reason"] = routing_decision.routing_reason
+                    span.attributes["llm.cost_savings_usd"] = routing_decision.cost_savings_usd
+                    
+                    logger.info(
+                        "Cost-aware routing: %s -> %s (savings: $%.4f)",
+                        routing_decision.original_model,
+                        routing_decision.new_model,
+                        routing_decision.cost_savings_usd
+                    )
+            except Exception as e:
+                logger.warning("Cost-aware routing failed: %s", e)
+                # Fallback to original model
 
         if bool(parsed.get("stream")) and not self.config.streaming_enabled:
             # Client asked for a stream but streaming is disabled: rewrite the

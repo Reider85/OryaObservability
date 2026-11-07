@@ -23,10 +23,11 @@ Modes (§0.4 compatibility table):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,34 @@ def _parse_float(raw: Any, default: float, *, name: str) -> float:
     except (TypeError, ValueError):
         logger.warning("Invalid %s=%r, using default %s", name, raw, default)
         return default
+
+
+def _parse_downgrade_targets(raw: str) -> dict[str, list[str]]:
+    """Parse downgrade_targets JSON configuration."""
+    if not raw or raw == "":
+        return {}
+    
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ConfigError(
+                f"downgrade_targets must be a JSON object, "
+                f"got {type(parsed).__name__}"
+            )
+        
+        # Validate structure and convert to list[str]
+        result = {}
+        for model, alternatives in parsed.items():
+            if not isinstance(alternatives, list):
+                raise ConfigError(
+                    f"downgrade_targets['{model}'] must be a list, "
+                    f"got {type(alternatives).__name__}"
+                )
+            result[model] = [str(alt) for alt in alternatives]
+        
+        return result
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"Invalid JSON in downgrade_targets: {e}")
 
 
 def _default_auto_probe() -> bool:
@@ -144,6 +173,12 @@ class ProxyConfig:
     shared_proxy_security_url: str = ""
     shared_proxy_security_timeout: float = 0.05
     shared_proxy_security_fail_open: bool = True
+    
+    # PP55: Cost-aware model routing configuration
+    cost_aware_routing_enabled: bool = False
+    cost_aware_routing_threshold: float = 0.8
+    downgrade_targets: dict[str, list[str]] = field(default_factory=dict)
+    max_downgrade_attempts: int = 1
 
     @classmethod
     def from_env(
@@ -190,6 +225,25 @@ class ProxyConfig:
                 "SHARED_PROXY_ENABLED=on requires AGENT_OBS_PROXY_MODE=on "
                 "(invalid combination per §0.4)"
             )
+        
+        # Parse downgrade_targets JSON configuration (PP55)
+        downgrade_targets_json = str(
+            pick("downgrade_targets", "AGENT_OBS_PROXY_DOWNGRADE_TARGETS", "")
+        ).strip()
+        if downgrade_targets_json:
+            try:
+                downgrade_targets = json.loads(downgrade_targets_json)
+                if not isinstance(downgrade_targets, dict):
+                    raise ConfigError(
+                        f"AGENT_OBS_PROXY_DOWNGRADE_TARGETS must be a JSON object, "
+                        f"got {type(downgrade_targets).__name__}"
+                    )
+            except json.JSONDecodeError as e:
+                raise ConfigError(
+                    f"Invalid JSON in AGENT_OBS_PROXY_DOWNGRADE_TARGETS: {e}"
+                )
+        else:
+            downgrade_targets = {}
 
         if mode == "on":
             enabled = True
@@ -339,6 +393,36 @@ class ProxyConfig:
                     True,
                 ),
                 True,
+            ),
+            # PP55: Cost-aware routing configuration
+            cost_aware_routing_enabled=_parse_bool(
+                pick(
+                    "cost_aware_routing_enabled",
+                    "COST_AWARE_ROUTING_ENABLED",
+                    False,
+                ),
+                False,
+            ),
+            cost_aware_routing_threshold=_parse_float(
+                pick(
+                    "cost_aware_routing_threshold",
+                    "COST_AWARE_ROUTING_THRESHOLD",
+                    0.8,
+                ),
+                0.8,
+                name="COST_AWARE_ROUTING_THRESHOLD",
+            ),
+            max_downgrade_attempts=_parse_int(
+                pick(
+                    "max_downgrade_attempts",
+                    "MAX_DOWNGRADE_ATTEMPTS",
+                    1,
+                ),
+                1,
+                name="MAX_DOWNGRADE_ATTEMPTS",
+            ),
+            downgrade_targets=_parse_downgrade_targets(
+                pick("downgrade_targets", "AGENT_OBS_PROXY_DOWNGRADE_TARGETS", ""),
             ),
         )
 
