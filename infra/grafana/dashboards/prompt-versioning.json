@@ -1,0 +1,459 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Explore in Explore",
+      "type": "link",
+      "url": "/explore?left=%7B%22datasource%22:%22ClickHouse%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22editorMode%22:%22builder%22,%22expr%22:%22%7B%7B__cell%7D%7D%22%7D%5D,%22range%22:%7B%22from%22:%22now-1h%22,%22to%22:%22now%22%7D%7D"
+    }
+  ],
+  "panels": [
+    {
+      "datasource": "ClickHouse",
+      "description": "Number of unique system prompt templates used over time",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "text": {}
+      },
+      "pluginVersion": "8.5.0",
+      "targets": [
+        {
+          "datasource": "ClickHouse",
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "count(DISTINCT sha256) FROM prompt_templates WHERE time >= $__timeFrom() AND time <= $__timeTo()",
+          "format": "time_series",
+          "hide": false,
+          "instant": false,
+          "interval": "",
+          "intervalFactor": 1,
+          "legendFormat": "",
+          "maxDataPoints": 100,
+          "queryType": "randomWalk",
+          "refId": "A"
+        }
+      ],
+      "title": "Unique System Prompt Templates",
+      "type": "stat"
+    },
+    {
+      "datasource": "ClickHouse",
+      "description": "Distribution of system prompt versions",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "displayMode": "pie_chart",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "values": ["value", "percent"]
+        },
+        "pieType": "pie",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "8.5.0",
+      "targets": [
+        {
+          "datasource": "ClickHouse",
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "count() FROM prompt_templates WHERE time >= $__timeFrom() AND time <= $__timeTo() GROUP BY version_label",
+          "format": "table",
+          "hide": false,
+          "instant": false,
+          "interval": "",
+          "intervalFactor": 1,
+          "legendFormat": "{{version_label}}",
+          "maxDataPoints": 100,
+          "queryType": "randomWalk",
+          "refId": "A"
+        }
+      ],
+      "title": "System Prompt Version Distribution",
+      "type": "piechart"
+    },
+    {
+      "datasource": "ClickHouse",
+      "description": "Traces using specific system prompt templates",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.5,
+        "groupWidth": 0.7,
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showValue": "auto",
+        "sizing": "auto",
+        "text": {
+          "valueSize": 10
+        }
+      },
+      "targets": [
+        {
+          "datasource": "ClickHouse",
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "count(DISTINCT trace_id) FROM spans_hot WHERE time >= $__timeFrom() AND time <= $__timeTo() AND attributes['llm.system_prompt_sha256'] IS NOT NULL GROUP BY attributes['llm.system_prompt_sha256']",
+          "format": "time_series",
+          "hide": false,
+          "instant": false,
+          "interval": "",
+          "intervalFactor": 1,
+          "legendFormat": "Prompt: {{attributes['llm.system_prompt_sha256']}}",
+          "maxDataPoints": 100,
+          "queryType": "randomWalk",
+          "refId": "A"
+        }
+      ],
+      "title": "Traces by System Prompt Template",
+      "type": "barchart"
+    },
+    {
+      "datasource": "ClickHouse",
+      "description": "New system prompt versions detected",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "count"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "text": {}
+      },
+      "pluginVersion": "8.5.0",
+      "targets": [
+        {
+          "datasource": "ClickHouse",
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "count(DISTINCT version_label) FROM prompt_templates WHERE time >= $__timeFrom() AND time <= $__timeTo()",
+          "format": "time_series",
+          "hide": false,
+          "instant": false,
+          "interval": "",
+          "intervalFactor": 1,
+          "legendFormat": "",
+          "maxDataPoints": 100,
+          "queryType": "randomWalk",
+          "refId": "A"
+        }
+      ],
+      "title": "New Prompt Versions",
+      "type": "stat"
+    },
+    {
+      "datasource": "ClickHouse",
+      "description": "Most frequently used system prompt templates",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.7,
+        "groupWidth": 0.7,
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showValue": "auto",
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "ClickHouse",
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "count() FROM prompt_templates WHERE time >= $__timeFrom() AND time <= $__timeTo() GROUP BY sha256, version_label ORDER BY count() DESC LIMIT 10",
+          "format": "table",
+          "hide": false,
+          "instant": false,
+          "interval": "",
+          "intervalFactor": 1,
+          "legendFormat": "{{version_label}} ({{sha256}})",
+          "maxDataPoints": 100,
+          "queryType": "randomWalk",
+          "refId": "A"
+        }
+      ],
+      "title": "Top System Prompt Templates",
+      "type": "barchart"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 34,
+  "style": "dark",
+  "tags": [
+    "prompt-templates",
+    "versioning",
+    "system-prompt"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "30m",
+          "value": "30m"
+        },
+        "description": "Time range for the dashboard",
+        "error": null,
+        "hide": 0,
+        "includeAll": false,
+        "label": "Time range",
+        "name": "timeRange",
+        "options": [
+          {
+            "selected": false,
+            "text": "5m",
+            "value": "5m"
+          },
+          {
+            "selected": false,
+            "text": "15m",
+            "value": "15m"
+          },
+          {
+            "selected": true,
+            "text": "30m",
+            "value": "30m"
+          },
+          {
+            "selected": false,
+            "text": "1h",
+            "value": "1h"
+          },
+          {
+            "selected": false,
+            "text": "6h",
+            "value": "6h"
+          },
+          {
+            "selected": false,
+            "text": "24h",
+            "value": "24h"
+          }
+        ],
+        "query": "5m,15m,30m,1h,6h,24h",
+        "queryValue": "",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ]
+  },
+  "timezone": "",
+  "title": "System Prompt Versioning",
+  "uid": "prompt-versioning-dashboard",
+  "version": 1
+}

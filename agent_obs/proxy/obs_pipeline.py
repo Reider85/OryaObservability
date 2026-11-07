@@ -40,6 +40,12 @@ from agent_obs.cost import PriceBook, Usage
 from agent_obs.cost.attribution import attribution_from_headers
 from agent_obs.observability import ObservabilitySDK, Span
 from agent_obs.proxy import ProxyConfig
+from agent_obs.proxy.prompt_templates import (
+    extract_first_system_prompt,
+    compute_prompt_sha256,
+    extract_version_label,
+    create_prompt_enricher,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from agent_obs.cost.attribution import CostAttributionTracker
@@ -224,6 +230,8 @@ class ObsPipeline:
     triggers the lazy env-based load.  An optional ``cost_tracker`` (PP42)
     receives every attributed ``cost.usd`` so budget enforcement and the
     daily tenant rollup stay current; without it enrichment is pure.
+    
+    PP53: Includes system prompt template versioning with SHA256 mapping.
     """
 
     def __init__(
@@ -231,16 +239,26 @@ class ObsPipeline:
         config: ProxyConfig,
         price_book: PriceBook | None | object = _AUTO_PRICE_BOOK,
         cost_tracker: CostAttributionTracker | None = None,
+        hot_store=None,  # Optional HotStore for prompt template operations
     ) -> None:
         self.config = config
         self._price_book = price_book
         self.cost_tracker = cost_tracker
+        self.hot_store = hot_store
+        self._prompt_enricher = None
 
     @property
     def price_book(self) -> PriceBook | None:
         if self._price_book is _AUTO_PRICE_BOOK:
             self._price_book = _load_price_book()
         return self._price_book  # type: ignore[return-value]
+    
+    @property
+    def prompt_enricher(self):
+        """Lazy initialization of prompt template enricher."""
+        if self._prompt_enricher is None and self.hot_store is not None:
+            self._prompt_enricher = create_prompt_enricher(self.hot_store)
+        return self._prompt_enricher
 
     async def enrich_span(
         self,
@@ -266,6 +284,17 @@ class ObsPipeline:
         span.attributes["cost.attribution.tenant_id"] = tenant_id
         span.attributes["cost.attribution.agent_id"] = agent_id
         span.attributes["cost.attribution.user_id"] = user_id
+        
+        # PP53: Enrich span with system prompt template information
+        if self.prompt_enricher is not None:
+            try:
+                await self.prompt_enricher.enrich_span_with_prompt(
+                    span=span,
+                    request_body=request_body,
+                    trace_id=span.context.trace_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to enrich span with prompt template: %s", e)
 
         req = _json_dict(request_body)
         messages = req.get("messages")
