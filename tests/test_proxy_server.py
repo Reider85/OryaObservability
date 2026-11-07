@@ -887,6 +887,159 @@ class TestSpanEnrichment:
         assert len(span.attributes["llm.input_sha256"]) == 64
         assert len(span.attributes["llm.output_sha256"]) == 64
         assert span.attributes["trace.content_sampled"] is False
+
+    @pytest.mark.asyncio
+    async def test_semantic_cache_hit(self, proxy, sdk, mock_redis):
+        """Test semantic cache hit scenario."""
+        from agent_obs.proxy.semantic_cache import CachedResponse
+        
+        # Mock Redis client
+        mock_redis_client = AsyncMock()
+        mock_redis_pool = AsyncMock()
+        mock_redis_client.ping = AsyncMock(return_value=b"PONG")
+        
+        # Mock cached response
+        cached_response = CachedResponse(
+            payload=b'{"response": "cached"}',
+            media_type="application/json",
+            cost_usd=0.01,
+            created_at=time.time(),
+            expires_at=time.time() + 300,
+            original_model="gpt-4o",
+            headers={"content-type": "application/json"},
+        )
+        
+        mock_redis_client.get.return_value = json.dumps(cached_response.to_dict()).encode()
+        
+        # Patch Redis in the proxy
+        with patch('agent_obs.proxy.semantic_cache.redis') as mock_redis_module:
+            mock_redis_module.Redis.return_value = mock_redis_client
+            mock_redis_module.ConnectionPool.return_value = mock_redis_pool
+            
+            # Make request with identical body
+            chat_request = chat_body()
+            async with client_for(proxy) as client:
+                response1 = await client.post("/llm/v1/chat/completions", json=chat_request)
+                response2 = await client.post("/llm/v1/chat/completions", json=chat_request)
+            
+            # Both responses should succeed
+            assert response1.status_code == 200
+            assert response2.status_code == 200
+            
+            # Check cache hit header
+            assert response2.headers.get("X-OryaObs-Cache-Hit") == "true"
+            assert response2.headers.get("X-OryaObs-Cache-Hit-Type") == "semantic"
+            
+            # Check spans
+            spans = proxy_spans(sdk)
+            assert len(spans) == 2
+            
+            # First call: no cache hit
+            assert spans[0].attributes.get("cache.hit") is None
+            
+            # Second call: cache hit
+            assert spans[1].attributes.get("cache.hit") is True
+            assert spans[1].attributes.get("cache.hit_type") == "semantic"
+            assert spans[1].attributes.get("llm.cost_usd") == 0.0
+
+    @pytest.mark.asyncio
+    async def test_semantic_cache_miss(self, proxy, sdk, mock_redis):
+        """Test semantic cache miss scenario."""
+        from agent_obs.proxy.semantic_cache import CachedResponse
+        
+        # Mock Redis client returning None (cache miss)
+        mock_redis_client = AsyncMock()
+        mock_redis_pool = AsyncMock()
+        mock_redis_client.ping = AsyncMock(return_value=b"PONG")
+        mock_redis_client.get.return_value = None
+        
+        # Patch Redis in the proxy
+        with patch('agent_obs.proxy.semantic_cache.redis') as mock_redis_module:
+            mock_redis_module.Redis.return_value = mock_redis_client
+            mock_redis_module.ConnectionPool.return_value = mock_redis_pool
+            
+            with respx.mock:
+                respx.post(UPSTREAM).mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={"choices": [{"message": {"content": "response"}}]},
+                    )
+                )
+                
+                # Make two different requests
+                chat_request1 = chat_body()
+                chat_request2 = {"model": "gpt-4o", "messages": [{"role": "user", "content": "different request"}]}
+                
+                async with client_for(proxy) as client:
+                    response1 = await client.post("/llm/v1/chat/completions", json=chat_request1)
+                    response2 = await client.post("/llm/v1/chat/completions", json=chat_request2)
+            
+            # Both responses should succeed
+            assert response1.status_code == 200
+            assert response2.status_code == 200
+            
+            # No cache hit headers
+            assert response2.headers.get("X-OryaObs-Cache-Hit") != "true"
+            
+            # Check spans
+            spans = proxy_spans(sdk)
+            assert len(spans) == 2
+            
+            # Both calls should be cache misses
+            for span in spans:
+                assert span.attributes.get("cache.hit") is None
+
+    @pytest.mark.asyncio
+    async def test_semantic_cache_ttl_expiry(self, proxy, sdk, mock_redis):
+        """Test semantic cache TTL expiry."""
+        from agent_obs.proxy.semantic_cache import CachedResponse
+        
+        # Mock Redis client with expired response
+        mock_redis_client = AsyncMock()
+        mock_redis_pool = AsyncMock()
+        mock_redis_client.ping = AsyncMock(return_value=b"PONG")
+        
+        # Create expired response
+        expired_response = CachedResponse(
+            payload=b'{"response": "expired"}',
+            media_type="application/json",
+            cost_usd=0.01,
+            created_at=time.time() - 400,  # Created 400 seconds ago
+            expires_at=time.time() - 100,  # Expired 100 seconds ago
+            original_model="gpt-4o",
+            headers={"content-type": "application/json"},
+        )
+        
+        mock_redis_client.get.return_value = json.dumps(expired_response.to_dict()).encode()
+        mock_redis_client.delete = AsyncMock()
+        
+        # Patch Redis in the proxy
+        with patch('agent_obs.proxy.semantic_cache.redis') as mock_redis_module:
+            mock_redis_module.Redis.return_value = mock_redis_client
+            mock_redis_module.ConnectionPool.return_value = mock_redis_pool
+            
+            with respx.mock:
+                respx.post(UPSTREAM).mock(
+                    return_value=httpx.Response(
+                        200,
+                        json={"choices": [{"message": {"content": "fresh response"}}]},
+                    )
+                )
+                
+                # Make request - should miss due to expiry
+                chat_request = chat_body()
+                async with client_for(proxy) as client:
+                    response = await client.post("/llm/v1/chat/completions", json=chat_request)
+            
+            # Response should succeed (fallback to upstream)
+            assert response.status_code == 200
+            
+            # Check that expired cache was deleted
+            mock_redis_client.delete.assert_called_once()
+            
+            # Check span - no cache hit
+            spans = proxy_spans(sdk)
+            assert spans[0].attributes.get("cache.hit") is None
         assert span.attributes["llm.input_chars"] == len(
             json.dumps([{"role": "user", "content": "hello"}])
         )

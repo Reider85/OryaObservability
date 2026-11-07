@@ -133,6 +133,12 @@ class ProxyConfig:
     cache_enabled: bool = False
     cache_ttl_seconds: float = 300.0
     
+    # PP54: Semantic cache configuration
+    semantic_cache_enabled: bool = True
+    semantic_cache_redis_url: str = "redis://localhost:6379/0"
+    semantic_cache_ttl_seconds: int = 300
+    semantic_cache_max_connections: int = 10
+    
     # PP44: Shared proxy mode configuration
     shared_proxy_enabled: bool = False
     shared_proxy_security_url: str = ""
@@ -281,6 +287,32 @@ class ProxyConfig:
                 ),
                 300.0,
                 name="AGENT_OBS_PROXY_CACHE_TTL_SECONDS",
+            ),
+            # PP54: Semantic cache configuration
+            semantic_cache_enabled=_parse_bool(
+                pick("semantic_cache_enabled", "SEMANTIC_CACHE_ENABLED", True),
+                True,
+            ),
+            semantic_cache_redis_url=str(
+                pick(
+                    "semantic_cache_redis_url",
+                    "SEMANTIC_CACHE_REDIS_URL",
+                    "redis://localhost:6379/0",
+                )
+            ),
+            semantic_cache_ttl_seconds=int(
+                pick(
+                    "semantic_cache_ttl_seconds",
+                    "SEMANTIC_CACHE_TTL",
+                    300,
+                )
+            ),
+            semantic_cache_max_connections=int(
+                pick(
+                    "semantic_cache_max_connections",
+                    "SEMANTIC_CACHE_MAX_CONNECTIONS",
+                    10,
+                )
             ),
             # PP44: Shared proxy configuration
             shared_proxy_enabled=shared_enabled,

@@ -136,3 +136,50 @@ applies. With `log_bodies=false` only sha256 + char counts are stored.
 
 Not yet supported: mTLS for internal-only access (`AGENT_OBS_PROXY_TLS`) —
 planned with the shared-proxy work (PP44).
+
+## Semantic Cache (PP54)
+
+The proxy includes a Redis-based semantic cache that stores identical LLM requests
+for 5 minutes to reduce costs and improve performance. Cost savings from cache hits
+are attributed to the eval pipeline budget.
+
+### Configuration
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `SEMANTIC_CACHE_ENABLED` | `true` | Enable semantic caching |
+| `SEMANTIC_CACHE_REDIS_URL` | `redis://localhost:6379/0` | Redis server URL |
+| `SEMANTIC_CACHE_TTL` | `300` | Cache TTL in seconds (5 minutes) |
+| `SEMANTIC_CACHE_MAX_CONNECTIONS` | `10` | Maximum Redis connections |
+
+### Behavior
+
+- **Cache Key**: SHA256 hash of the masked request body (PII-safe)
+- **Cache Hit**: Returns cached response immediately, sets `X-OryaObs-Cache-Hit: true`
+- **Cache Miss**: Forwards to upstream, then caches the successful response
+- **Cost Attribution**: Cache hit costs = $0, savings tracked in `semantic_cache_cost_saved_usd`
+- **TTL**: Responses expire after 5 minutes (configurable)
+- **PII Safety**: Only masked request bodies are hashed and stored
+
+### Metrics
+
+The cache exports Prometheus metrics:
+- `semantic_cache_hits_total{tenant_id, agent_id}` - Number of cache hits
+- `semantic_cache_misses_total` - Number of cache misses
+- `semantic_cache_hit_ratio` - Cache hit ratio (gauge)
+- `semantic_cache_cost_saved_usd` - Total cost savings from cache hits
+- `semantic_cache_latency_seconds` - Cache operation latency
+
+### Headers
+
+Cache responses include these headers:
+- `X-OryaObs-Cache-Hit: true` - Indicates cache hit
+- `X-OryaObs-Cache-Hit-Type: semantic` - Cache type
+- `X-OryaOrig-Model: <original_model>` - Original model requested
+
+### Performance
+
+- p99 latency < 1ms for cache operations
+- Redis connection pooling with configurable max connections
+- Graceful degradation on Redis failures
+- Concurrent access safe

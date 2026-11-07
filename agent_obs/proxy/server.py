@@ -59,7 +59,7 @@ from agent_obs.proxy.shared_pipeline import SharedPipeline
 from agent_obs.proxy.security_client import SecurityClient
 from agent_obs.proxy.decision_router import DecisionRouter
 
-from agent_obs.proxy.semantic_cache import get_cache
+from agent_obs.proxy.semantic_cache import get_semantic_cache
 
 if TYPE_CHECKING:  # pragma: no cover
     from agent_obs.observability import ObservabilitySDK
@@ -189,7 +189,10 @@ class LLMProxyServer:
 
         # PP43: upstream failover
         self.upstream_breaker = CircuitBreaker("llm_upstream")
-        self.cache = get_cache(config)
+        self.cache = get_semantic_cache(config)
+        # Initialize semantic cache if enabled
+        if self.cache is not None:
+            asyncio.create_task(self.cache.initialize())
         # For testability: allow sleep injection to avoid real delays
         self._sleep = asyncio.sleep
 
@@ -282,6 +285,14 @@ class LLMProxyServer:
                 self._server_task.cancel()
             self._server_task = None
             self._server = None
+        # PP54: close semantic cache
+        if self.cache is not None:
+            try:
+                await self.cache.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                logger.warning("Semantic cache close failed", exc_info=True)
+            self.cache = None
+            
         if self._client is not None:
             try:
                 await self._client.aclose()
@@ -519,25 +530,74 @@ class LLMProxyServer:
                     self.upstream_breaker.record_success()
                 return upstream_resp, []
 
-    async def _fallback_to_cache_or_503(self, reason: str, request_id: str, span: Span) -> Response:
-        """Handle fallback: cache lookup or 503 response."""
-        upstream_url = f"{self.config.upstream_base_url.rstrip('/')}/chat/completions"
-        
-        # Try cache first if enabled
-        if self.cache is not None:
-            cached = self.cache.get(span.attributes.get("llm.input_text", "").encode("utf-8"))
+    async def _check_semantic_cache(self, request_body: bytes, span: Span, tenant_id: str = "default", agent_id: str = "unknown") -> Optional[Response]:
+        """Check semantic cache before upstream call."""
+        if self.cache is None:
+            return None
+            
+        try:
+            cached = await self.cache.get(request_body, tenant_id, agent_id)
             if cached is not None:
                 # Cache hit: return cached response
                 span.attributes["cache.hit"] = True
-                span.attributes["status"] = "ok"
+                span.attributes["cache.hit_type"] = "semantic"
+                span.attributes["llm.cost_usd"] = 0.0  # No cost for cache hit
+                span.attributes["llm.input_tokens"] = 0  # No tokens for cache hit
+                span.attributes["llm.output_tokens"] = 0
                 span.end_time = _now()
                 await self._enqueue_span(span)
+                
+                # Record cost savings
+                await self.cache.record_cost_savings(cached.cost_usd, tenant_id, agent_id)
                 
                 from fastapi.responses import Response
                 return Response(
                     content=cached.payload,
                     media_type=cached.media_type,
-                    headers={"X-OryaObs-Cache-Hit": "true"}
+                    headers={
+                        "X-OryaObs-Cache-Hit": "true",
+                        "X-OryaObs-Cache-Hit-Type": "semantic",
+                        "X-OryaOrig-Model": cached.original_model,
+                    }
+                )
+        except Exception as e:
+            logger.warning("Semantic cache lookup error: %s", e)
+            
+        return None
+
+    async def _fallback_to_cache_or_503(self, reason: str, request_id: str, span: Span) -> Response:
+        """Handle fallback: cache lookup or 503 response."""
+        upstream_url = f"{self.config.upstream_base_url.rstrip('/')}/chat/completions"
+        
+        # Try semantic cache first if enabled
+        if self.cache is not None:
+            # Extract tenant_id and agent_id from span for accurate metrics
+            tenant_id = span.attributes.get("context.tenant_id", "default")
+            agent_id = span.attributes.get("context.agent_id", "unknown")
+            
+            request_body = span.attributes.get("llm.input_text", "").encode("utf-8")
+            cached = await self.cache.get(request_body, tenant_id, agent_id)
+            if cached is not None:
+                # Cache hit: return cached response
+                span.attributes["cache.hit"] = True
+                span.attributes["cache.hit_type"] = "semantic"
+                span.attributes["status"] = "ok"
+                span.attributes["llm.cost_usd"] = 0.0  # No cost for cache hit
+                span.end_time = _now()
+                await self._enqueue_span(span)
+                
+                # Record cost savings
+                await self.cache.record_cost_savings(cached.cost_usd, tenant_id, agent_id)
+                
+                from fastapi.responses import Response
+                return Response(
+                    content=cached.payload,
+                    media_type=cached.media_type,
+                    headers={
+                        "X-OryaObs-Cache-Hit": "true",
+                        "X-OryaObs-Cache-Hit-Type": "semantic",
+                        "X-OryaOrig-Model": cached.original_model,
+                    }
                 )
         
         # Cache miss or no cache: return 503
@@ -595,6 +655,12 @@ class LLMProxyServer:
             stream=stream,
             start_time=start_time,
         )
+
+        # PP54: Check semantic cache before any processing
+        if self.cache is not None:
+            cached_response = await self._check_semantic_cache(body, span, tenant_id, agent_id)
+            if cached_response is not None:
+                return cached_response
 
         # PP42 §3: tenant-level daily budget gate, checked before the upstream
         # call.  Budget resolution mirrors enrich_span's attribution defaults
@@ -751,6 +817,28 @@ class LLMProxyServer:
         await self._enqueue_span(span)
 
         media_type = upstream.headers.get("content-type", "application/json")
+        
+        # PP54: Cache successful response if semantic cache is enabled
+        if self.cache is not None and upstream.status_code < 400:
+            try:
+                # Extract cost information from span for caching
+                cost_usd = span.attributes.get("llm.cost_usd", 0.0)
+                original_model = span.attributes.get("llm.model", "")
+                
+                await self.cache.set(
+                    request_body=body,
+                    response_payload=upstream.content,
+                    media_type=media_type,
+                    cost_usd=cost_usd,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    original_model=original_model,
+                    headers=dict(upstream.headers),
+                )
+                logger.debug("Cached successful response for tenant=%s, agent=%s", tenant_id, agent_id)
+            except Exception as e:
+                logger.warning("Failed to cache response: %s", e)
+        
         return Response(
             content=upstream.content,
             status_code=upstream.status_code,
