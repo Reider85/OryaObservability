@@ -465,6 +465,48 @@ services:
       retries: 6
       start_period: 5s
 
+  # PP56: OPA Bundle Server — distributes Rego policies as atomic bundles with
+  # hot-reload capability. The PolicyEngine polls /bundles/observability.zip
+  # every 30 seconds. File-watcher detects changes in ./rbac/policies and
+  # rebuilds the bundle atomically. Audit trail tracks all bundle reloads.
+  opa-bundle-server:
+    image: openpolicyagent/opa:1.21.2-debug
+    restart: unless-stopped
+    command:
+      - run
+      - --server
+      - --addr=:8080
+      - --set
+      - services.default.url=http://opa-bundle-server:8080
+      - --set
+      - services.default.resource=bundles/observability.zip
+      - --set
+      - bundles.observability.service=default
+      - --set
+      - bundles.observ.resource=bundles/observability.zip
+      - --set
+      - bundles.observ.poll_interval=30s
+      - --set
+      - decision_logs.console=true
+    volumes:
+      - ./rbac/policies:/policies:ro
+      - ./rbac/bundle:/bundle:rw
+    ports:
+      - "8080:8080"  # HTTP — bundle distribution endpoint
+    healthcheck:
+      test:
+        - CMD
+        - opa
+        - eval
+        - --fail
+        - -e
+        - result
+        - 'http.send({"method": "get", "url": "http://localhost:8080/health"}).status_code == 200'
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
   eval-worker:
     build:
       context: ..

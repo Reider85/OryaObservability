@@ -1,0 +1,69 @@
+# PP56: OPA Bundle Server Configuration
+# This configuration enables bundle distribution for hot-reload of security policies
+# without requiring OPA service restarts.
+
+services:
+  # OPA Bundle Server - distributes Rego policies as atomic bundles
+  opa-bundle-server:
+    image: openpolicyagent/opa:1.21.2-debug
+    restart: unless-stopped
+    command:
+      - run
+      - --server
+      - --addr=:8080
+      - --set
+      - services.default.url=http://opa-bundle-server:8080
+      - --set
+      - services.default.resource=bundles/observability.tar.gz
+      - --set
+      - bundles.observability.service=default
+      - --set
+      - bundles.observ.resource=bundles/observability.tar.gz
+      - --set
+      - bundles.observ.poll_interval=30s
+      - --set
+      - decision_logs.console=true
+    volumes:
+      - ./rbac/policies:/policies:ro
+      - ./rbac/bundle:/bundle:rw
+    ports:
+      - "8080:8080"  # HTTP — bundle distribution endpoint
+    healthcheck:
+      test:
+        - CMD
+        - opa
+        - eval
+        - --fail
+        - -e
+        - result
+        - 'http.send({"method": "get", "url": "http://localhost:8080/health"}).status_code == 200'
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # File Watcher - monitors policy changes and rebuilds bundle
+  opa-bundle-watcher:
+    image: mcr.microsoft.com/powershell:7.2-windowsservercore-ltsc2022
+    restart: unless-stopped
+    depends_on:
+      opa-bundle-server:
+        condition: service_healthy
+    volumes:
+      - ./rbac/policies:/policies:ro
+      - ./rbac/bundle:/bundle:rw
+      - ../:/app:ro
+    command: >
+      pwsh -File /app/scripts/watch-opa-bundle.ps1
+      -PoliciesDir /policies
+      -BundleDir /bundle
+      -BundleName observability
+      -PollInterval 5
+    environment:
+      - POWERSHELL_TELEMETRY_OPTOUT=1
+    healthcheck:
+      test: ["CMD", "powershell", "-c", "Test-Path -Path /bundle/observability.tar.gz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

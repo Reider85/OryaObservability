@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  # PP56: File watcher service for OPA bundle hot-reload
+  # Monitors ./policies directory and rebuilds bundle when Rego files change
+  opa-bundle-watcher:
+    image: mcr.microsoft.com/powershell:7.2-windowsservercore-ltsc2022
+    restart: unless-stopped
+    depends_on:
+      opa-bundle-server:
+        condition: service_healthy
+    volumes:
+      - ./rbac/policies:/policies:ro
+      - ./rbac/bundle:/bundle:rw
+      - ../:/app:ro
+    command: >
+      pwsh -File /app/scripts/watch-opa-bundle.ps1
+      -PoliciesDir /policies
+      -BundleDir /bundle
+      -BundleName observability
+      -PollInterval 5
+    environment:
+      - POWERSHELL_TELEMETRY_OPTOUT=1
+    healthcheck:
+      test: ["CMD", "powershell", "-c", "Test-Path -Path /bundle/observability.tar.gz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
