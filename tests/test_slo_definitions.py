@@ -99,8 +99,11 @@ def _reset_slo_metrics():
 # ---------------------------------------------------------------------------
 
 class TestSLOCatalog:
-    def test_catalog_has_exactly_four_slos(self):
-        assert set(SLO_CATALOG) == {"availability", "latency_p95", "quality", "cost_p99"}
+    def test_catalog_has_exactly_eight_slos(self):
+        assert set(SLO_CATALOG) == {
+            "availability", "latency_p95", "quality", "cost_p99",
+            "latency_p99", "traffic", "errors", "saturation"
+        }
 
     def test_availability_target_and_windows(self):
         slo = SLO_CATALOG["availability"]

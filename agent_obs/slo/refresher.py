@@ -126,7 +126,12 @@ class SLORefresher:
 
         # 3. Error budget remaining (PP27): budget = (1 - target) * total
         # events on the rolling window; remaining = unspent share.
-        budget = ErrorBudget.from_counts(slo.name, slo.target, good, total)
+        if slo.target > 1.0 and slo.sli_kind == "traffic":
+            # Handle traffic signals with targets > 1.0
+            budget = ErrorBudget.from_traffic_counts(slo.name, slo.target, good, total)
+        else:
+            # Handle regular SLIs with targets in (0, 1]
+            budget = ErrorBudget.from_counts(slo.name, slo.target, good, total)
         remaining = budget.clamped_remaining
         slo_error_budget_remaining.labels(name=slo.name).set(remaining)
 

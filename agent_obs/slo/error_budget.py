@@ -150,6 +150,59 @@ class ErrorBudget:
             remaining_ratio=remaining,
         )
 
+    @classmethod
+    def from_traffic_counts(
+        cls,
+        slo_name: str,
+        target: float,
+        actual_traffic: int,
+        baseline_traffic: int,
+    ) -> ErrorBudget:
+        """Build a budget for traffic signals with target > 1.0.
+
+        For traffic signals, the target represents the expected traffic ratio
+        (e.g., 1.2 means 120% of baseline). The SLI is calculated as
+        min(actual_traffic / baseline_traffic, 1.0).
+        """
+        if target <= 1.0:
+            raise ValueError(f"traffic target must be > 1.0, got {target}")
+        if baseline_traffic <= 0:
+            return cls(
+                slo_name=slo_name,
+                target=target,
+                total_events=0,
+                error_events=0,
+                budget_total=0.0,
+                budget_consumed=0.0,
+                remaining_ratio=1.0,
+            )
+        
+        # Calculate traffic ratio (SLI for traffic)
+        traffic_ratio = actual_traffic / baseline_traffic
+        sli = min(traffic_ratio, 1.0)  # Cap at 1.0
+        
+        # For traffic signals, "error" is when we exceed the target
+        # The budget is how much we can exceed the target
+        excess_traffic = max(0, actual_traffic - target * baseline_traffic)
+        budget_total = (target - 1.0) * baseline_traffic  # Allowance above baseline
+        budget_consumed = excess_traffic
+        
+        if budget_total <= 0.0:
+            # No allowance for exceeding target: any excess exhausts it
+            remaining = 1.0 if excess_traffic == 0 else -float(excess_traffic)
+        else:
+            remaining = (budget_total - excess_traffic) / budget_total
+        
+        return cls(
+            slo_name=slo_name,
+            target=target,
+            total_events=actual_traffic,
+            error_events=excess_traffic,
+            budget_total=budget_total,
+            budget_consumed=float(budget_consumed),
+            remaining_ratio=remaining,
+        )
+
     @property
     def consumed_ratio(self) -> float:
         """Share of the budget consumed so far (can exceed 1.0 when overspent)."""

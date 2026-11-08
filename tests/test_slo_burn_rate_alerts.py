@@ -209,10 +209,21 @@ def slo_rules(rules):
     return groups[0]["rules"]
 
 
+@pytest.fixture(scope="module")
+def golden_signal_rules(rules):
+    groups = [g for g in rules["groups"] if g["name"] == "golden-signals"]
+    assert groups, "golden-signals group missing from prometheus-rules.yml"
+    
+    # Exclude the overall health alert
+    return [r for r in groups[0]["rules"] if r.get("alert") != "GoldenSignalsMultipleUnhealthy"]
+
+
 class TestPrometheusRules:
-    def test_eight_alerts_cover_all_slos_both_severities(self, slo_rules):
+    def test_eight_alerts_cover_all_original_slos_both_severities(self, slo_rules):
         combos = {(r["labels"]["slo"], r["labels"]["severity"]) for r in slo_rules}
-        expected = {(slo, sev) for slo in SLO_CATALOG for sev in ("page", "ticket")}
+        # Original 4 SLOs only
+        original_slos = {"availability", "latency_p95", "quality", "cost_p99"}
+        expected = {(slo, sev) for slo in original_slos for sev in ("page", "ticket")}
         assert combos == expected
 
     def test_alert_names(self, slo_rules):
@@ -270,6 +281,38 @@ class TestPrometheusRules:
 
     def test_yaml_file_reparses(self, rules):
         assert rules["groups"]  # sanity: whole file is valid YAML
+
+    def test_eight_alerts_cover_all_golden_signals_both_severities(self, golden_signal_rules):
+        combos = {(r["labels"]["slo"], r["labels"]["severity"]) for r in golden_signal_rules}
+        # Golden signals only
+        golden_slos = {"latency_p99", "traffic", "errors", "saturation"}
+        expected = {(slo, sev) for slo in golden_slos for sev in ("page", "ticket")}
+        assert combos == expected
+
+    def test_golden_signal_alert_names(self, golden_signal_rules):
+        for r in golden_signal_rules:
+            expected = "GoldenSignalLatencyBurnRateHigh" if r["labels"]["severity"] == "page" else "GoldenSignalLatencyBurnRateSlowBurn"
+            # Check if it's a latency signal
+            if r["labels"]["slo"] == "latency_p99":
+                assert r["alert"] == expected
+            elif r["labels"]["slo"] == "traffic":
+                expected_alert = "GoldenSignalTrafficBurnRateHigh" if r["labels"]["severity"] == "page" else "GoldenSignalTrafficBurnRateSlowBurn"
+                assert r["alert"] == expected_alert
+            elif r["labels"]["slo"] == "errors":
+                expected_alert = "GoldenSignalErrorsBurnRateHigh" if r["labels"]["severity"] == "page" else "GoldenSignalErrorsBurnRateSlowBurn"
+                assert r["alert"] == expected_alert
+            elif r["labels"]["slo"] == "saturation":
+                expected_alert = "GoldenSignalSaturationBurnRateHigh" if r["labels"]["severity"] == "page" else "GoldenSignalSaturationBurnRateSlowBurn"
+                assert r["alert"] == expected_alert
+
+    def test_golden_signal_metric_names(self, golden_signal_rules):
+        for r in golden_signal_rules:
+            assert "golden_signal_burn_rate" in r["expr"], f"{r['alert']}/{r['labels']['slo']} uses wrong metric"
+
+    def test_golden_signal_runbook_references(self, golden_signal_rules):
+        for r in golden_signal_rules:
+            assert r["annotations"].get("summary")
+            assert "docs/golden-signals-runbook.md" in r["annotations"]["description"]
 
 
 # ---------------------------------------------------------------------------

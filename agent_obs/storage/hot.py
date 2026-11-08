@@ -1288,14 +1288,18 @@ class HotStore:
         good_threshold: float | None = None,
         version: str | None = None,
     ) -> tuple[int, int]:
-        """Aggregate (good_events, total_events) for an SLO SLI (PP25).
+        """Aggregate (good_events, total_events) for an SLO SLI (PP25, PP59).
 
         Args:
-            sli_kind: One of "availability" | "latency" | "quality" | "cost".
+            sli_kind: One of "availability" | "latency" | "quality" | "cost" |
+                "latency_golden" | "traffic" | "errors" | "saturation".
+                PP59 adds Google SRE Four Golden Signals: latency_golden (p99),
+                traffic (request rate), errors (error rate), saturation (utilization).
             window: Rolling window length, measured back from now.
             good_threshold: Per-event good threshold — latency seconds for
-                "latency", USD for "cost", faithfulness score for "quality".
-                Unused for "availability" (good = status != "error").
+                "latency"/"latency_golden", USD for "cost", faithfulness score for "quality".
+                Unused for "availability" and "errors" (good = status != "error").
+                For "traffic", this parameter is ignored (baseline-based calculation).
             version: Optional deploy version to scope the counts to (PP29).
                 Matches the span attribute ``agent_version``, stamped into
                 ``span.attributes`` by ``ObservabilitySDK._enqueue`` from
@@ -1309,6 +1313,7 @@ class HotStore:
 
         Note: the 30d SLO window exceeds hot-tier TTLs (spans 21d, evals 14d),
         so long-window results are a lower bound until warm rollups land (PP25).
+        Golden signals use the same TTL constraints as the base SLOs.
         """
         cutoff = time.time() - window.total_seconds()
         params: dict = {"cutoff": cutoff}
@@ -1383,6 +1388,105 @@ class HotStore:
                 FROM eval_results_hot
                 WHERE eval_timestamp >= toDateTime64(%(cutoff)s, 3)
                 {version_scope}
+                """,
+                params,
+            )
+        elif sli_kind == "latency_golden":
+            # PP59: Golden Signal latency - p99 latency <= 2 seconds
+            if good_threshold is None:
+                raise ValueError("latency_golden SLI requires good_threshold (seconds)")
+            params["threshold"] = float(good_threshold)
+            # Calculate p99 latency per trace, then count traces within threshold
+            rows = self._execute_clickhouse(
+                f"""
+                SELECT count(), countIf(p99_latency <= %(threshold)s)
+                FROM (
+                    SELECT 
+                        trace_id,
+                        quantileExact(0.99)(end_time - start_time) AS p99_latency
+                    FROM spans_hot
+                    WHERE span_type = 'agent.loop'
+                      AND start_time >= toDateTime64(%(cutoff)s, 3)
+                      {version_predicate}
+                    GROUP BY trace_id
+                    HAVING p99_latency <= 60  -- Filter out traces with impossible latency
+                )
+                """,
+                params,
+            )
+        elif sli_kind == "traffic":
+            # PP59: Golden Signal traffic - within 20% of 7-day moving average
+            # SLI is calculated as current_rate / baseline_rate, where baseline is 7-day moving average
+            current_rows = self._execute_clickhouse(
+                f"""
+                SELECT count() as current_count
+                FROM spans_hot
+                WHERE span_type = 'agent.loop'
+                  AND start_time >= toDateTime64(%(cutoff)s, 3)
+                  {version_predicate}
+                """,
+                params,
+            )
+            if not current_rows:
+                return (0, 0)
+            current_count = int(current_rows[0][0])
+            
+            # Calculate 7-day moving average from historical data
+            baseline_rows = self._execute_clickhouse(
+                f"""
+                SELECT count() as baseline_count
+                FROM spans_hot
+                WHERE span_type = 'agent.loop'
+                  AND start_time >= toDateTime64(%(cutoff)s - 7*86400, 3)
+                  AND start_time < toDateTime64(%(cutoff)s, 3)
+                  {version_predicate}
+                """,
+                params,
+            )
+            if not baseline_rows:
+                return (current_count, current_count)  # No baseline data, treat as perfect SLI
+            
+            baseline_count = int(baseline_rows[0][0])
+            baseline_rate = baseline_count / 7.0  # 7-day moving average
+            
+            # SLI = current_rate / baseline_rate, capped at 1.0 for SLI calculation
+            # Target is 1.20 (20% above baseline), so we count as "good" if current_rate <= 1.20 * baseline_rate
+            target_multiplier = 1.20
+            good_count = current_count if baseline_rate == 0 else min(current_count, int(baseline_rate * target_multiplier))
+            
+            return (good_count, current_count)
+        elif sli_kind == "errors":
+            # PP59: Golden Signal errors - share of requests without errors
+            # Similar to availability but for all span types, not just root spans
+            rows = self._execute_clickhouse(
+                f"""
+                SELECT count(), countIf(status != 'error')
+                FROM spans_hot
+                WHERE start_time >= toDateTime64(%(cutoff)s, 3)
+                  {version_predicate}
+                """,
+                params,
+            )
+        elif sli_kind == "saturation":
+            # PP59: Golden Signal saturation - system utilization <= 80%
+            # Track concurrent spans as proxy for system utilization
+            rows = self._execute_clickhouse(
+                f"""
+                SELECT count(), countIf(max_concurrent <= 0.8)
+                FROM (
+                    SELECT 
+                        trace_id,
+                        max(concurrent_spans) AS max_concurrent
+                    FROM (
+                        SELECT 
+                            trace_id,
+                            count() OVER (PARTITION BY trace_id ORDER BY start_time) AS concurrent_spans
+                        FROM spans_hot
+                        WHERE start_time >= toDateTime64(%(cutoff)s, 3)
+                          {version_predicate}
+                    )
+                    GROUP BY trace_id
+                )
                 """,
                 params,
             )

@@ -1,0 +1,715 @@
+{
+  "uid": "golden-signals",
+  "title": "Golden Signals",
+  "description": "PP59: Google SRE Four Golden Signals dashboard - LATENCY, TRAFFIC, ERRORS, SATURATION monitoring with SLI vs target, burn rate trends, and drill-down into traces that degrade each signal.",
+  "tags": ["agent-obs", "golden-signals", "pp59", "sre", "latency", "traffic", "errors", "saturation"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["30s", "1m", "5m", "15m", "30m", "1h"],
+    "time_options": ["1h", "6h", "24h", "7d", "30d"]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "trace_viewer_url",
+        "label": "Trace-viewer URL",
+        "description": "Base URL of the trace-viewer used by the drill-down links. Default is Langfuse (E1.5) on :3000 - set it to http://127.0.0.1:8089 to drill into the built-in PP10 trace viewer instead.",
+        "type": "textbox",
+        "query": "http://localhost:3000",
+        "current": {
+          "text": "http://localhost:3000",
+          "value": "http://localhost:3000"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "http://localhost:3000",
+            "value": "http://localhost:3000"
+          }
+        ]
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Open trace-viewer",
+      "url": "${var:trace_viewer_url}",
+      "icon": "external link",
+      "type": "link",
+      "targetBlank": true,
+      "tooltip": "Trace-viewer (Langfuse by default). Set the 'Trace-viewer URL' variable to point it elsewhere."
+    },
+    {
+      "title": "SLO Dashboard",
+      "url": "/d/slo/slo",
+      "icon": "dashboard",
+      "type": "link",
+      "targetBlank": false,
+      "tooltip": "View original SLO dashboard"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Golden Signal State Changes",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "iconColor": "orange",
+        "titleFormat": "{{signal}} signal {{new_state}}",
+        "textFormat": "{{reason}}",
+        "target": {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "{{signal}} {{new_state}}",
+          "range": true,
+          "refId": "A",
+          "expr": "rate(golden_signal_healthy_changes_total[5m])"
+        }
+      },
+      {
+        "name": "Error Budget Actions",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "iconColor": "red",
+        "titleFormat": "{{signal}} budget {{action}}",
+        "textFormat": "{{reason}}",
+        "target": {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "{{signal}} {{action}}",
+          "range": true,
+          "refId": "A",
+          "expr": "rate(slo_error_budget_actions_taken_total{~signal=~\"latency_p99|traffic|errors|saturation\"}[5m])"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 0 },
+      "type": "stat",
+      "title": "Golden Signals Health",
+      "description": "How many of the 4 golden signals are healthy (latency, traffic, errors, saturation). Green = all healthy, yellow = 1-2 at risk, red = >2 at risk.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "count(golden_signal_healthy == 1) OR vector(0)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 4,
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "all unhealthy", "color": "red" }, "1": { "text": "1 signal healthy", "color": "red" }, "2": { "text": "2 signals healthy", "color": "yellow" }, "3": { "text": "3 signals healthy", "color": "yellow" }, "4": { "text": "all healthy", "color": "green" } } }
+          ],
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "red", "value": 1 },
+              { "color": "yellow", "value": 2 },
+              { "color": "yellow", "value": 3 },
+              { "color": "green", "value": 4 }
+            ]
+          },
+          "valueMaps": [
+            { "match": "0", "text": "0/4 healthy" },
+            { "match": "1", "text": "1/4 healthy" },
+            { "match": "2", "text": "2/4 healthy" },
+            { "match": "3", "text": "3/4 healthy" },
+            { "match": "4", "text": "4/4 healthy" }
+          ]
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "text": {}
+      }
+    },
+    {
+      "id": 2,
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "type": "gauge",
+      "title": "latency: SLI vs target",
+      "description": "golden_signal_latency_sli - rolling window share of requests within latency target. Target golden_signal_latency_target = 0.95",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "golden_signal_latency_sli{name=\"latency_p99\"}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "B",
+          "expr": "golden_signal_latency_target{name=\"latency_p99\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "yellow", "value": 0.9 },
+              { "color": "green", "value": 0.95 }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "text": {}
+      }
+    },
+    {
+      "id": 3,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "type": "timeseries",
+      "title": "latency: p99 latency trend",
+      "description": "p99 latency over time with threshold comparison",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, rate(agent_obs_span_duration_seconds_bucket[5m])) by (span_type)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "seconds",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointRadius": 2,
+            "pointShape": "circle",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointInterval": null,
+            "pointTimeWindow": null,
+            "pointOffset": null,
+            "barAlignment": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "useThresholds": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "dataLinks": []
+      }
+    },
+    {
+      "id": 4,
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 7 },
+      "type": "gauge",
+      "title": "errors: error rate",
+      "description": "golden_signal_error_sli - percentage of requests with errors. Target golden_signal_error_target = 0.995",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "1 - golden_signal_error_sli{name=\"errors\"}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "B",
+          "expr": "1 - golden_signal_error_target{name=\"errors\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 0.1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 0.005 },
+              { "color": "red", "value": 0.01 }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "text": {}
+      }
+    },
+    {
+      "id": 5,
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 15 },
+      "type": "timeseries",
+      "title": "traffic: request rate",
+      "description": "golden_signal_traffic_sli - requests per second with baseline comparison",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "rate(agent_obs_spans_total[5m]) by (span_type)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointRadius": 2,
+            "pointShape": "circle",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointInterval": null,
+            "pointTimeWindow": null,
+            "pointOffset": null,
+            "barAlignment": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "useThresholds": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "dataLinks": []
+      }
+    },
+    {
+      "id": 6,
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 15 },
+      "type": "gauge",
+      "title": "saturation: resource utilization",
+      "description": "golden_signal_saturation_sli - system resource utilization percentage. Target golden_signal_saturation_target = 0.80",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "golden_signal_saturation_sli{name=\"saturation\"}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "B",
+          "expr": "golden_signal_saturation_target{name=\"saturation\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 0.8 },
+              { "color": "red", "value": 0.9 }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "values": false,
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "text": {}
+      }
+    },
+    {
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "type": "timeseries",
+      "title": "saturation: concurrent spans",
+      "description": "Maximum concurrent spans per trace (proxy for system utilization)",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "refId": "A",
+          "rawSql": "SELECT\n  toStartOfHour(timestamp) AS time,\n  avg(max_concurrent) AS avg_max_concurrent,\n  quantile(0.95)(max_concurrent) AS p95_max_concurrent\nFROM (\n  SELECT \n    toStartOfHour(start_time) AS timestamp,\n    trace_id,\n    max(concurrent_spans) AS max_concurrent\n  FROM (\n    SELECT \n      trace_id,\n      start_time,\n      count() OVER (PARTITION BY trace_id ORDER BY start_time) AS concurrent_spans\n    FROM spans_hot\n    WHERE start_time >= now() - interval '24 hour'\n      AND span_type = 'agent.loop'\n  )\n  GROUP BY trace_id, timestamp\n)\nGROUP BY time\nORDER BY time"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointRadius": 2,
+            "pointShape": "circle",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointInterval": null,
+            "pointTimeWindow": null,
+            "pointOffset": null,
+            "barAlignment": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "useThresholds": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "dataLinks": []
+      }
+    },
+    {
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "type": "timeseries",
+      "title": "Golden Signal Burn Rates",
+      "description": "Multi-window burn rate trends for all golden signals",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "expr": "golden_signal_burn_rate{name=\"latency_p99\", window=\"5m\"}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "B",
+          "expr": "golden_signal_burn_rate{name=\"latency_p99\", window=\"1h\"}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "C",
+          "expr": "golden_signal_burn_rate{name=\"traffic\", window=\"5m\"}"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "D",
+          "expr": "golden_signal_burn_rate{name=\"traffic\", window=\"1h\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointRadius": 2,
+            "pointShape": "circle",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointInterval": null,
+            "pointTimeWindow": null,
+            "pointOffset": null,
+            "barAlignment": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "useThresholds": false
+          },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "dataLinks": []
+      }
+    },
+    {
+      "id": 9,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 23 },
+      "type": "table",
+      "title": "latency: slow requests",
+      "description": "Requests exceeding latency threshold with drill-down links",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "refId": "A",
+          "rawSql": "SELECT\n  trace_id,\n  formatDateTime(start_time, '%Y-%m-%d %H:%M:%S') AS time,\n  duration_ms,\n  status,\n  agent_id,\n  tenant_id,\n  concat('${var:trace_viewer_url}/trace/', trace_id) AS trace_url\nFROM spans_hot\nWHERE span_type = 'agent.loop'\n  AND duration_ms > 2000  -- Above 2 second threshold\n  AND start_time >= now() - interval '24 hour'\nORDER BY duration_ms DESC\nLIMIT 50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": null,
+            "displayMode": "auto",
+            "filterable": false,
+            "width": 100
+          },
+          "mappings": [],
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 1000 },
+              { "color": "red", "value": 2000 }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trace_url"
+            },
+            "properties": [
+              {
+                "id": "custom.displayMode",
+                "value": "url"
+              },
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "duration_ms"
+          }
+        ]
+      }
+    },
+    {
+      "id": 10,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 32 },
+      "type": "table",
+      "title": "errors: failed requests",
+      "description": "Requests with error status and drill-down links",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "refId": "A",
+          "rawSql": "SELECT\n  trace_id,\n  formatDateTime(start_time, '%Y-%m-%d %H:%M:%S') AS time,\n  status,\n  error_message,\n  agent_id,\n  tenant_id,\n  concat('${var:trace_viewer_url}/trace/', trace_id) AS trace_url\nFROM spans_hot\nWHERE status = 'error'\n  AND start_time >= now() - interval '24 hour'\nORDER BY start_time DESC\nLIMIT 50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": null,
+            "displayMode": "auto",
+            "filterable": false,
+            "width": 100
+          },
+          "mappings": [],
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trace_url"
+            },
+            "properties": [
+              {
+                "id": "custom.displayMode",
+                "value": "url"
+              },
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "time"
+          }
+        ]
+      }
+    },
+    {
+      "id": 11,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 32 },
+      "type": "table",
+      "title": "traffic: unusual request rates",
+      "description": "Requests with unusual traffic patterns (baseline comparison)",
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "refId": "A",
+          "rawSql": "SELECT\n  trace_id,\n  formatDateTime(start_time, '%Y-%m-%d %H:%M:%S') AS time,\n  duration_ms,\n  agent_id,\n  tenant_id,\n  concat('${var:trace_viewer_url}/trace/', trace_id) AS trace_url,\n  -- Calculate current rate vs baseline\n  count() OVER (PARTITION toStartOfHour(start_time)) AS hourly_count\nFROM spans_hot\nWHERE span_type = 'agent.loop'\n  AND start_time >= now() - interval '24 hour'\n  -- Show traces in unusual traffic periods
+  AND count() OVER (PARTITION toStartOfHour(start_time)) > 
+    (SELECT avg(count) FROM (
+      SELECT count() AS count FROM spans_hot 
+      WHERE span_type = 'agent.loop'
+        AND start_time >= now() - interval '7 day'
+      GROUP BY toStartOfHour(start_time)
+    ) * 1.2)  -- Above 20% of 7-day average
+ORDER BY hourly_count DESC\nLIMIT 50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": null,
+            "displayMode": "auto",
+            "filterable": false,
+            "width": 100
+          },
+          "mappings": [],
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 200 }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "trace_url"
+            },
+            "properties": [
+              {
+                "id": "custom.displayMode",
+                "value": "url"
+              },
+              {
+                "id": "custom.width",
+                "value": 200
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "hourly_count"
+          }
+        ]
+      }
+    }
+  ]
+}

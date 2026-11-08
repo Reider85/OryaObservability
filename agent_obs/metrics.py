@@ -631,6 +631,75 @@ slo_error_budget_actions_taken_total = Counter(
     ["name", "action"],
 )
 
+# --- PP59 Golden Signals metrics (Google SRE Four Golden Signals) -------------
+# PP59 extends SLO metrics with LATENCY, TRAFFIC, ERRORS, SATURATION golden signals.
+# All gauges updated by SLORefresher, following the same 5-minute cadence.
+# `name` label includes both original SLOs and golden signals from SLO_CATALOG.
+
+# Golden Signal SLI values (actual SLI for each golden signal)
+golden_signal_latency_sli = Gauge(
+    "golden_signal_latency_sli",
+    "Golden Signal: latency SLI (p99 latency <= 2 seconds), rolling 30d",
+    ["name"],
+)
+
+golden_signal_traffic_sli = Gauge(
+    "golden_signal_traffic_sli", 
+    "Golden Signal: traffic SLI (within 20% of 7-day moving average), rolling 30d",
+    ["name"],
+)
+
+golden_signal_error_sli = Gauge(
+    "golden_signal_error_sli",
+    "Golden Signal: error SLI (share of requests without errors), rolling 30d",
+    ["name"],
+)
+
+golden_signal_saturation_sli = Gauge(
+    "golden_signal_saturation_sli",
+    "Golden Signal: saturation SLI (system utilization <= 80%), rolling 30d",
+    ["name"],
+)
+
+# Golden Signal health indicators (1=healthy, 0=unhealthy)
+golden_signal_healthy = Gauge(
+    "golden_signal_healthy",
+    "Golden Signal health status (1=healthy, 0=unhealthy)",
+    ["name"],
+)
+
+# Golden Signal burn rates per alerting window
+golden_signal_burn_rate = Gauge(
+    "golden_signal_burn_rate",
+    "Golden Signal error-budget burn rate per alerting window",
+    ["name", "window"],
+)
+
+# Golden Signal target values
+golden_signal_latency_target = Gauge(
+    "golden_signal_latency_target",
+    "Golden Signal: latency target (p99 <= 2 seconds)",
+    ["name"],
+)
+
+golden_signal_traffic_target = Gauge(
+    "golden_signal_traffic_target",
+    "Golden Signal: traffic target (20% above baseline tolerance)",
+    ["name"],
+)
+
+golden_signal_error_target = Gauge(
+    "golden_signal_error_target",
+    "Golden Signal: error target (< 0.5% error rate)",
+    ["name"],
+)
+
+golden_signal_saturation_target = Gauge(
+    "golden_signal_saturation_target",
+    "Golden Signal: saturation target (<= 80% utilization)",
+    ["name"],
+)
+
 # --- PP38 health probes + circuit breakers (T3.8.4) -------------------------
 # `dependency` is a bounded set (DEPENDENCIES in agent_obs.ha.health_checks):
 # langfuse | ch | pg | vault | redis | minio.

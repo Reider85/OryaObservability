@@ -4,6 +4,8 @@ Four SLOs with target + rolling window + multi-window burn-rate thresholds
 (Google SRE Workbook style). Single source of truth for PP26 (burn-rate
 alerting), PP27 (error budget) and PP28 (Grafana dashboard).
 
+PP59 extends with Google SRE Four Golden Signals: latency, traffic, errors, saturation.
+
 SLI definitions (how each SLO is measured)
 ------------------------------------------
 All SLIs are event ratios over a rolling window: ``good_events / total_events``.
@@ -30,6 +32,30 @@ cost_p99
     SLI = share of traces with per-request cost <= $0.05 (rolling 30d).
     Per-request cost is the sum of ``cost_usd`` across all spans of a trace.
 
+Golden Signals (PP59)
+----------------------
+Google SRE Four Golden Signals for comprehensive system health monitoring:
+
+latency_p99 (Golden Signal)
+    SLI = share of requests with p99 latency <= 2 seconds (rolling 30d).
+    Measures user experience and system responsiveness. Target 0.95 means
+    "p99 of requests complete within 2 seconds".
+
+traffic (Golden Signal)
+    SLI = traffic rate within 20% of 7-day moving average (rolling 30d).
+    Measures service load and capacity planning. Target 1.20 allows for
+    20% growth above baseline without triggering alerts.
+
+errors (Golden Signal)
+    SLI = share of requests without errors (rolling 30d).
+    Measures service reliability and error rates. Target 0.995 means
+    "less than 0.5% of requests result in errors".
+
+saturation (Golden Signal)
+    SLI = share of time system utilization <= 80% (rolling 30d).
+    Measures resource pressure and capacity headroom. Target 0.80 means
+    "system operates below 80% utilization 95% of the time".
+
 Burn rate
 ---------
 ``burn_rate = (1 - actual_sli) / (1 - target)`` — how fast the error budget
@@ -55,6 +81,11 @@ SLI_KIND_AVAILABILITY = "availability"
 SLI_KIND_LATENCY = "latency"
 SLI_KIND_QUALITY = "quality"
 SLI_KIND_COST = "cost"
+#: SLI kinds for golden signals (PP59)
+SLI_KIND_LATENCY_GOLDEN = "latency_golden"
+SLI_KIND_TRAFFIC = "traffic"
+SLI_KIND_ERRORS = "errors"
+SLI_KIND_SATURATION = "saturation"
 
 
 @dataclass(frozen=True)
@@ -83,8 +114,13 @@ class SLO:
     good_threshold: float | None = None
 
     def __post_init__(self) -> None:
-        if not 0.0 < self.target <= 1.0:
-            raise ValueError(f"SLO {self.name!r}: target must be in (0, 1], got {self.target}")
+        # Traffic signal allows targets > 1.0 (e.g., 1.2 = 20% above baseline)
+        if self.sli_kind == SLI_KIND_TRAFFIC:
+            if not 0.0 < self.target:
+                raise ValueError(f"SLO {self.name!r}: traffic target must be > 0, got {self.target}")
+        else:
+            if not 0.0 < self.target <= 1.0:
+                raise ValueError(f"SLO {self.name!r}: target must be in (0, 1], got {self.target}")
 
 
 def _slo(
@@ -105,6 +141,7 @@ def _slo(
 
 
 #: The PP25 catalog: 4 SLOs with target + window + burn-rate thresholds.
+#: PP59 extends with 4 golden signals: latency, traffic, errors, saturation.
 SLO_CATALOG: dict[str, SLO] = {
     "availability": _slo(
         "availability",
@@ -132,6 +169,32 @@ SLO_CATALOG: dict[str, SLO] = {
         thresholds=[("1h", "6h", 6.0), ("6h", "1d", 3.0)],
         sli_kind=SLI_KIND_COST,
         good_threshold=0.05,  # USD per request
+    ),
+    # PP59: Golden Signals (Google SRE Four Golden Signals)
+    "latency_p99": _slo(
+        "latency_p99",
+        target=0.95,
+        thresholds=[("5m", "1h", 14.4), ("1h", "6h", 6.0)],
+        sli_kind=SLI_KIND_LATENCY_GOLDEN,
+        good_threshold=2.0,  # seconds (p99 latency target)
+    ),
+    "traffic": _slo(
+        "traffic",
+        target=1.20,  # +20% tolerance above 7-day moving average
+        thresholds=[("5m", "1h", 14.4), ("1h", "6h", 6.0)],
+        sli_kind=SLI_KIND_TRAFFIC,
+    ),
+    "errors": _slo(
+        "errors",
+        target=0.995,  # < 0.5% error rate
+        thresholds=[("5m", "1h", 14.4), ("1h", "6h", 6.0)],
+        sli_kind=SLI_KIND_ERRORS,
+    ),
+    "saturation": _slo(
+        "saturation",
+        target=0.80,  # 80% utilization threshold
+        thresholds=[("5m", "1h", 14.4), ("1h", "6h", 6.0)],
+        sli_kind=SLI_KIND_SATURATION,
     ),
 }
 
@@ -192,12 +255,26 @@ def burn_rate(actual_sli: float, target: float) -> float:
     ``> 1.0`` means the budget is being consumed faster than the target
     allows. Raises ValueError when target == 1.0 (zero budget — burn rate
     is undefined).
+    
+    For traffic signals with target > 1.0, calculates burn rate as
+    ``(actual_sli / target) - 1.0`` where actual_sli is the traffic ratio
+    (actual_traffic / baseline_traffic).
     """
-    if not 0.0 < target < 1.0:
-        raise ValueError(f"burn rate undefined for target={target!r} (must be in (0, 1))")
-    if not 0.0 <= actual_sli <= 1.0:
-        raise ValueError(f"actual_sli must be in [0, 1], got {actual_sli!r}")
-    return (1.0 - actual_sli) / (1.0 - target)
+    if target == 1.0:
+        raise ValueError(f"burn rate undefined for target={target!r} (zero budget)")
+    
+    if 0.0 < target < 1.0:
+        # Regular SLI: burn rate increases as actual_sli decreases
+        if not 0.0 <= actual_sli <= 1.0:
+            raise ValueError(f"actual_sli must be in [0, 1], got {actual_sli!r}")
+        return (1.0 - actual_sli) / (1.0 - target)
+    elif target > 1.0:
+        # Traffic signal: burn rate increases as actual_sli increases above target
+        if actual_sli <= 0.0:
+            raise ValueError(f"traffic actual_sli must be > 0, got {actual_sli!r}")
+        return (actual_sli / target) - 1.0
+    else:
+        raise ValueError(f"target must be > 0, got {target!r}")
 
 
 def sli_from_counts(good_events: int, total_events: int) -> float:

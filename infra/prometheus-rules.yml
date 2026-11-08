@@ -603,89 +603,257 @@ groups:
              (AGENT_OBS_HEALTH_PROBE_INTERVAL). Check the dependency's own
              health endpoint and the HA stack (infra/docker-compose.ha.yml).
 
-   # PP47 (T3.10.4): Performance isolation for shared proxy.
-   # These rules monitor the performance isolation between security and obs pipelines.
+# PP47 (T3.10.4): Performance isolation for shared proxy.
+  # These rules monitor the performance isolation between security and obs pipelines.
   - name: shared-proxy-performance
     rules:
-       # Alert if security pipeline latency exceeds 50ms (PP47 timeout)
-       - alert: SharedProxySecurityLatencyHigh
-         expr: histogram_quantile(0.99, sum(rate(shared_proxy_security_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.05
-         for: 5m
-         labels:
-           severity: warning
-           component: proxy
-         annotations:
-           summary: "Shared proxy security pipeline latency >50ms for >5m"
-           description: >-
-             Security pipeline latency (p99) has been above 50ms for more than 5 minutes.
-             This indicates performance issues in the security scanning pipeline.
-             Check OryaSecurity service health and network latency.
+      # Alert if security pipeline latency exceeds 50ms (PP47 timeout)
+      - alert: SharedProxySecurityLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(shared_proxy_security_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: proxy
+        annotations:
+          summary: "Shared proxy security pipeline latency >50ms for >5m"
+          description: >-
+            Security pipeline latency (p99) has been above 50ms for more than 5 minutes.
+            This indicates performance issues in the security scanning pipeline.
+            Check OryaSecurity service health and network latency.
 
-       # Alert if obs pipeline latency exceeds 100ms (PP47 timeout)
-       - alert: SharedProxyObsLatencyHigh
-         expr: histogram_quantile(0.99, sum(rate(shared_proxy_obs_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
-         for: 5m
-         labels:
-           severity: warning
-           component: proxy
-         annotations:
-           summary: "Shared proxy obs pipeline latency >100ms for >5m"
-           description: >-
-             Observability pipeline latency (p99) has been above 100ms for more than 5 minutes.
-             This indicates performance issues in the observability enrichment pipeline.
-             Check obs pipeline resources and upstream dependencies.
+      # Alert if obs pipeline latency exceeds 100ms (PP47 timeout)
+      - alert: SharedProxyObsLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(shared_proxy_obs_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: proxy
+        annotations:
+          summary: "Shared proxy obs pipeline latency >100ms for >5m"
+          description: >-
+            Observability pipeline latency (p99) has been above 100ms for more than 5 minutes.
+            This indicates performance issues in the observability enrichment pipeline.
+            Check obs pipeline resources and upstream dependencies.
 
-       # Alert if total pipeline latency exceeds 100ms (PP47 SLA)
-       - alert: SharedProxyTotalLatencyHigh
-         expr: histogram_quantile(0.99, sum(rate(shared_proxy_total_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
-         for: 5m
-         labels:
-           severity: critical
-           component: proxy
-         annotations:
-           summary: "Shared proxy total latency >100ms (SLA violation) for >5m"
-           description: >-
-             Total shared proxy pipeline latency (p99) has exceeded the 100ms SLA for more than 5 minutes.
-             This violates PP47 performance isolation requirements. Check both security and obs pipelines.
+      # Alert if total pipeline latency exceeds 100ms (PP47 SLA)
+      - alert: SharedProxyTotalLatencyHigh
+        expr: histogram_quantile(0.99, sum(rate(shared_proxy_total_latency_seconds_bucket[5m])) by (le, agent_id, tenant_id)) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: proxy
+        annotations:
+          summary: "Shared proxy total latency >100ms (SLA violation) for >5m"
+          description: >-
+            Total shared proxy pipeline latency (p99) has exceeded the 100ms SLA for more than 5 minutes.
+            This violates PP47 performance isolation requirements. Check both security and obs pipelines.
 
-       # PP48: Alert if block rate exceeds 5%
-       - alert: SharedProxyBlockRateHigh
-         expr: rate(shared_proxy_audit_total{decision="block"}[5m]) / rate(shared_proxy_audit_total[5m]) > 0.05
-         for: 5m
-         labels:
-           severity: critical
-           component: proxy
-         annotations:
-           summary: "Shared proxy block rate >5% for >5m"
-           description: >-
-             Block rate has exceeded 5% for more than 5 minutes. This may indicate
-             an ongoing attack or overly aggressive security policies. Investigate
-             recent security events and consider policy tuning.
+      # PP48: Alert if block rate exceeds 5%
+      - alert: SharedProxyBlockRateHigh
+        expr: rate(shared_proxy_audit_total{decision="block"}[5m]) / rate(shared_proxy_audit_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: proxy
+        annotations:
+          summary: "Shared proxy block rate >5% for >5m"
+          description: >-
+            Block rate has exceeded 5% for more than 5 minutes. This may indicate
+            an ongoing attack or overly aggressive security policies. Investigate
+            recent security events and consider policy tuning.
 
-       # PP48: Alert if security timeout rate exceeds 10%
-       - alert: SharedProxySecurityTimeoutsHigh
-         expr: rate(shared_proxy_security_timeouts_total[5m]) / (rate(shared_proxy_security_timeouts_total[5m]) + rate(shared_proxy_pipeline_total[5m])) > 0.1
-         for: 5m
-         labels:
-           severity: warning
-           component: proxy
-         annotations:
-           summary: "Shared proxy security timeout rate >10% for >5m"
-           description: >-
-             Security pipeline timeout rate has exceeded 10% for more than 5 minutes.
-             This may indicate that OryaSecurity is overwhelmed or network issues.
-             Consider increasing timeout or scaling the security service.
+      # PP48: Alert if security timeout rate exceeds 10%
+      - alert: SharedProxySecurityTimeoutsHigh
+        expr: rate(shared_proxy_security_timeouts_total[5m]) / (rate(shared_proxy_security_timeouts_total[5m]) + rate(shared_proxy_pipeline_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: proxy
+        annotations:
+          summary: "Shared proxy security timeout rate >10% for >5m"
+          description: >-
+            Security pipeline timeout rate has exceeded 10% for more than 5 minutes.
+            This may indicate that OryaSecurity is overwhelmed or network issues.
+            Consider increasing timeout or scaling the security service.
 
-       # Alert if security circuit breaker opens frequently
-       - alert: SharedProxySecurityCircuitOpenFrequent
-         expr: rate(shared_proxy_security_circuit_open_total[5m]) > 0.1
-         for: 5m
-         labels:
-           severity: warning
-           component: proxy
-         annotations:
-           summary: "Shared proxy security circuit opens >0.1/min for >5m"
-           description: >-
-             Security circuit breaker has been opening more than once every 10 minutes.
-             This indicates persistent issues with the security service. Check the service
-             health and consider adjusting circuit breaker thresholds.
+      # Alert if security circuit breaker opens frequently
+      - alert: SharedProxySecurityCircuitOpenFrequent
+        expr: rate(shared_proxy_security_circuit_open_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: proxy
+        annotations:
+          summary: "Shared proxy security circuit opens >0.1/min for >5m"
+          description: >-
+            Security circuit breaker has been opening more than once every 10 minutes.
+            This indicates persistent issues with the security service. Check the service
+            health and consider adjusting circuit breaker thresholds.
+
+  # PP59 (T3.6.4): Golden Signals alerting - Google SRE Four Golden Signals
+  # LATENCY, TRAFFIC, ERRORS, SATURATION with multi-window burn rate alerting
+  # Same thresholds and window pairs as SLOs but for golden signals
+  # Runbook: docs/golden-signals-runbook.md
+  - name: golden-signals
+    rules:
+      # --- Page: fast burn (latency_p99: 5m + 1h @ 14.4x) ---
+      - alert: GoldenSignalLatencyBurnRateHigh
+        expr: |
+          (golden_signal_burn_rate{name="latency_p99",window="5m"} > 14.4)
+          and on(name)
+          (golden_signal_burn_rate{name="latency_p99",window="1h"} > 14.4)
+        for: 2m
+        labels:
+          severity: page
+          slo: latency_p99
+        annotations:
+          summary: "Golden Signal: Latency p99 burn-rate high (page)"
+          description: >-
+            Latency p99 budget (>2s traces) is burning at >14.4x over BOTH the
+            5m and 1h windows ({{ $value | humanize }}). Fast burn: p99 of
+            traces exceeds 2 seconds persistently. Check agent loop hot
+            paths, LLM provider latency and network latency.
+            Runbook: docs/golden-signals-runbook.md#latency.
+
+      # --- Page: fast burn (traffic: 5m + 1h @ 14.4x) ---
+      - alert: GoldenSignalTrafficBurnRateHigh
+        expr: |
+          (golden_signal_burn_rate{name="traffic",window="5m"} > 14.4)
+          and on(name)
+          (golden_signal_burn_rate{name="traffic",window="1h"} > 14.4)
+        for: 2m
+        labels:
+          severity: page
+          slo: traffic
+        annotations:
+          summary: "Golden Signal: Traffic burn-rate high (page)"
+          description: >-
+            Traffic budget is burning at >14.4x over BOTH the 5m and 1h windows
+            ({{ $value | humanize }}). Fast burn: request rate has deviated
+            significantly from baseline. Check for load spikes, DDoS, or
+            misconfigured client applications.
+            Runbook: docs/golden-signals-runbook.md#traffic.
+
+      # --- Page: fast burn (errors: 5m + 1h @ 14.4x) ---
+      - alert: GoldenSignalErrorsBurnRateHigh
+        expr: |
+          (golden_signal_burn_rate{name="errors",window="5m"} > 14.4)
+          and on(name)
+          (golden_signal_burn_rate{name="errors",window="1h"} > 14.4)
+        for: 2m
+        labels:
+          severity: page
+          slo: errors
+        annotations:
+          summary: "Golden Signal: Errors burn-rate high (page)"
+          description: >-
+            Error budget is burning at >14.4x over BOTH the 5m and 1h windows
+            ({{ $value | humanize }}). Fast burn: error rate has exceeded 0.5%.
+            Check for recent code changes, dependency failures, or infrastructure
+            issues affecting service reliability.
+            Runbook: docs/golden-signals-runbook.md#errors.
+
+      # --- Page: fast burn (saturation: 5m + 1h @ 14.4x) ---
+      - alert: GoldenSignalSaturationBurnRateHigh
+        expr: |
+          (golden_signal_burn_rate{name="saturation",window="5m"} > 14.4)
+          and on(name)
+          (golden_signal_burn_rate{name="saturation",window="1h"} > 14.4)
+        for: 2m
+        labels:
+          severity: page
+          slo: saturation
+        annotations:
+          summary: "Golden Signal: Saturation burn-rate high (page)"
+          description: >-
+            Saturation budget is burning at >14.4x over BOTH the 5m and 1h windows
+            ({{ $value | humanize }}). Fast burn: system utilization has exceeded
+            80% for extended periods. Check for resource constraints, scaling
+            issues, or memory leaks.
+            Runbook: docs/golden-signals-runbook.md#saturation.
+
+      # --- Ticket: slow burn (latency_p99: 1h + 6h @ 6.0x) ---
+      - alert: GoldenSignalLatencyBurnRateSlowBurn
+        expr: |
+          (golden_signal_burn_rate{name="latency_p99",window="1h"} > 6.0)
+          and on(name)
+          (golden_signal_burn_rate{name="latency_p99",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: latency_p99
+        annotations:
+          summary: "Golden Signal: Latency burn-rate elevated (ticket)"
+          description: >-
+            Latency p99 budget burning at >6x over BOTH the 1h and 6h windows
+            ({{ $value | humanize }}). Slow latency degradation — investigate
+            recent infrastructure changes and performance tuning.
+            Runbook: docs/golden-signals-runbook.md#latency.
+
+      # --- Ticket: slow burn (traffic: 1h + 6h @ 6.0x) ---
+      - alert: GoldenSignalTrafficBurnRateSlowBurn
+        expr: |
+          (golden_signal_burn_rate{name="traffic",window="1h"} > 6.0)
+          and on(name)
+          (golden_signal_burn_rate{name="traffic",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: traffic
+        annotations:
+          summary: "Golden Signal: Traffic burn-rate elevated (ticket)"
+          description: >-
+            Traffic budget burning at >6x over BOTH the 1h and 6h windows
+            ({{ $value | humanize }}). Slow traffic deviation — investigate
+            baseline calculation accuracy and long-term load patterns.
+            Runbook: docs/golden-signals-runbook.md#traffic.
+
+      # --- Ticket: slow burn (errors: 1h + 6h @ 6.0x) ---
+      - alert: GoldenSignalErrorsBurnRateSlowBurn
+        expr: |
+          (golden_signal_burn_rate{name="errors",window="1h"} > 6.0)
+          and on(name)
+          (golden_signal_burn_rate{name="errors",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: errors
+        annotations:
+          summary: "Golden Signal: Errors burn-rate elevated (ticket)"
+          description: >-
+            Error budget burning at >6x over BOTH the 1h and 6h windows
+            ({{ $value | humanize }}). Slow error rate degradation — investigate
+            recent code changes, dependency reliability, and error trends.
+            Runbook: docs/golden-signals-runbook.md#errors.
+
+      # --- Ticket: slow burn (saturation: 1h + 6h @ 6.0x) ---
+      - alert: GoldenSignalSaturationBurnRateSlowBurn
+        expr: |
+          (golden_signal_burn_rate{name="saturation",window="1h"} > 6.0)
+          and on(name)
+          (golden_signal_burn_rate{name="saturation",window="6h"} > 6.0)
+        for: 2m
+        labels:
+          severity: ticket
+          slo: saturation
+        annotations:
+          summary: "Golden Signal: Saturation burn-rate elevated (ticket)"
+          description: >-
+            Saturation budget burning at >6x over BOTH the 1h and 6h windows
+            ({{ $value | humanize }}). Slow saturation creep — monitor
+            resource utilization trends and scaling capacity.
+            Runbook: docs/golden-signals-runbook.md#saturation.
+
+# --- Overall Golden Signal Health Alert ---
+      - alert: GoldenSignalsMultipleUnhealthy
+        expr: count(golden_signal_healthy == 0) >= 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Multiple golden signals unhealthy"
+          description: >-
+            {{ $value }} golden signals are currently unhealthy. This indicates
+            widespread system health issues requiring immediate attention.
+            Check the individual signal alerts and system resources.
+            Runbook: docs/golden-signals-runbook.md#multiple-unhealthy.
