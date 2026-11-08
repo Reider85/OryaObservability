@@ -8,6 +8,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from agent_obs.drift.explainability import DriftAlert, DriftExplainer
 from agent_obs.drift.kl_divergence import compute_kl_from_embeddings
 from agent_obs.drift.models import DriftReport
 from agent_obs.drift.threshold import (
@@ -17,6 +18,9 @@ from agent_obs.drift.threshold import (
 )
 from agent_obs.metrics import (
     drift_alerts_total,
+    drift_explanation_generation_seconds,
+    drift_explanations_generated_total,
+    drift_explanation_llm_errors_total,
     drift_kl_score,
     drift_runs_total,
     drift_threshold_value,
@@ -56,6 +60,8 @@ class DriftDetector:
         last_window_hours: int = 1,   # 1 hour
         kl_threshold: float | None = None,  # PC25 override; None = read from config
         thresholds_path: str = DEFAULT_THRESHOLDS_PATH,
+        enable_explainability: bool = False,
+        explainer: DriftExplainer | None = None,
     ):
         self.sdk = sdk
         self.hotstore = hotstore
@@ -66,6 +72,9 @@ class DriftDetector:
         self.kl_threshold = DEFAULT_KL_THRESHOLD if kl_threshold is None else kl_threshold
         self._pinned_threshold = kl_threshold
         self.threshold_store = ThresholdStore(thresholds_path)
+        # PP57: Drift explainability
+        self.enable_explainability = enable_explainability
+        self.explainer = explainer
         # Track previous baseline labels to prevent series accumulation
         self._kl_series_labels: dict[str, tuple[str, str]] = {}
 
@@ -192,6 +201,24 @@ class DriftDetector:
                     f"Drift detected for agent {agent_id}: KL={kl_score:.4f} "
                     f"(threshold={threshold}) severity={severity}"
                 )
+                
+                # PP57: Generate drift explanation if enabled
+                if self.enable_explainability and self.explainer:
+                    try:
+                        drift_alert = DriftAlert(drift_report=report, detected_at=time.time())
+                        start_explanation = time.time()
+                        
+                        # Generate explanation in background (low priority)
+                        asyncio.create_task(self._generate_drift_explanation(
+                            drift_alert, agent_id
+                        ))
+                        
+                        duration = time.time() - start_explanation
+                        drift_explanation_generation_seconds.labels(agent_id=agent_id).observe(duration)
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to enqueue drift explanation: {e}")
+                        drift_explanation_llm_errors_total.labels(agent_id=agent_id).inc()
             else:
                 logger.info(
                     f"Drift check for agent {agent_id}: KL={kl_score:.4f} "
@@ -326,3 +353,29 @@ class DriftDetector:
             return "warning"
         else:
             return "info"
+    
+    async def _generate_drift_explanation(self, drift_alert: DriftAlert, agent_id: str) -> None:
+        """Generate drift explanation asynchronously.
+        
+        Args:
+            drift_alert: Drift alert context
+            agent_id: Target agent identifier
+        """
+        try:
+            explanation = await self.explainer.explain(drift_alert)
+            
+            # Track successful generation
+            drift_explanations_generated_total.labels(
+                agent_id=agent_id, 
+                severity=explanation.severity
+            ).inc()
+            
+            logger.info(
+                f"Drift explanation generated for agent {agent_id}: "
+                f"summary={explanation.summary[:50]}..., "
+                f"top_k_traces={len(explanation.top_k_traces)}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to generate drift explanation for agent {agent_id}: {e}")
+            drift_explanation_llm_errors_total.labels(agent_id=agent_id).inc()

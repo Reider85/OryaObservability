@@ -229,6 +229,25 @@ PARTITION BY toYYYYMMDD(created_at)
 TTL created_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
+-- PP57: Drift explanations table for storing automatic drift explanations
+CREATE TABLE IF NOT EXISTS drift_explanations ON CLUSTER 'observability_cluster' (
+    id UUID DEFAULT generateUUIDv4(),
+    top_k_traces Array(JSON),
+    summary String,
+    hypothesis String,
+    generated_at DateTime64(3),
+    agent_id String,
+    kl_score Float64,
+    threshold Float64,
+    severity String,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (agent_id, created_at)
+PARTITION BY toYYYYMMDD(created_at)
+TTL created_at + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
+
 -- PP13 (T3.3.2): nightly golden-eval results (sharded).
 CREATE TABLE IF NOT EXISTS eval_golden_results_local ON CLUSTER 'observability_cluster' (
     nightly_ts DateTime64(3),

@@ -368,6 +368,27 @@ drift_threshold_calibrated_at = Gauge(
     ["agent_id"],
 )
 
+# --- PP57 Drift explainability metrics ---
+
+drift_explanations_generated_total = Counter(
+    "agent_obs_drift_explanations_generated_total",
+    "Number of drift explanations generated",
+    ["agent_id", "severity"],
+)
+
+drift_explanation_generation_seconds = Histogram(
+    "agent_obs_drift_explanation_generation_seconds",
+    "Time taken to generate drift explanations",
+    ["agent_id"],
+    buckets=[1, 5, 10, 30, 60, 120],
+)
+
+drift_explanation_llm_errors_total = Counter(
+    "agent_obs_drift_explanation_llm_errors_total",
+    "LLM errors during drift explanation generation",
+    ["agent_id"],
+)
+
 drift_calibration_runs_total = Counter(
     "agent_obs_drift_calibration_runs_total",
     "Drift threshold calibration runs completed",

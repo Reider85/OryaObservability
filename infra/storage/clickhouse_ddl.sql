@@ -239,6 +239,25 @@ PARTITION BY toYYYYMMDD(created_at)
 TTL created_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
+-- PP57: Drift explanations table for storing automatic drift explanations
+CREATE TABLE IF NOT EXISTS drift_explanations (
+    id UUID DEFAULT generateUUIDv4(),
+    top_k_traces Array(JSON),
+    summary String,
+    hypothesis String,
+    generated_at DateTime64(3),
+    agent_id String,
+    kl_score Float64,
+    threshold Float64,
+    severity String,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = MergeTree()
+ORDER BY (agent_id, created_at)
+PARTITION BY toYYYYMMDD(created_at)
+TTL created_at + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
+
 -- PP13 (T3.3.2): nightly golden-eval results for regression control.
 -- One row per (nightly run, question, metric). GoldenEvalRegression compares
 -- agent_obs_eval_golden_pass_rate against its 7-day moving average; this table

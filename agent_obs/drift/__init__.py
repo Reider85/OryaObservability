@@ -5,6 +5,7 @@ the detector reads on every run.
 """
 
 from agent_obs.drift.detector import DriftDetector
+from agent_obs.drift.explainability import DriftExplainer, DriftAlert, DriftExplanation
 from agent_obs.drift.kl_divergence import (
     compute_kl_divergence,
     compute_kl_from_embeddings,
@@ -31,6 +32,9 @@ __all__ = [
     "DEFAULT_THRESHOLDS_PATH",
     "MIN_SAMPLES_FOR_CALIBRATION",
     "DriftDetector",
+    "DriftExplainer",
+    "DriftAlert",
+    "DriftExplanation",
     "DriftReport",
     "ThresholdStore",
     "compute_kl_divergence",

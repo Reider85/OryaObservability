@@ -185,6 +185,28 @@ PARTITION BY toYYYYMMDD(created_at)
 TTL created_at + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
+-- PP57: Drift explanations table for storing automatic drift explanations with HA
+CREATE TABLE IF NOT EXISTS drift_explanations ON CLUSTER 'observability_cluster' (
+    id UUID DEFAULT generateUUIDv4(),
+    top_k_traces Array(JSON),
+    summary String,
+    hypothesis String,
+    generated_at DateTime64(3),
+    agent_id String,
+    kl_score Float64,
+    threshold Float64,
+    severity String,
+    created_at DateTime64(3) DEFAULT now()
+)
+ENGINE = ReplicatedMergeTree(
+    '/clickhouse/observability/drift_explanations/{shard}',
+    '{replica}'
+)
+ORDER BY (agent_id, created_at)
+PARTITION BY toYYYYMMDD(created_at)
+TTL created_at + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
+
 -- PP13 (T3.3.2): nightly golden-eval results (HA).
 CREATE TABLE IF NOT EXISTS eval_golden_results_local ON CLUSTER 'observability_cluster' (
     nightly_ts DateTime64(3),
@@ -205,8 +227,8 @@ TTL nightly_ts + INTERVAL 90 DAY
 SETTINGS index_granularity = 8192;
 
 -- Distributed tables for querying across shards (same as base setup)
--- NB (PP35): sharding key must evaluate to an integer on 26.x — a bare String
--- column raises TYPE_MISMATCH — and it must EXIST in the local table: only
+-- NB (PP35): sharding key must evaluate to an integer on 26.x ï¿½ a bare String
+-- column raises TYPE_MISMATCH ï¿½ and it must EXIST in the local table: only
 -- spans_hot has tenant_id; eval/tree/audit shard by trace_id, embeddings and
 -- compliance by agent_id, golden evals by question_id.
 -- These reference the local ReplicatedMergeTree tables and provide
@@ -291,5 +313,5 @@ FROM compliance_catalog_hot;
 -- 26.x: ON TABLE tbl1, tbl2 is not valid grammar (needs db-qualified single
 -- grants), and neither provisioning account holds WITH GRANT OPTION, so every
 -- GRANT ... TO observability_user aborts with ACCESS_DENIED (497) on a fresh
--- cluster — taking the rest of the init script down with it. Config-defined
+-- cluster ï¿½ taking the rest of the init script down with it. Config-defined
 -- grants land on SYSTEM RELOAD CONFIG (the init script reloads users.d first).
