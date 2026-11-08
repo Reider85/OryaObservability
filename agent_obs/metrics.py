@@ -797,3 +797,36 @@ obs_stack_health = Gauge(
     "Overall observability stack health (1=healthy, 0=unhealthy)",
     ["agent_id"],
 )
+
+# PP58: PII encryption metrics
+pii_encrypted_total = Counter(
+    "agent_obs_pii_encrypted_total",
+    "Total PII fields encrypted",
+    ["entity_type", "tenant_id"],
+)
+
+pii_vault_transit_failures_total = Counter(
+    "agent_obs_pii_vault_transit_failures_total",
+    "Vault encryption failures",
+    ["tenant_id", "error_type"],
+)
+
+pii_encryption_latency_seconds = Histogram(
+    "agent_obs_pii_encryption_latency_seconds",
+    "PII encryption latency",
+    ["tenant_id", "entity_type"],
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+)
+
+pii_decryption_latency_seconds = Histogram(
+    "agent_obs_pii_decryption_latency_seconds",
+    "PII decryption latency",
+    ["tenant_id", "entity_type"],
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
+)
+
+pii_encryption_enabled = Gauge(
+    "agent_obs_pii_encryption_enabled",
+    "PII encryption enabled (1=enabled, 0=disabled)",
+    ["tenant_id"],
+)

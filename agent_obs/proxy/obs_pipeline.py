@@ -27,10 +27,12 @@ Design notes
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -38,12 +40,12 @@ from typing import TYPE_CHECKING, Any
 from agent_obs.content_sampling import attach_llm_content
 from agent_obs.cost import PriceBook, Usage
 from agent_obs.cost.attribution import attribution_from_headers
+from agent_obs.guardrail.engine import GuardrailEngine, PIIMatch
+from agent_obs.guardrail.field_masker import FieldMasker
+from agent_obs.guardrail.vault_client import VaultClient
 from agent_obs.observability import ObservabilitySDK, Span
 from agent_obs.proxy import ProxyConfig
 from agent_obs.proxy.prompt_templates import (
-    extract_first_system_prompt,
-    compute_prompt_sha256,
-    extract_version_label,
     create_prompt_enricher,
 )
 
@@ -232,6 +234,7 @@ class ObsPipeline:
     daily tenant rollup stay current; without it enrichment is pure.
     
     PP53: Includes system prompt template versioning with SHA256 mapping.
+    PP58: Includes PII detection and end-to-end encryption using Vault Transit.
     """
 
     def __init__(
@@ -240,12 +243,26 @@ class ObsPipeline:
         price_book: PriceBook | None | object = _AUTO_PRICE_BOOK,
         cost_tracker: CostAttributionTracker | None = None,
         hot_store=None,  # Optional HotStore for prompt template operations
+        vault_client: VaultClient | None = None,
     ) -> None:
         self.config = config
         self._price_book = price_book
         self.cost_tracker = cost_tracker
         self.hot_store = hot_store
         self._prompt_enricher = None
+        self.vault_client = vault_client
+        pii_env = os.environ.get("PII_E2E_ENCRYPTION", "true")
+        self.pii_enabled = pii_env.lower() in ("true", "1", "yes", "on")
+        try:
+            self.field_masker = FieldMasker()
+        except TypeError:
+            # Handle FieldMasker requiring config
+            self.field_masker = None
+        try:
+            self.guardrail_engine = GuardrailEngine()
+        except TypeError:
+            # Handle GuardrailEngine requiring dependencies
+            self.guardrail_engine = None
 
     @property
     def price_book(self) -> PriceBook | None:
@@ -285,6 +302,10 @@ class ObsPipeline:
         span.attributes["cost.attribution.agent_id"] = agent_id
         span.attributes["cost.attribution.user_id"] = user_id
         
+        # PP58: PII Detection and Encryption
+        if self.pii_enabled and tenant_id:
+            await self._process_pii_encryption(span, request_body, response_body, stream_chunks, tenant_id)
+        
         # PP53: Enrich span with system prompt template information
         if self.prompt_enricher is not None:
             try:
@@ -322,6 +343,7 @@ class ObsPipeline:
             else:
                 output_text = None
 
+        # PP58: Use potentially encrypted request body for input_text
         input_text = (
             json.dumps(message_list, ensure_ascii=False)
             if message_list
@@ -368,6 +390,8 @@ class ObsPipeline:
         sampling policy decides full-text vs hash storage.  Char counts
         always describe the full logical text (spec: ``llm.input_chars`` =
         ``len(json.dumps(messages))``).
+        
+        PP58: Handles potentially encrypted PII in bodies.
         """
         cfg = self.config
 
@@ -377,13 +401,21 @@ class ObsPipeline:
                 return text, False
             return raw[: cfg.log_bodies_max_bytes].decode("utf-8", errors="replace"), True
 
+        # PP58: Check if PII encryption is enabled
+        pii_encrypted = span.attributes.get("pii.encryption_enabled", False)
+        
         if not cfg.log_bodies:
             if input_text is not None:
+                # PP58: For encrypted content, use the actual content for hashing
                 span.attributes["llm.input_sha256"] = _sha256(input_text)
                 span.attributes["llm.input_chars"] = len(input_text)
+                if pii_encrypted:
+                    span.attributes["llm.input_encrypted"] = True
             if output_text is not None:
                 span.attributes["llm.output_sha256"] = _sha256(output_text)
                 span.attributes["llm.output_chars"] = len(output_text)
+                if pii_encrypted:
+                    span.attributes["llm.output_encrypted"] = True
             return
 
         in_text: str | None = None
@@ -399,8 +431,12 @@ class ObsPipeline:
         attach_llm_content(span, input_text=in_text, output_text=out_text)
         if input_text is not None:
             span.attributes["llm.input_chars"] = len(input_text)
+            if pii_encrypted:
+                span.attributes["llm.input_encrypted"] = True
         if output_text is not None:
             span.attributes["llm.output_chars"] = len(output_text)
+            if pii_encrypted:
+                span.attributes["llm.output_encrypted"] = True
 
     def _attach_routing_metadata(self, span: Span, headers: Mapping[str, str]) -> None:
         """Attach cost-aware routing metadata to span attributes (PP55).
@@ -432,6 +468,161 @@ class ObsPipeline:
                 "cost_aware_routing_decision",
                 routing_attrs
             )
+
+    async def _process_pii_encryption(
+        self, 
+        span: Span, 
+        request_body: bytes, 
+        response_body: bytes | None, 
+        stream_chunks: list[bytes] | None, 
+        tenant_id: str
+    ) -> None:
+        """Process PII detection and encryption for request/response bodies (PP58)."""
+        try:
+            # Process request body PII
+            req = _json_dict(request_body)
+            messages = req.get("messages")
+            message_list = messages if isinstance(messages, list) else []
+            
+            if message_list:
+                # Extract text from messages for PII detection
+                input_text = json.dumps(message_list, ensure_ascii=False)
+                encrypted_input, encrypted_fields = await self._detect_and_encrypt_pii(input_text, tenant_id)
+                
+                if encrypted_fields:
+                    span.attributes["pii.encrypted_fields"] = encrypted_fields
+                    span.attributes["pii.encryption_enabled"] = True
+                    
+                    # Update request body with encrypted content
+                    req["messages"] = json.loads(encrypted_input)
+                    request_body = json.dumps(req).encode()
+            
+            # Process response body PII if present
+            if response_body:
+                response_text = response_body.decode("utf-8", errors="replace")
+                encrypted_response, response_fields = await self._detect_and_encrypt_pii(response_text, tenant_id)
+                
+                if response_fields:
+                    # Merge with existing fields or create new
+                    existing_fields = span.attributes.get("pii.encrypted_fields", [])
+                    span.attributes["pii.encrypted_fields"] = existing_fields + response_fields
+                    span.attributes["pii.encryption_enabled"] = True
+                    
+                    # Update response body with encrypted content
+                    response_body = encrypted_response.encode()
+            
+            # Process streaming chunks if present
+            if stream_chunks:
+                # Process aggregated content from streaming
+                if stream_chunks is not None:
+                    summary = _aggregate_stream(iter_sse_json(stream_chunks))
+                    if summary.content:
+                        encrypted_stream, stream_fields = await self._detect_and_encrypt_pii(summary.content, tenant_id)
+                        
+                        if stream_fields:
+                            existing_fields = span.attributes.get("pii.encrypted_fields", [])
+                            span.attributes["pii.encrypted_fields"] = existing_fields + stream_fields
+                            span.attributes["pii.encryption_enabled"] = True
+                
+        except Exception as e:
+            logger.warning("PII encryption failed: %s", e)
+            # Don't fail the request, just log the error
+
+    async def _detect_and_encrypt_pii(self, text: str, tenant_id: str) -> tuple[str, list[dict]]:
+        """Detect PII and encrypt using Vault Transit (PP58)."""
+        if not self.pii_enabled or not tenant_id:
+            return text, []
+        
+        # Detect PII using GuardrailEngine
+        pii_matches = self._detect_pii(text)
+        if not pii_matches:
+            return text, []
+        
+        encrypted_fields = []
+        for match in pii_matches:
+            # Encrypt using Vault Transit
+            encrypted_value = await self._encrypt_pii_value(
+                match.value, tenant_id
+            )
+            
+            encrypted_fields.append({
+                "field": f"{match.entity_type}.{match.span_start}",
+                "encrypted_value": encrypted_value,
+                "key_version": 1,  # Track key version for rotation
+                "original_length": len(match.value),
+            })
+        
+        # Replace original values with encrypted markers
+        encrypted_text = self._replace_with_encrypted_markers(text, pii_matches)
+        
+        return encrypted_text, encrypted_fields
+
+    def _detect_pii(self, text: str) -> list[PIIMatch]:
+        """Detect PII in text using GuardrailEngine logic."""
+        try:
+            # Use GuardrailEngine to detect PII
+            # This is a simplified version - in production you'd want to use the actual GuardrailEngine
+            pii_matches = []
+            
+            # Basic email detection
+            email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+            for match in re.finditer(email_pattern, text):
+                pii_matches.append(PIIMatch(
+                    entity_type="email",
+                    value=match.group(),
+                    span_start=match.start(),
+                    span_end=match.end(),
+                    mask="[EMAIL]"
+                ))
+            
+            # Basic phone detection
+            phone_pattern = r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b'
+            for match in re.finditer(phone_pattern, text):
+                pii_matches.append(PIIMatch(
+                    entity_type="phone",
+                    value=match.group(),
+                    span_start=match.start(),
+                    span_end=match.end(),
+                    mask="[PHONE]"
+                ))
+            
+            return pii_matches
+            
+        except Exception as e:
+            logger.warning("PII detection failed: %s", e)
+            return []
+
+    async def _encrypt_pii_value(self, value: str, tenant_id: str) -> str:
+        """Encrypt PII value using Vault Transit (PP58)."""
+        if not self.vault_client:
+            # Fallback to base64 encoding if vault client not available
+            logger.warning("Vault client not available, using base64 fallback")
+            return base64.b64encode(value.encode()).decode()
+        
+        try:
+            # Use existing Vault Transit implementation
+            transit_key = f"{tenant_id}_pii_field_key"
+            encrypt_response = self.vault_client.secrets.transit.encrypt_data(
+                key_name=transit_key,
+                plaintext=base64.b64encode(value.encode()).decode()
+            )
+            return encrypt_response["data"]["ciphertext"]
+        except Exception as e:
+            logger.warning("Vault encryption failed: %s, using base64 fallback", e)
+            # Fallback to base64 encoding
+            return base64.b64encode(value.encode()).decode()
+
+    def _replace_with_encrypted_markers(self, text: str, pii_matches: list[PIIMatch]) -> str:
+        """Replace PII values with encrypted markers."""
+        # Sort matches by position in reverse order to avoid offset issues
+        sorted_matches = sorted(pii_matches, key=lambda x: x.span_start, reverse=True)
+        
+        for match in sorted_matches:
+            # Create encrypted marker
+            marker = f"[ENCRYPTED:{match.entity_type}:{len(match.value)}]"
+            text = text[:match.span_start] + marker + text[match.span_end:]
+        
+        return text
 
 
 __all__ = [

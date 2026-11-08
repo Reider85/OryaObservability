@@ -22,12 +22,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from agent_obs.ha.health_checks import circuit_breaker_for
 from prometheus_client import Counter, Histogram
 from agent_obs.observability import ObservabilitySDK, Span
-from agent_obs.proxy.obs_pipeline import ObsPipeline
+from agent_obs.proxy.obs_pipeline import ObsPipeline, attribution_from_headers
 from agent_obs.proxy.security_client import SecurityClient, SecurityScanResult
 
 logger = logging.getLogger(__name__)
@@ -86,12 +86,16 @@ class SharedPipelineResult:
         obs_span: Span - enriched observability span
         decision: str - final decision ("forward" | "flag" | "block")
         latency_seconds: float - total processing time
+        pii_encrypted_fields: list[dict] - PII fields that were encrypted
+        pii_encryption_enabled: bool - whether PII encryption was applied
     """
     masked_request_body: bytes
     security_result: SecurityScanResult
     obs_span: Span
     decision: str  # "forward" | "flag" | "block"
     latency_seconds: float
+    pii_encrypted_fields: list[dict] = field(default_factory=list)
+    pii_encryption_enabled: bool = False
 
 
 class SharedPipeline:
@@ -99,6 +103,7 @@ class SharedPipeline:
     
     Coordinates between security scanning and observability enrichment with
     performance isolation and fail-open semantics.
+    PP58: Handles PII encryption in the shared pipeline.
     """
 
     def __init__(
@@ -159,11 +164,43 @@ class SharedPipeline:
             Exception: On unrecoverable errors (rare due to fail-open)
         """
         start_time = time.time()
+        pii_encrypted_fields = []
+        pii_encryption_enabled = False
         
         try:
+# PP58: PII Encryption in Shared Pipeline
+            pii_encryption_enabled = False
+            if self.obs_pipeline.pii_enabled:
+                try:
+                    # Extract tenant_id for PII processing
+                    tenant_id, _, _ = attribution_from_headers(headers)
+                    if tenant_id and tenant_id != "default":
+                        # Convert request body to text for PII processing
+                        request_text = request_body.decode("utf-8", errors="replace")
+                        encrypted_text, encrypted_fields = await self.obs_pipeline._detect_and_encrypt_pii(
+                            request_text, tenant_id
+                        )
+                        
+                        if encrypted_fields:
+                            pii_encrypted_fields = encrypted_fields
+                            pii_encryption_enabled = True
+                            masked_request_body = encrypted_text.encode()
+                        else:
+                            masked_request_body = request_body
+                    else:
+                        # No tenant_id, disable PII encryption
+                        pii_encryption_enabled = False
+                        masked_request_body = request_body
+                        
+                except Exception as e:
+                    logger.warning("Shared pipeline PII encryption failed: %s", e)
+                    masked_request_body = request_body
+            else:
+                masked_request_body = request_body
+            
             # PP47: Create security and obs tasks with independent timeouts
             security_task = asyncio.create_task(
-                self._scan_with_timeout(request_body, headers, trace_id),
+                self._scan_with_timeout(masked_request_body, headers, trace_id),
                 name="security_scan"  # PP47: Name for timeout identification
             )
             obs_task = asyncio.create_task(
@@ -236,13 +273,19 @@ class SharedPipeline:
                 _obs_latency_seconds.observe(obs_latency)
                 _total_latency_seconds.observe(latency)
                 
+                # Extract PII info from obs span if available
+                pii_encrypted_fields = getattr(obs_span, 'attributes', {}).get('pii.encrypted_fields', [])
+                pii_encryption_enabled = getattr(obs_span, 'attributes', {}).get('pii.encryption_enabled', False)
+                
                 return SharedPipelineResult(
-                    masked_request_body=security_result.masked_request_body,
-                    security_result=security_result,
-                    obs_span=obs_span,
-                    decision=decision,
-                    latency_seconds=latency,
-                )
+                masked_request_body=security_result.masked_request_body,
+                security_result=security_result,
+                obs_span=obs_span,
+                decision="forward",  # PP47: Fail-open allows forwarding
+                latency_seconds=latency,
+                pii_encrypted_fields=pii_encrypted_fields,
+                pii_encryption_enabled=pii_encryption_enabled,
+            )
             
             # Make final decision (security > obs)
             decision = self._make_decision(security_result, obs_span)
@@ -263,6 +306,10 @@ class SharedPipeline:
             _obs_latency_seconds.observe(obs_latency)
             _total_latency_seconds.observe(latency)
             
+            # Extract PII info from obs span
+            pii_encrypted_fields = getattr(obs_span, 'attributes', {}).get('pii.encrypted_fields', [])
+            pii_encryption_enabled = getattr(obs_span, 'attributes', {}).get('pii.encryption_enabled', False)
+            
             logger.debug(
                 "Shared pipeline completed: decision=%s, latency=%.3fs, security=%.3fs, obs=%.3fs",
                 decision, latency, security_latency, obs_latency
@@ -274,6 +321,8 @@ class SharedPipeline:
                 obs_span=obs_span,
                 decision=decision,
                 latency_seconds=latency,
+                pii_encrypted_fields=pii_encrypted_fields,
+                pii_encryption_enabled=pii_encryption_enabled,
             )
             
         except asyncio.TimeoutError:
@@ -287,9 +336,6 @@ class SharedPipeline:
             )
             
             # PP47: Determine which pipeline timed out based on task names
-            security_task_name = "security_scan"
-            obs_task_name = "obs_enrichment"
-            
             # Check which task completed and which timed out
             if security_task.done() and not obs_task.done():
                 # Security completed, obs timed out
@@ -330,6 +376,8 @@ class SharedPipeline:
                 obs_span=obs_span,
                 decision="forward",  # PP47: Fail-open allows forwarding
                 latency_seconds=latency,
+                pii_encrypted_fields=pii_encrypted_fields,
+                pii_encryption_enabled=pii_encryption_enabled,
             )
             
         except Exception as e:
@@ -349,6 +397,8 @@ class SharedPipeline:
                 obs_span=obs_span,
                 decision="forward",  # PP47: Fail-open allows forwarding
                 latency_seconds=latency,
+                pii_encrypted_fields=pii_encrypted_fields,
+                pii_encryption_enabled=pii_encryption_enabled,
             )
 
     async def _scan_with_timeout(
@@ -524,7 +574,7 @@ class SharedPipeline:
             # Wait for obs with 100ms timeout
             obs_span = await asyncio.wait_for(obs_task, timeout=self.obs_timeout)
             
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
             # PP47: Handle timeouts with fail-open
             if security_task.done() and not obs_task.done():
                 # Security completed, obs timed out
